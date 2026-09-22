@@ -8,7 +8,29 @@ It is a separate project from [SeriousSportSync](https://github.com/Monkfish1337
 
 > **Phase 1.** The manual loop works end to end: request → search → review → download → import. Automatic grabbing, quality upgrades and media-server notifications come later.
 
-## Run it
+## Run it with Docker
+
+Each push to `main` or a `phase-*` branch is tested and published to `ghcr.io/monkfish1337/replayarr` for amd64 and arm64. Tags: `latest` (main), the branch name (e.g. `phase-1`), and `sha-<commit>`.
+
+1. The repository is private, so the image is too. Sign in once on the server with a GitHub personal access token (classic) that has the `read:packages` scope:
+
+   ```sh
+   echo <token> | docker login ghcr.io -u Monkfish1337 --password-stdin
+   ```
+
+2. Copy [`docker-compose.yml`](docker-compose.yml) and [`.env.example`](.env.example) (renamed `.env`) into a folder on the server. Then set `REPLAYARR_PASSWORD`, `DATA_ROOT` (the host folder holding your downloads and media) and `PUID`/`PGID`.
+
+3. Start it:
+
+   ```sh
+   docker compose pull && docker compose up -d
+   ```
+
+Open `http://<server>:4173`. Inside the container the data root is `/data`, so the library folder is something like `/data/media/sports`. If qBittorrent or SABnzbd mount the same folder under a different path, add a remote path mapping in **Settings › Download Clients**. To reach them by container name, join your *arr network (see the end of the compose file).
+
+The database lives in the `replayarr_config` volume, owned by uid 1000. If `PUID` is not 1000, replace that volume with a host folder owned by your `PUID`, e.g. `./config:/config`.
+
+## Run it with Node
 
 Requires Node.js 22.13 or newer. There are no npm dependencies.
 

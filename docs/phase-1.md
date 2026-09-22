@@ -61,4 +61,3 @@ All routes are under `/api`. Writes must be `application/json`, which a cross-si
 2. Quality profiles and upgrade monitoring.
 3. Media-server notifications (Plex/Jellyfin library refresh).
 4. Bitmagnet as a second search source.
-5. A Dockerfile and compose example with shared download volume.

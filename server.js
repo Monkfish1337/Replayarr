@@ -68,6 +68,11 @@ createServer(async (request, response) => {
   response.setHeader('x-content-type-options', 'nosniff');
   response.setHeader('x-frame-options', 'DENY');
   response.setHeader('referrer-policy', 'no-referrer');
+  // Liveness only, for container healthchecks; reveals nothing about the install.
+  if (request.url === '/health') {
+    response.writeHead(200, { 'content-type': 'text/plain' }).end('ok');
+    return;
+  }
   if (!authorised(request)) {
     response.writeHead(401, { 'www-authenticate': 'Basic realm="Replayarr", charset="UTF-8"' }).end('Authentication required');
     return;
