@@ -1,57 +1,14 @@
 # Running Replayarr in Dockge
 
-Replayarr is published to `ghcr.io/monkfish1337/replayarr` for amd64 and arm64. Each push to a `phase-*` branch publishes that branch's tag, e.g. `phase-1`; merges to `main` publish `latest`. The repository is private, so the image is too, and Docker must be logged in to GHCR before it can pull.
+Replayarr is published to `ghcr.io/monkfish1337/replayarr` for amd64 and arm64. Each push to a `phase-*` branch publishes that branch's tag, e.g. `phase-1`; merges to `main` publish `latest`. The image is public, so Dockge pulls it without logging in to GitHub.
 
-## 1. Create a GitHub token for pulling images
-
-GHCR only accepts **classic** personal access tokens; fine-grained tokens do not work with it.
-
-1. Open [github.com/settings/tokens/new?scopes=read:packages&description=homelab-ghcr-pull](https://github.com/settings/tokens/new?scopes=read:packages&description=homelab-ghcr-pull). That is *Settings › Developer settings › Personal access tokens › Tokens (classic) › Generate new token (classic)* with the fields pre-filled.
-2. Leave only **`read:packages`** ticked. The server only pulls; it needs nothing else.
-3. Choose an expiration. When it expires, pulls start failing with `denied`/`unauthorized`; create a new token and repeat step 2 below.
-4. **Generate token** and copy it (`ghp_…`). GitHub shows it only once.
-
-If you already logged in for the private SSS scraper image with a classic `read:packages` token, that token also works here: it covers every package your account can read. Skip to step 3 to check.
-
-## 2. Log in where Dockge can use it
-
-Dockge runs `docker compose` with the Docker client *inside the Dockge container*, and Docker stores registry logins with the client, not the daemon. A `docker login` on the host is therefore invisible to Dockge unless Dockge can see the host's login file.
-
-**Recommended: share the host login with Dockge.** On the server:
-
-```bash
-# Log in on the host as root; this writes /root/.docker/config.json.
-read -rsp 'GitHub token: ' CR_PAT && echo
-printf '%s' "$CR_PAT" | sudo docker login ghcr.io -u Monkfish1337 --password-stdin
-unset CR_PAT
-```
-
-Then add one line to the `volumes:` of **Dockge's own** compose file (usually `/opt/dockge/compose.yaml`) and restart Dockge:
-
-```yaml
-      - /root/.docker:/root/.docker:ro
-```
-
-The login now survives Dockge updates, and the same token serves host `docker` commands.
-
-**Quick alternative (no Dockge change):** log in inside the running Dockge container. This is lost whenever the Dockge container is recreated, e.g. when you update Dockge:
-
-```bash
-docker exec -it dockge docker login ghcr.io -u Monkfish1337
-# Paste the token at the Password prompt.
-```
-
-Never put the token in the Replayarr stack's `.env`.
-
-## 3. Check the pull works
+To check the server can reach it:
 
 ```bash
 docker exec dockge docker pull ghcr.io/monkfish1337/replayarr:phase-1
 ```
 
-`denied` or `unauthorized` means Dockge is not seeing a valid login: repeat step 2, and check the token is classic with `read:packages`. `manifest unknown` means the tag does not exist; check the tag name.
-
-## 4. Create the stack
+## Create the stack
 
 1. In Dockge, **+ Compose**, and name the stack `replayarr`.
 2. Paste [`docker-compose.yml`](../docker-compose.yml) into the compose editor.
@@ -65,7 +22,7 @@ docker exec dockge docker pull ghcr.io/monkfish1337/replayarr:phase-1
 
 Open `http://<server>:4173` and sign in with `REPLAYARR_USERNAME` (default `admin`) and your password. **System › Status** lists anything still to connect.
 
-## 5. Connect services
+## Connect services
 
 On the shared network, use container names:
 

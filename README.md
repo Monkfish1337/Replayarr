@@ -12,7 +12,7 @@ It is a separate project from [SeriousSportSync](https://github.com/Monkfish1337
 
 Each push to `main` or a `phase-*` branch is tested and published to `ghcr.io/monkfish1337/replayarr` for amd64 and arm64. Tags: `latest` (main), the branch name (e.g. `phase-1`), and `sha-<commit>`.
 
-**[docs/DOCKGE.md](docs/DOCKGE.md)** walks through it: creating the GitHub token the private image needs, logging in where Dockge can use it, then creating the stack from [`docker-compose.yml`](docker-compose.yml) and [`.env.example`](.env.example).
+**[docs/DOCKGE.md](docs/DOCKGE.md)** walks through creating the stack from [`docker-compose.yml`](docker-compose.yml) and [`.env.example`](.env.example).
 
 ## Run it with Node
 
