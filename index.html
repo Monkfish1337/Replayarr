@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b1118">
+  <title>Replayarr — Sports replay manager prototype</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="brand" href="#overview" aria-label="Replayarr overview">
+        <span class="brand-mark" aria-hidden="true"><span></span></span>
+        <span class="brand-word">replay<span>arr</span><small>YOUR SPORTS. ON REPLAY.</small></span>
+      </a>
+      <div class="workspace-label">WORKSPACE</div>
+      <nav class="main-nav" aria-label="Main navigation">
+        <a href="#overview" data-page="overview"><span class="nav-icon">◫</span> Overview</a>
+        <a href="#discover" data-page="discover"><span class="nav-icon">⌕</span> Discover</a>
+        <a href="#requests" data-page="requests"><span class="nav-icon">▤</span> Requests <span id="nav-count" class="nav-count">0</span></a>
+        <a href="#activity" data-page="activity"><span class="nav-icon">◷</span> Activity</a>
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="demo-label"><span class="live-dot"></span> Interactive prototype</div>
+        <p>Demo data only. No indexer or download client is connected.</p>
+        <a href="#settings" data-page="settings" class="settings-link">⚙ <span>Prototype settings</span></a>
+      </div>
+    </aside>
+    <main class="main">
+      <header class="topbar">
+        <div class="breadcrumb">LIBRARY <span>/</span> <strong id="breadcrumb-page">OVERVIEW</strong></div>
+        <div class="top-actions">
+          <span class="local-badge"><span class="live-dot"></span> LOCAL INSTANCE</span>
+          <button id="reset-demo" type="button" class="icon-button" title="Reset demo data" aria-label="Reset demo data">↺</button>
+          <span class="avatar" title="Demo admin">R</span>
+        </div>
+      </header>
+      <div id="view" class="content"></div>
+    </main>
+  </div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

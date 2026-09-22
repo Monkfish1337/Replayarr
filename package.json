@@ -1,0 +1,15 @@
+{
+  "name": "replayarr",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A self-hosted sports replay manager prototype",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
