@@ -1,0 +1,48 @@
+services:
+  replayarr:
+    container_name: replayarr
+    image: ghcr.io/monkfish1337/replayarr:${REPLAYARR_TAG:-latest}
+    restart: unless-stopped
+    # Match the owner of your media and download folders so imported files
+    # (and hardlinks) belong to the same user as the rest of your *arr stack.
+    user: "${PUID:-1000}:${PGID:-1000}"
+    environment:
+      REPLAYARR_USERNAME: "${REPLAYARR_USERNAME:-admin}"
+      # Replayarr is reachable from your LAN, so a login is required.
+      REPLAYARR_PASSWORD: "${REPLAYARR_PASSWORD:?Set REPLAYARR_PASSWORD in .env}"
+      TZ: "${TZ:-UTC}"
+    volumes:
+      # Settings and the SQLite database.
+      - replayarr_config:/config
+      # One shared data root, mounted the same way into qBittorrent/SABnzbd,
+      # keeps downloads and the library on one filesystem so imports can be
+      # hardlinks (instant, no extra space, torrents keep seeding). Point
+      # Settings > Media Management > Library Folder at e.g. /data/media/sports.
+      # If a client reports different paths (e.g. /downloads), add a remote
+      # path mapping in Settings > Download Clients.
+      - "${DATA_ROOT:?Set DATA_ROOT in .env}:/data"
+    ports:
+      - "${REPLAYARR_BIND_ADDRESS:-0.0.0.0}:${REPLAYARR_PORT:-4173}:4173"
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: ${REPLAYARR_MEM_LIMIT:-512m}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  replayarr_config:
+
+# To reach Prowlarr, qBittorrent and SABnzbd by container name, join the
+# network your *arr stack already uses:
+# networks:
+#   default:
+#     external: true
+#     name: my-arr-network

@@ -2,60 +2,104 @@
 
 **Your sports. On replay.**
 
-Replayarr is an early, self-hosted prototype for finding sports event recordings and managing them from request through download and library import. It is a separate project from [SeriousSportSync](https://github.com/Monkfish1337/Serioussportsync): SSS is a sports calendar and streaming add-on; Replayarr is intended to manage a durable local replay library.
+Replayarr is a self-hosted manager for sports event recordings, in the style of Sonarr. You request an event, Replayarr searches your indexers, you pick a release, and it tracks the download through to a named file in your media library.
 
-> **Prototype status:** This repository currently contains an interactive UI with illustrative data. It makes no indexer requests, starts no downloads, and writes no media files. The request workflow is simulated and stored only in your browser's local storage.
+It is a separate project from [SeriousSportSync](https://github.com/Monkfish1337/Serioussportsync). SSS is a sports calendar and streaming add-on; Replayarr keeps a durable local library. Replayarr reads SSS's calendar but never writes to it, and its release matching is ported from SSS (see [Matching](#matching)).
 
-## Try the prototype
+> **Phase 1.** The manual loop works end to end: request → search → review → download → import. Automatic grabbing, quality upgrades and media-server notifications come later.
 
-Requires Node.js 20 or newer. There are no npm dependencies.
+## Run it with Docker
+
+Each push to `main` or a `phase-*` branch is tested and published to `ghcr.io/monkfish1337/replayarr` for amd64 and arm64. Tags: `latest` (main), the branch name (e.g. `phase-1`), and `sha-<commit>`.
+
+1. The repository is private, so the image is too. Sign in once on the server with a GitHub personal access token (classic) that has the `read:packages` scope:
+
+   ```sh
+   echo <token> | docker login ghcr.io -u Monkfish1337 --password-stdin
+   ```
+
+2. Copy [`docker-compose.yml`](docker-compose.yml) and [`.env.example`](.env.example) (renamed `.env`) into a folder on the server. Then set `REPLAYARR_PASSWORD`, `DATA_ROOT` (the host folder holding your downloads and media) and `PUID`/`PGID`.
+
+3. Start it:
+
+   ```sh
+   docker compose pull && docker compose up -d
+   ```
+
+Open `http://<server>:4173`. Inside the container the data root is `/data`, so the library folder is something like `/data/media/sports`. If qBittorrent or SABnzbd mount the same folder under a different path, add a remote path mapping in **Settings › Download Clients**. To reach them by container name, join your *arr network (see the end of the compose file).
+
+The database lives in the `replayarr_config` volume, owned by uid 1000. If `PUID` is not 1000, replace that volume with a host folder owned by your `PUID`, e.g. `./config:/config`.
+
+## Run it with Node
+
+Requires Node.js 22.13 or newer. There are no npm dependencies.
 
 ```sh
 npm start
 ```
 
-Open [http://localhost:4173](http://localhost:4173). You can request an event, advance the demo search, review candidate titles, select a release, and simulate download/import completion. The reset button in the top bar restores the initial demo state.
+Open [http://localhost:4173](http://localhost:4173), then go to **Settings** and connect:
+
+| Settings page | What to enter |
+| --- | --- |
+| Metadata Source | Your SSS addon install URL (ends in `/manifest.json`, from your SSS account page) |
+| Indexers | Prowlarr URL and API key |
+| Download Clients | qBittorrent and/or SABnzbd, plus remote path mappings if they run in other containers |
+| Media Management | The library folder Plex, Jellyfin or Emby scans, and the naming pattern |
+
+Each connection has a **Test** button. **System › Status** lists anything still missing.
 
 ```sh
 npm test
 ```
 
-## Product direction
+### Environment
 
-The central record is a **wanted event**, not a search query or a torrent title. An event has a stable identity, promotion, date, teams or show name, and aliases. A request for that event moves through these stages:
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PORT` | `4173` | HTTP port |
+| `HOST` | `127.0.0.1` | Bind address; use `0.0.0.0` in a container |
+| `REPLAYARR_DB` | `data/replayarr.db` | SQLite database file |
+| `REPLAYARR_USERNAME`, `REPLAYARR_PASSWORD` | unset | Require HTTP Basic login. Set these whenever `HOST` is not localhost |
+| `REPLAYARR_TICK_MS` | `30000` | How often the worker searches due requests and checks downloads |
+| `REPLAYARR_WORKER` | on | `off` disables the background worker |
+
+## How it works
+
+The UI follows Sonarr: **Promotions** stand in for series, **events** for episodes, and **requesting** an event is monitoring it.
 
 ```text
-Event → Wanted request → Candidate releases → Reviewed selection
-      → Download job → Verified import → Library item
+Event ─▶ Request (wanted) ─▶ Search ─▶ Candidates ─▶ Review ─▶ Download job ─▶ Import ─▶ Library
 ```
 
-The prototype deliberately makes the candidate review step visible. Sports titles vary widely across indexers, and an incorrect automated match is worse than an event waiting for review.
+- **Events** come from SSS's existing addon catalog (read-only) or are added by hand. Requesting one fetches its aliases and start time from SSS.
+- **Searching** waits until 3 hours after the event starts, then runs the promotion's search titles through Prowlarr, most precise first, up to *Queries Per Search*. When nothing matches it backs off: 30 minutes, 2, 6 and 12 hours, then daily.
+- **Candidates** pass SSS's release filter and the promotion's matcher. Rejected releases stay visible in Interactive Search with the reason, such as `wrong-date` or `sports-noise`, but cannot be grabbed. Matches are scored from quality, source, seeders and protocol, and each score shows how it was reached.
+- **Review** is manual in Phase 1: choose a release from Interactive Search. A torrent goes to qBittorrent and an NZB to SABnzbd.
+- **Import** uses the largest non-sample video. It checks the minimum size and that the file name does not name a different date or event. It then hardlinks, copies or moves the file to `{promotion}/Season {year}/{promotion} - {date} - {title} [{quality}]`. Imports are idempotent, and a half-copied file never appears under its final name.
 
-### First working milestone
+State lives in SQLite. Request status changes only through an explicit transition table, so no code path can mark a request ready without an import.
 
-1. Import event identities and aliases from a stable metadata adapter, beginning with SSS.
-2. Persist requests and activity in Replayarr's own database.
-3. Run measured, deduplicated searches against a configured Prowlarr instance and/or Bitmagnet.
-4. Show candidates with the title, source, identity, score, and reasons for the score.
-5. Send an approved candidate to one torrent client and one Usenet client.
-6. Follow download state, verify the completed file, and import it under a configurable naming pattern.
+## Matching
 
-Automatic grabs, quality upgrades, additional download clients, and media-server notifications come after that loop is reliable.
+`src/matching/` is ported from SSS (`lib/promotions.js`, `promotion-aliases.js`, `team-identities.js`, `team-alias-presets.js`, `sources/release-filter.js` at SSS `0706d4d`), with SSS's matcher tests in `test/matching/`. That covers every built-in SSS promotion: UFC, ONE, WWE and AEW shows, F1, MotoGP, boxing, Match of the Day, UCL, MLB, NFL, NBA and the Premier League. It also brings the team alias presets and SSS's rules against false positives.
+
+Under **Settings › Promotions** you can add learned aliases to a built-in promotion or create a custom one. **Suggest From Examples** runs SSS's alias learner on real release names you paste in.
+
+When SSS's matching improves, port the change into `src/matching/` and its tests. Don't make Replayarr depend on SSS's code at runtime.
 
 ## Architecture boundaries
 
 | Concern | Owner |
 | --- | --- |
-| Calendar and sports-specific event matching | SSS initially; extract a shared contract once stable |
+| Calendar and event identity | SSS (read through its public addon endpoints) |
+| Release matching rules | Ported from SSS into Replayarr |
 | Wanted events, download decisions and job history | Replayarr |
-| Search and candidate provenance | Replayarr adapters |
-| Actual transfer | Existing torrent/Usenet download clients |
-| Completed file placement and naming | Replayarr importer |
-| Playback and stream resolution | SSS / media server |
+| Actual transfer | qBittorrent / SABnzbd |
+| File placement and naming | Replayarr importer |
+| Playback | Your media server |
 
-Replayarr should consume a versioned event API or export from SSS rather than share its writable database. That lets both applications evolve independently, and it avoids download state affecting streaming requests.
-
-See [docs/prototype.md](docs/prototype.md) for screen behavior, the proposed data model, and integration milestones.
+See [docs/phase-1.md](docs/phase-1.md) for the data model, API and what comes next.
 
 ## License
 

@@ -1,0 +1,103 @@
+name: Publish container
+
+on:
+  push:
+    branches: [main, 'phase-*']
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: monkfish1337/replayarr
+
+jobs:
+  publish-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # Nothing ships that has not passed the suite.
+      - name: Test
+        run: npm test
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Sign in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Build release candidate
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: replayarr-release-candidate:ci
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Start it exactly the way a home server would: through docker-compose.yml.
+      - name: Verify release candidate through Compose
+        env:
+          REPLAYARR_PASSWORD: ci-only
+          DATA_ROOT: /tmp/replayarr-data
+        run: |
+          mkdir -p "$DATA_ROOT" && sudo chown 1000:1000 "$DATA_ROOT"
+          printf 'services:\n  replayarr:\n    image: replayarr-release-candidate:ci\n    pull_policy: never\n' > compose.ci.yml
+          docker compose -f docker-compose.yml -f compose.ci.yml up -d --wait --wait-timeout 90
+          curl --fail --show-error --retry 5 --retry-delay 2 http://127.0.0.1:4173/health
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4173/api/health)" = 401
+          curl --fail --show-error -u admin:ci-only http://127.0.0.1:4173/api/system/status
+
+      - name: Publish tested image (amd64 + arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Show container logs on failure
+        if: failure()
+        continue-on-error: true
+        env:
+          REPLAYARR_PASSWORD: ci-only
+          DATA_ROOT: /tmp/replayarr-data
+        run: docker compose -f docker-compose.yml -f compose.ci.yml logs --no-color
+
+      - name: Stop test stack
+        if: always()
+        continue-on-error: true
+        env:
+          REPLAYARR_PASSWORD: ci-only
+          DATA_ROOT: /tmp/replayarr-data
+        run: docker compose -f docker-compose.yml -f compose.ci.yml down --volumes --remove-orphans
