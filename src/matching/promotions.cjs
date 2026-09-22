@@ -1,0 +1,3609 @@
+// Ported from SeriousSportSync (Monkfish1337/Serioussportsync @ 0706d4d), lib/promotions.js.
+// Replayarr changes: artwork, admin overrides, release-first promotions and the
+// SSS registry are removed; see the registry at the end of this file.
+
+const teamIdentities = require('./team-identities.cjs');
+
+// Shared event-scope window. All promotions use 2025-01-01 as the start
+// of the indexed window. End is today+180d so we keep showing 6 months of
+// upcoming events. 2025 is chosen because Usenet retention is multi-year —
+// older PPV / Fight Night / WrestleMania / boxing / F1 / ONE rips remain
+// accessible through indexers long after broadcast. Configurable via the
+// EVENT_WINDOW_START_DATE env if you want to roll the window forward.
+const EVENT_WINDOW_START = process.env.EVENT_WINDOW_START_DATE || '2025-01-01';
+function defaultEventScope(ev) {
+  if (!ev || !ev.date) return false;
+  const today = new Date(); today.setUTCHours(0, 0, 0, 0);
+  const ahead = new Date(today); ahead.setUTCDate(ahead.getUTCDate() + 180);
+  const aheadIso = ahead.toISOString().slice(0, 10);
+  const start = this && this.metadataStartDate || EVENT_WINDOW_START;
+  return ev.date >= start && ev.date <= aheadIso;
+}
+
+const promotionRuleTools = require('./promotion-aliases.cjs');
+// Replayarr serves no artwork of its own; keep the promotion's source URL.
+function brandedPoster(_file, fallbackUrl) {
+  return fallbackUrl;
+}
+
+// Promotion registry. Each promotion is a self-contained config bundle
+// describing how to fetch its events, classify them, build search aliases,
+// filter stream candidates, and present catalogs in Stremio.
+
+function isoToday() { return new Date().toISOString().slice(0, 10); }
+
+function genericVsHandle(name) {
+  if (!name) return null;
+  const m = name.match(
+    /([A-Z][\w'.-]+(?:\s+[A-Z][\w'.-]+)*)\s+vs\.?\s+([A-Z][\w'.-]+(?:\s+[A-Z][\w'.-]+)*)/
+  );
+  return m ? m[1] + ' vs ' + m[2] : null;
+}
+
+// Reject candidate titles whose 4-digit year tokens (1990–2039, avoiding
+// hits on 1080/2160 resolution markers) don't match the event's year.
+// Used by WWE/AEW where PPV names repeat annually (Backlash 2023 vs 2026).
+// Titles without any year token pass — release groups sometimes omit it.
+//
+// 0.42.3 — TIGHTENED. Removed the "year - 1" leniency that was letting
+// wrong-year football matches through (2025-05-24 Man City vs Villa release
+// masquerading as 2026 fixture). Season notation (2025-26) still matches
+// via the fullSeasonRe branch. For football events specifically, use
+// `dateMatchesEvent` on top of this — the year check is a fallback for
+// non-dated titles.
+function yearMatchesEvent(title, event) {
+  if (!event || !event.date) return true;
+  const eventYear = parseInt(event.date.slice(0, 4), 10);
+  if (!Number.isFinite(eventYear)) return true;
+
+  // Season notation: YYYY-YY, YYYY/YYYY or YYYY-YYYY. Range brackets the
+  // event year. Basketball releases commonly use the full `2025-2026` form.
+  const fullSeasonRe = /\b(19|20)(\d{2})[-/](?:(19|20))?(\d{2})\b/g;
+  let m;
+  while ((m = fullSeasonRe.exec(title)) !== null) {
+    const startYear = parseInt(m[1] + m[2], 10);
+    const endYearShort = parseInt(m[4], 10);
+    const endCentury = m[3] ? parseInt(m[3], 10) : parseInt(m[1], 10);
+    const endYear = endCentury * 100 + endYearShort;
+    if (eventYear === startYear || eventYear === endYear) return true;
+  }
+
+  // Short-form YY-YY (e.g. "24-25")
+  const shortSeasonRe = /\b(\d{2})[-/](\d{2})\b/g;
+  const eventYearShort = eventYear % 100;
+  while ((m = shortSeasonRe.exec(title)) !== null) {
+    const startShort = parseInt(m[1], 10);
+    const endShort = parseInt(m[2], 10);
+    if (eventYearShort === startShort || eventYearShort === endShort) return true;
+  }
+
+  const years = title.match(/\b(?:199\d|20[0-3]\d)\b/g);
+  if (!years || years.length === 0) return true;
+  return years.some((y) => parseInt(y, 10) === eventYear);
+}
+
+// A week number, where a release carries one instead of a date.
+//
+//   NFL.2025-2026.W04.Packers-Cowboys.1080p.ACC.2CH.MKV-CG
+//
+// requireDateInTitle rejects this outright, and that rule is right in general:
+// it is what separates EPL.2026.05.24.Man.City.vs.Villa from the 2025 fixture
+// with the same two teams. But a season span plus a week number pins a fixture
+// just as tightly — more tightly, in fact, since an NFL week contains one game
+// per team — so the requirement is really "identify WHICH fixture", and a date
+// is only the usual way of doing it.
+//
+// Deliberately strict, because this is the one route into the matcher that
+// does not involve a date:
+//   * the event must actually carry a week number (only ESPN's regular season
+//     sets one, so nothing else can reach this path at all);
+//   * the number in the title must be that week, not merely some week;
+//   * the title must carry a year/season and the correct season phase, so last
+//     season's W04 is rejected exactly as last season's date would be.
+const TITLE_WEEK_RE = /\b(?:w|wk|week)[.\-_ ]?(\d{1,2})\b/gi;
+function weekMatchesEvent(title, event) {
+  const week = Number(event && event.week);
+  if (!Number.isInteger(week) || week < 1) return false;
+  const text = String(title || '');
+  const scene = normaliseSceneText(text);
+  const preseason = /\b(?:ps|preseason|pre season)\b/.test(scene);
+  if (preseason !== (event.seasonPhase === 'preseason')) return false;
+  if (event.seasonPhase === 'postseason') return false;
+  // Week alone repeats every season. Require an explicit year or season key.
+  if (!/\b(?:19|20)\d{2}\b/.test(scene) && !/\b\d{2}[-/]\d{2}\b/.test(text)) return false;
+  const releaseSpan = /\b((?:19|20)\d{2}|\d{2})\s+(\d{4}|\d{2})\s+(?:(?:ps|preseason|pre season)\s+)?(?:w|wk|week)\s*\d{1,2}\b/.exec(scene);
+  if (releaseSpan && event.seasonSpan) {
+    const expected = String(event.seasonSpan).split('-').map(Number);
+    const start = Number(releaseSpan[1]), end = Number(releaseSpan[2]);
+    if (start !== (releaseSpan[1].length === 2 ? expected[0] % 100 : expected[0])
+        || end !== (releaseSpan[2].length === 2 ? expected[1] % 100 : expected[1])) return false;
+  }
+  TITLE_WEEK_RE.lastIndex = 0;
+  let found = false, m;
+  while ((m = TITLE_WEEK_RE.exec(scene)) !== null) {
+    if (parseInt(m[1], 10) === week) { found = true; break; }
+  }
+  if (!found) return false;
+  return yearMatchesEvent(text.replace(/_/g, ' '), event);
+}
+
+function footballRoundVerdict(title, event, identities) {
+  const season = Number(event && event.season), round = Number(event && event.round);
+  if (!Number.isInteger(season) || season < 1900 || !Number.isInteger(round) || round < 1) return 'none';
+  const text = normaliseSceneText(title);
+  const span = /\b((?:19|20)\d{2})\s+(\d{4}|\d{2})\b/.exec(text);
+  const stage = /\b(?:md|matchday|round|r|gameweek)\s*(\d{1,2})\b|\b(\d{1,2})\s*(?:day|round|tour|tur)\b/i.exec(text);
+  if (!span || !stage) return 'none';
+  if (!identities.some(identity=>(' '+text+' ').includes(' '+normaliseSceneText(identity)+' '))) return 'none';
+  const start = Number(span[1]), end = span[2].length === 2 ? Math.floor(start/100)*100+Number(span[2]) : Number(span[2]);
+  if (start !== season || end !== season+1) return 'wrong-season';
+  return Number(stage[1] || stage[2]) === round ? 'match' : 'wrong-round';
+}
+
+// 0.42.3 — Date-based match for football promotions.
+//
+// Football releases essentially always include YYYY.MM.DD (or a permutation)
+// in the title — that's the canonical way scene groups identify a specific
+// fixture:
+//   EPL.2026.05.24.Manchester.City.vs.Aston.Villa.1080p
+//   BWSL.2024.05.18.Aston.Villa.vs.Manchester.City
+//   UEFA.Champions.League.2022.09.06.Group.Stage.Sevilla.Vs.Man.City
+//
+// This helper extracts the date and compares it to event.date. Returns:
+//   'match'      — the title's date is within ±1 day of the event date
+//   'wrong-date' — the title has a date but it's not the fixture date
+//   'none'       — no date found in the title (caller decides fallback)
+//
+// Both YYYY-MM-DD (ISO) and DD-MM-YYYY (European scene style) are recognised.
+// Separator can be ".", "-", "_", or " ".
+const DATE_YMD_RE = /(?<![0-9])(20\d{2})[.\-_ ](\d{1,2})[.\-_ ](\d{1,2})(?![0-9])/g;
+const DATE_DMY_RE = /(?<![0-9])(\d{1,2})[.\-_ ](\d{1,2})[.\-_ ](20\d{2})(?![0-9])/g;
+const DATE_DMY_SHORT_RE = /(?<![0-9])(\d{1,2})[.\-_](\d{1,2})[.\-_](\d{2})(?![0-9])/g;
+// 0.94.0 — compact YYYYMMDD with no separators at all.
+//
+// rgfootball.net leads every filename with one: "20260905_EPL_26.27_R.03_
+// MCI_vs_COV_[rgfootball.net]_720p.50.mkv". Football sets requireDateInTitle,
+// so a title whose date we cannot read is rejected outright — the whole of that
+// group's output was being discarded as "no-date-in-title" even when the teams
+// matched perfectly.
+//
+// Anchored hard: exactly eight digits with no digit either side, a 20xx year,
+// and a real month and day. That is narrow enough not to swallow the other
+// eight-digit numbers that show up in release names (resolutions are four
+// digits, bitrates carry units, hashes contain letters or run far longer).
+const DATE_COMPACT_RE = /(?<![0-9])(20\d{2})(\d{2})(\d{2})(?![0-9])/g;
+
+function extractReleaseDates(title) {
+  const found = [];
+  let m;
+
+  // YMD form (most common in scene releases)
+  DATE_YMD_RE.lastIndex = 0;
+  while ((m = DATE_YMD_RE.exec(title)) !== null) {
+    const y = parseInt(m[1], 10);
+    const mo = parseInt(m[2], 10);
+    const d = parseInt(m[3], 10);
+    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+      found.push({ y, mo, d });
+    }
+  }
+
+  // DMY form — European scene sometimes uses "18.05.2024" style
+  DATE_DMY_RE.lastIndex = 0;
+  while ((m = DATE_DMY_RE.exec(title)) !== null) {
+    const d = parseInt(m[1], 10);
+    const mo = parseInt(m[2], 10);
+    const y = parseInt(m[3], 10);
+    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+      found.push({ y, mo, d });
+    }
+  }
+  // Older sports releases commonly use DD.MM.YY (for example 21.07.18).
+  // Requiring punctuation separators avoids interpreting scores as dates.
+  DATE_DMY_SHORT_RE.lastIndex = 0;
+  while ((m = DATE_DMY_SHORT_RE.exec(title)) !== null) {
+    const d = parseInt(m[1], 10);
+    const mo = parseInt(m[2], 10);
+    const shortYear = parseInt(m[3], 10);
+    const y = shortYear <= 39 ? 2000 + shortYear : 1900 + shortYear;
+    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) found.push({ y, mo, d });
+  }
+
+  // Compact YYYYMMDD. Month and day are validated rather than merely
+  // range-checked loosely, because with no separators there is nothing else
+  // distinguishing a date from any other run of eight digits.
+  DATE_COMPACT_RE.lastIndex = 0;
+  while ((m = DATE_COMPACT_RE.exec(title)) !== null) {
+    const y = parseInt(m[1], 10);
+    const mo = parseInt(m[2], 10);
+    const d = parseInt(m[3], 10);
+    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) found.push({ y, mo, d });
+  }
+
+  return found;
+}
+
+function dateMatchesEvent(title, event, promotionId) {
+  if (!event || !event.date) return 'none';
+  const [ey, em, ed] = event.date.split('-').map((s) => parseInt(s, 10));
+  if (!Number.isFinite(ey) || !Number.isFinite(em) || !Number.isFinite(ed)) return 'none';
+  const eventDay = Date.UTC(ey, em - 1, ed);
+  const dates = extractReleaseDates(title);
+  // MLB series and dated TV episodes can occur on consecutive days. A
+  // neighbouring date identifies different content, not a timezone variant.
+  const exactDatePromotion = promotionId === 'mlb' || promotionId === 'motd'
+    || /^mlb:|^motd:/.test(String(event.id || '')) || event.source?.type === 'mlb';
+  const tolerance = exactDatePromotion ? 0 : 1;
+  if (dates.length === 0) return 'none';
+  for (const dt of dates) {
+    const day = Date.UTC(dt.y, dt.mo - 1, dt.d);
+    const diffDays = Math.abs((day - eventDay) / (1000 * 60 * 60 * 24));
+    if (diffDays <= tolerance) return 'match';
+  }
+  return 'wrong-date';
+}
+
+// ===== UFC =====
+const UFC_PPV_RE = /^UFC\s*\d{1,4}(?:[:.\s]|$)/i;
+const UFC_FN_RE = /UFC\s*Fight\s*Night/i;
+const UFC_ON_RE = /^UFC\s+on\s+(ABC|ESPN|FOX|FX)/i;
+const UFC_CONTENDER_RE = /Contender\s*Series/i;
+// 0.33.6: branded numbered PPV pattern — "UFC Freedom 250 Topuria vs Gaethje".
+// UFC has started using a subtitle word between "UFC" and the event number on
+// some PPVs (TSDB now lists "UFC Freedom 250 …" rather than "UFC 250: …"), and
+// release groups follow suit ("UFC.Freedom.250.Topuria.vs.Gaethje.PPV…"). The
+// negative lookahead skips known prefixes (Fight, on, Contender) so those keep
+// being handled by their own classifiers below.
+const UFC_BRANDED_PPV_RE = /^UFC\s+(?!(?:Fight|on|Contender)\b)[A-Za-z][A-Za-z']*\s+\d{1,4}\b/i;
+
+// Extract the event number from a UFC event name across all supported formats.
+// Used by isRelevantStreamTitle to reject candidate titles that don't include
+// the right number. Returns null when the event name has no recognisable
+// number (rare; some unnumbered specials slip through). 0.33.6 added the
+// branded-PPV branch to cover "UFC Freedom 250 …" — the older inline regex
+// `ufc\s*(?:fight\s*night\s*)?(\d+)` couldn't extract 250 because "Freedom"
+// sits between "UFC" and the digits.
+function ufcEventNumber(name) {
+  if (!name) return null;
+  let m;
+  if ((m = name.match(/^UFC\s+Fight\s+Night\s+(\d{1,4})\b/i))) return m[1];
+  if ((m = name.match(/^UFC\s+on\s+(?:ABC|ESPN|FOX|FX)\s+(\d{1,4})\b/i))) return m[1];
+  if ((m = name.match(/^UFC\s+(?!(?:Fight|on|Contender)\b)[A-Za-z][A-Za-z']*\s+(\d{1,4})\b/i))) return m[1];
+  if ((m = name.match(/^UFC\s*(\d{1,4})\b/i))) return m[1];
+  return null;
+}
+
+// Same idea as the event classifier above, but applied to a torrent TITLE
+// (which has scene-style separators . _ - and may not start with "UFC").
+// Used to reject "UFC 276" (numbered PPV) candidates from being matched to
+// "UFC Fight Night 276" (different event sharing only the number 276), and
+// vice versa. Order matters: check Fight Night before PPV because a fight-
+// night title also contains "UFC <digits>". 0.33.6 adds an explicit branded
+// check so "UFC.Freedom.250" / "UFC Freedom 250" classifies as 'ppv' too.
+function ufcTitleType(title) {
+  const t = title || '';
+  if (/\bUFC[\s._-]*Fight[\s._-]*Night\b/i.test(t)) return 'fight-night';
+  if (/\bUFC[\s._-]+on[\s._-]+(?:ABC|ESPN|FOX|FX)\b/i.test(t)) return 'ufc-on-network';
+  if (/\bContender[\s._-]*Series\b/i.test(t)) return 'contender-series';
+  // Branded numbered: "UFC Freedom 250" / "UFC.Freedom.250"
+  if (/\bUFC[\s._-]+(?!(?:Fight|on|Contender)\b)[A-Za-z]+[\s._-]+\d{1,4}\b/i.test(t)) return 'ppv';
+  // Plain numbered: "UFC 250" / "UFC.250"
+  if (/\bUFC[\s._-]*\d{1,4}\b/i.test(t)) return 'ppv';
+  return 'other';
+}
+
+const ufc = {
+  id: 'ufc',
+  name: 'UFC',
+  idPrefix: 'ufc',
+  enabled: true,
+  source: { type: 'thesportsdb', leagueId: '4443' },
+
+  // Stremio's posterShape — landscape for TSDB-sourced (we prefer strThumb).
+  posterShape: 'landscape',
+
+  // Static fallback artwork. TSDB often hasn't populated posters for
+  // upcoming events; this guarantees Stremio renders a UFC-branded tile
+  // rather than a blank.
+  defaults: {
+    // TSDB-hosted UFC league banner (landscape, UFC-branded) — distinct
+    // from the octagon photo used as fanart so the catalog tile doesn't
+    // look identical to the meta-page backdrop. WWE/ONE/AEW use the same
+    // TSDB-league pattern; this brings UFC in line with them.
+    poster: brandedPoster('ufc-upcoming.jpg', 'https://r2.thesportsdb.com/images/media/league/banner/rwyuqv1463908317.jpg'),
+    // TSDB CDN art (NOT upload.wikimedia.org — Wikimedia 403s some clients,
+    // e.g. Android-TV Nuvio, so its images render broken there).
+    fanart: 'https://r2.thesportsdb.com/images/media/league/fanart/vrutwv1463859748.jpg',
+    logo:   'https://r2.thesportsdb.com/images/media/league/logo/1gp4vo1722604906.png',
+  },
+
+  // Wikipedia page title derived from the event short handle. Used by the
+  // post-refresh enrichment pass to pull a poster + summary from Wikipedia
+  // when TSDB hasn't populated those fields yet.
+  wikipediaTitle(name) {
+    const sh = ufc.shortHandle(name);
+    return sh ? sh.replace(/\s+/g, '_') : null;
+  },
+
+  classify(name) {
+    if (!name) return 'other';
+    if (UFC_CONTENDER_RE.test(name)) return 'contender-series';
+    if (UFC_PPV_RE.test(name)) return 'ppv';
+    // 0.33.6: branded numbered PPV ("UFC Freedom 250 Topuria vs Gaethje").
+    // Checked after plain PPV; the negative lookahead inside the regex skips
+    // events that should be handled by the Fight Night / UFC-on-network /
+    // Contender Series classifiers immediately below.
+    if (UFC_BRANDED_PPV_RE.test(name)) return 'ppv';
+    if (UFC_FN_RE.test(name)) return 'fight-night';
+    if (UFC_ON_RE.test(name)) return 'ufc-on-network';
+    return 'other';
+  },
+
+  shortHandle(name) {
+    if (!name) return null;
+    let m;
+    if ((m = name.match(/^(UFC\s*\d{1,4})\b/i))) return m[1].replace(/\s+/g, ' ').trim();
+    if ((m = name.match(/^(UFC\s+Fight\s+Night\s*\d{0,4})\b/i))) return m[1].replace(/\s+/g, ' ').trim();
+    if ((m = name.match(/^(UFC\s+on\s+(?:ABC|ESPN|FOX|FX)\s*\d{0,3})\b/i))) return m[1].replace(/\s+/g, ' ').trim();
+    // 0.33.6: branded numbered PPV — return "UFC Freedom 250" so Wikipedia
+    // lookups and alias-building have a clean handle for these events.
+    if ((m = name.match(/^(UFC\s+(?!(?:Fight|on|Contender)\b)[A-Za-z][A-Za-z']*\s+\d{1,4})\b/i))) {
+      return m[1].replace(/\s+/g, ' ').trim();
+    }
+    return null;
+  },
+
+  buildAliases(name) {
+    const out = new Set();
+    if (!name) return [];
+    const t = name.trim();
+    out.add(t);
+    const sh = ufc.shortHandle(t); if (sh) out.add(sh);
+    const vs = genericVsHandle(t); if (vs) out.add(vs);
+    out.add(t.replace(/\s+/g, '.'));
+    out.add(t.replace(/:/g, ''));
+    if (sh && vs) out.add(sh + ' ' + vs);
+    return Array.from(out).filter(Boolean);
+  },
+
+  // 0.30.0: short scene-style queries for Newznab-style text search.
+  // The full event name ("UFC 291: Poirier vs. Gaethje 2") returns 0 hits on
+  // NZB indexers because Usenet uploaders never include the matchup in titles.
+  // The short form ("UFC 291") returns dozens. Each entry here is a complete,
+  // standalone query we fire at the indexer; they're deduped + merged downstream.
+  // 0.33.6: branded numbered PPVs ("UFC Freedom 250 Topuria vs Gaethje") now
+  // emit both the full branded handle ("UFC Freedom 250") AND the plain
+  // numbered form ("UFC 250"). Release groups overwhelmingly use the branded
+  // form, but the plain form is a cheap fallback against groups that drop the
+  // subtitle.
+  searchTitles(event) {
+    const name = event && event.name;
+    if (!name) return [];
+    const out = new Set();
+    // Branded numbered PPV: "UFC Freedom 250 Topuria vs Gaethje" → both
+    // "UFC Freedom 250" and "UFC 250". Checked first so plain-PPV logic
+    // below doesn't fire on the same event (the plain regex requires digits
+    // immediately after "UFC", which branded names don't satisfy, but the
+    // explicit ordering documents intent).
+    const branded = name.match(/^(UFC\s+(?!(?:Fight|on|Contender)\b)([A-Za-z][A-Za-z']*)\s+(\d{1,4}))\b/i);
+    if (branded) {
+      out.add(branded[1].replace(/\s+/g, ' ').trim());      // "UFC Freedom 250"
+      out.add('UFC ' + branded[3]);                          // "UFC 250" fallback
+    }
+    // Numbered PPV: "UFC 291: Poirier vs. Gaethje 2" → "UFC 291"
+    const ppv = name.match(/^(UFC\s*\d{1,4})\b/i);
+    if (ppv) out.add(ppv[1].replace(/\s+/g, ' ').trim());
+    // Numbered Fight Night: "UFC Fight Night 277: Song vs. Figueiredo"
+    const fn = name.match(/^UFC\s+Fight\s+Night\s+(\d{1,4})\b/i);
+    if (fn) {
+      out.add('UFC Fight Night ' + fn[1]);
+      out.add('UFC FN ' + fn[1]);
+    } else if (/^UFC\s+Fight\s+Night/i.test(name) && event.date) {
+      // Unnumbered FN: fall back to date-form (rare nowadays)
+      out.add('UFC Fight Night ' + event.date);
+    }
+    // UFC on ABC/ESPN/FOX/FX (numbered)
+    const onNet = name.match(/^(UFC\s+on\s+(?:ABC|ESPN|FOX|FX)\s*\d{0,3})\b/i);
+    if (onNet) out.add(onNet[1].replace(/\s+/g, ' ').trim());
+    // Contender Series — scene tag is "DWCS" or "Dana Whites Contender Series"
+    if (UFC_CONTENDER_RE.test(name)) {
+      const week = name.match(/\bweek\s*(\d{1,2})\b/i);
+      const year = event.date ? event.date.slice(0, 4) : '';
+      if (week && year) {
+        out.add('DWCS ' + year + ' Week ' + week[1]);
+        out.add('Contender Series ' + year + ' Week ' + week[1]);
+      } else if (year) {
+        out.add('DWCS ' + year);
+      }
+    }
+    return Array.from(out).filter(Boolean);
+  },
+
+  isRelevantStreamTitle(title, event) {
+    if (!title) return { ok: false, reason: 'no-title' };
+    const t = title.toLowerCase();
+    if (!t.includes('ufc')) return { ok: false, reason: 'no-ufc' };
+    // Disambiguate event type so e.g. "UFC 276" (a 2022 numbered PPV) doesn't
+    // match "UFC Fight Night 276" — they happen to share the number "276" but
+    // are different events. Both event sides must be a known type for the
+    // check to bite (lenient on 'other').
+    const eventType = ufc.classify(event.name || '');
+    const titleType = ufcTitleType(title);
+    const known = new Set(['ppv', 'fight-night', 'ufc-on-network', 'contender-series']);
+    if (known.has(eventType) && known.has(titleType) && eventType !== titleType) {
+      return { ok: false, reason: 'wrong-event-type(' + titleType + '≠' + eventType + ')' };
+    }
+    // 0.33.6: use ufcEventNumber() which understands branded numbered PPVs
+    // ("UFC Freedom 250" etc). The old inline regex
+    // `/ufc\s*(?:fight\s*night\s*)?(\d{1,4})/` couldn't extract the number
+    // when a subtitle word sat between "UFC" and the digits, so the event-
+    // number guard silently disabled itself and let unrelated releases match.
+    const num = ufcEventNumber(event.name || '');
+    if (num && !t.includes(num)) return { ok: false, reason: 'wrong-event-number' };
+    return { ok: true };
+  },
+
+  catalogs: [
+    { id: 'ufc-upcoming', name: 'UFC Upcoming',
+      filter: (ev) => ev.date && ev.date > isoToday(),
+      sort: (a, b) => (a.date || '').localeCompare(b.date || '') },
+    { id: 'ufc-recent', name: 'UFC Recent',
+      filter: (ev) => ev.date && ev.date <= isoToday(),
+      sort: (a, b) => (b.date || '').localeCompare(a.date || '') },
+  ],
+
+  eventScope: defaultEventScope,
+
+  includeEvent(ev, config) {
+    if (!config.includeContenderSeries && ev.kind === 'contender-series') return false;
+    // Road to UFC is a regional developmental series, not a main-roster UFC
+    // event — keep it out of the UFC catalog.
+    if (/road\s*to\s*ufc/i.test(ev.name || '')) return false;
+    return true;
+  },
+
+  genres(ev) {
+    const g = ['Sports', 'MMA', 'UFC'];
+    if (ev.kind === 'ppv') g.push('PPV');
+    if (ev.kind === 'fight-night') g.push('Fight Night');
+    return g;
+  },
+};
+
+// ===== ONE Championship =====
+const one = {
+  id: 'one',
+  name: 'ONE Championship',
+  idPrefix: 'one',
+  enabled: true,
+  source: {
+    // Authoritative feed: watch.onefc.com (Next.js SSR data endpoint).
+    // The Wikipedia year-page parser is still available as a fallback —
+    // promotion.wikipediaTitle drives the post-refresh description
+    // enrichment, so per-event Wikipedia summaries are still pulled.
+    type: 'onefc',
+  },
+
+  // ONE FC banners are landscape (Cloudinary 16:9-ish).
+  posterShape: 'landscape',
+
+  defaults: {
+    poster: 'https://r2.thesportsdb.com/images/media/league/banner/wsvtvu1422290020.jpg',
+    fanart: 'https://r2.thesportsdb.com/images/media/league/fanart/m4f49k1622281416.jpg',
+    logo:   'https://r2.thesportsdb.com/images/media/league/badge/4cem2k1619616539.png',
+  },
+
+  wikipediaTitle(name) {
+    const sh = one.shortHandle(name);
+    return sh ? sh.replace(/\s+/g, '_') : null;
+  },
+
+  classify(name) {
+    if (!name) return 'other';
+    if (/Friday\s*Fights/i.test(name)) return 'friday-fights';
+    if (/Fight\s*Night/i.test(name)) return 'fight-night';
+    if (/^ONE\s*(Championship\s*)?\d{1,4}\b/i.test(name)) return 'numbered';
+    return 'other';
+  },
+
+  shortHandle(name) {
+    if (!name) return null;
+    let m;
+    if ((m = name.match(/^(ONE\s*(?:Championship\s*)?\d{1,4})\b/i))) return m[1].replace(/\s+/g, ' ').trim();
+    if ((m = name.match(/^(ONE\s+Fight\s+Night\s*\d{0,4})\b/i))) return m[1].replace(/\s+/g, ' ').trim();
+    if ((m = name.match(/^(ONE\s+Friday\s+Fights\s*\d{0,4})\b/i))) return m[1].replace(/\s+/g, ' ').trim();
+    return null;
+  },
+
+  buildAliases(name) {
+    const out = new Set();
+    if (!name) return [];
+    const t = name.trim();
+    // Drop any "& The Inner Circle" sub-card label that ONE FC appends to
+    // some Friday Fights — release groups don't include it.
+    const tClean = t.replace(/\s*&\s*The\s+Inner\s+Circle\s*$/i, '').trim();
+    out.add(tClean);
+    const sh = one.shortHandle(tClean); if (sh) out.add(sh);
+    const vs = genericVsHandle(tClean); if (vs) out.add(vs);
+    out.add(tClean.replace(/\s+/g, '.'));
+    out.add(tClean.replace(/:/g, ''));
+
+    // Numbered events (ONE 173, ONE Championship 173)
+    const numbered = tClean.match(/^ONE\s+(?:Championship\s+)?(\d{1,4})\b/i);
+    if (numbered) {
+      out.add('ONE FC ' + numbered[1]);
+      out.add('ONE.FC.' + numbered[1]);
+      out.add('ONE Championship ' + numbered[1]);
+    }
+
+    // Fight Night — release groups commonly use ONE.FN.43 / ONE.FightNight.43
+    const fn = tClean.match(/^ONE\s+Fight\s+Night\s+(\d{1,4})\b/i);
+    if (fn) {
+      out.add('ONE FN ' + fn[1]);
+      out.add('ONE.FN.' + fn[1]);
+      out.add('ONE.FightNight.' + fn[1]);
+      out.add('ONE FightNight ' + fn[1]);
+    }
+
+    // Friday Fights — release groups use ONE.FF.137 / ONE.FridayFights.137
+    const ff = tClean.match(/^ONE\s+Friday\s+Fights\s+(\d{1,4})\b/i);
+    if (ff) {
+      out.add('ONE FF ' + ff[1]);
+      out.add('ONE.FF.' + ff[1]);
+      out.add('ONE.FridayFights.' + ff[1]);
+      out.add('ONE FridayFights ' + ff[1]);
+      // Some release groups prefix the full promotion name, e.g.
+      // "One Championship ONE Friday Fights 155 ...".
+      out.add('ONE Championship Friday Fights ' + ff[1]);
+    }
+
+    if (sh && vs) out.add(sh + ' ' + vs);
+    return Array.from(out).filter(Boolean);
+  },
+
+  // 0.30.0: short queries for Usenet/Newsnab. ONE FC release naming is
+  // consistently number-based across all three series (numbered cards, FN, FF),
+  // so we emit ONLY the short forms — no event-name suffix.
+  searchTitles(event) {
+    const name = event && event.name;
+    if (!name) return [];
+    const out = new Set();
+    // Numbered: "ONE 173" / "ONE Championship 173"
+    const numbered = name.match(/^ONE\s+(?:Championship\s+)?(\d{1,4})\b/i);
+    if (numbered) {
+      out.add('ONE ' + numbered[1]);
+      out.add('ONE FC ' + numbered[1]);
+      out.add('ONE Championship ' + numbered[1]);
+    }
+    // Fight Night
+    const fn = name.match(/^ONE\s+Fight\s+Night\s+(\d{1,4})\b/i);
+    if (fn) {
+      out.add('ONE Championship ONE Fight Night ' + fn[1]);
+      out.add('ONE Fight Night ' + fn[1]);
+      out.add('ONE FN ' + fn[1]);
+    }
+    // Friday Fights
+    const ff = name.match(/^ONE\s+Friday\s+Fights\s+(\d{1,4})\b/i);
+    if (ff) {
+      out.add('ONE Championship ONE Friday Fights ' + ff[1]);
+      out.add('ONE Friday Fights ' + ff[1]);
+      out.add('ONE FF ' + ff[1]);
+    }
+    return Array.from(out).filter(Boolean);
+  },
+
+  isRelevantStreamTitle(title, event) {
+    if (!title) return { ok: false, reason: 'no-title' };
+    const t = title.toLowerCase();
+    // Accept ONE context including scene abbreviations (FN, FF, FC) and
+    // ONE sub-brands: Samurai, Lumpinee, Hero. Numeric suffixes
+    // (`ONE 173`, `ONE.Samurai.1`) also count as context. The event-number
+    // check below filters out any false positives that slip through.
+    if (!/\bone[\s.\-_]+(fc|championship|fight[\s.\-_]*night|friday[\s.\-_]*fights|fn|ff|fightnight|fridayfights|samurai|lumpinee|hero|warrior|\d)/i.test(title)) {
+      return { ok: false, reason: 'no-one-context' };
+    }
+    // Event number is a strong signal — accept 1+ digits since some series
+    // (ONE Samurai 1) start at 1.
+    const m = (event.name || '').match(/\b(\d{1,4})\b/);
+    if (m && !t.includes(m[1])) return { ok: false, reason: 'wrong-event-number' };
+    return { ok: true };
+  },
+
+  catalogs: [
+    { id: 'one-upcoming', name: 'ONE Upcoming',
+      filter: (ev) => ev.date && ev.date > isoToday(),
+      sort: (a, b) => (a.date || '').localeCompare(b.date || '') },
+    { id: 'one-recent', name: 'ONE Recent',
+      filter: (ev) => ev.date && ev.date <= isoToday(),
+      sort: (a, b) => (b.date || '').localeCompare(a.date || '') },
+  ],
+
+  eventScope: defaultEventScope,
+
+  includeEvent(ev) { return true; },
+  genres(ev) {
+    const g = ['Sports', 'MMA', 'ONE'];
+    if (ev.kind === 'numbered') g.push('Numbered');
+    if (ev.kind === 'fight-night') g.push('Fight Night');
+    if (ev.kind === 'friday-fights') g.push('Friday Fights');
+    return g;
+  },
+};
+
+// ===== WWE (PPVs / Premium Live Events, including NXT-branded) =====
+const wwe = {
+  id: 'wwe',
+  name: 'WWE',
+  idPrefix: 'wwe',
+  enabled: true,
+  defaultMetadataStartDate: new Date().getUTCFullYear() + '-01-01',
+  source: { type: 'thesportsdb', leagueId: '4444' },
+
+  // Event-specific thumbnails are useful; TSDB's shared fanart/banner is not
+  // event art and can repeat the same old photo across every upcoming card.
+  posterShape: 'landscape',
+  preferThumb: true,
+
+  // Use the centered WWE brand card when no event-specific art exists.
+  defaults: {
+    poster: brandedPoster('wwe-upcoming.jpg', 'https://r2.thesportsdb.com/images/media/league/badge/ywtxyv1453504109.png'),
+    fanart: brandedPoster('wwe-upcoming.jpg', 'https://r2.thesportsdb.com/images/media/league/badge/ywtxyv1453504109.png'),
+    logo:   'https://r2.thesportsdb.com/images/media/league/badge/ywtxyv1453504109.png',
+  },
+
+  // TSDB still has the originally announced September date. WWE moved the
+  // 2026 event to October 10; scope this correction to this year's card so
+  // other editions and similarly named events retain their source dates.
+  correctDate(name, date) {
+    if (/^(?:WWE\s+)?Money\s+in\s+the\s+Bank(?:\s+2026)?$/i.test(String(name || '').trim())
+        && String(date || '').startsWith('2026-')) return '2026-10-10';
+    return date;
+  },
+
+  wikipediaTitle(name) { return null; },
+
+  // Normalize the upstream prefix before filtering weekly Main Event entries.
+  normaliseName(rawName) {
+    if (!rawName) return rawName;
+    if (/^Main\s+Event\b/i.test(rawName)) return 'WWE ' + rawName;
+    return rawName;
+  },
+
+  classify(name) {
+    if (!name) return 'other';
+    if (/^WrestleMania\b/i.test(name)) return 'mania';
+    if (/^Royal\s*Rumble\b/i.test(name)) return 'royal-rumble';
+    if (/^SummerSlam\b/i.test(name)) return 'summerslam';
+    if (/^Survivor\s*Series\b/i.test(name)) return 'survivor-series';
+    if (/Vengeance\s*Day|Stand\s*&\s*Deliver|Battleground|Halloween\s*Havoc|Heatwave|No\s*Mercy|Roadblock|Spring\s*Breakin|TakeOver/i.test(name)) return 'nxt';
+    return 'ple';
+  },
+
+  shortHandle(name) { return name ? name.trim().replace(/\s+/g, ' ') : null; },
+
+  buildAliases(name) {
+    if (!name) return [];
+    const out = new Set();
+    const t = name.trim();
+    out.add(t);
+    out.add(t.replace(/\s+/g, '.'));
+    out.add('WWE ' + t);
+    out.add('WWE.' + t.replace(/\s+/g, '.'));
+    return Array.from(out).filter(Boolean);
+  },
+
+  // 0.30.0: short queries for Usenet/Newsnab. WWE PLEs use scene-style naming
+  // already (WrestleMania 42, SummerSlam 2026, Royal Rumble 2026 etc.) — we
+  // mostly just strip colon-prefixed subtitles and append the year for
+  // annually-repeating events. Saturday Night's Main Event uses a broad name
+  // query because scene rips use Roman-numeral editions OR broadcast-date in
+  // dot-format (YYYY.MM.DD), which doesn't reliably match the TSDB UTC date.
+  // The relevance filter's year check narrows the broad results.
+  searchTitles(event) {
+    const name = event && event.name;
+    if (!name) return [];
+    const out = new Set();
+    // Strip any colon subtitle then strip a leading "WWE " so we don't
+    // double-prefix events that TSDB already labels "WWE …" (e.g. "WWE
+    // Main Event #713"). Also drop "#" — scene rips never use it.
+    const colonStripped = name.split(':')[0].trim();
+    const wweStripped = colonStripped.replace(/^WWE\s+/i, '').trim();
+    const bare = wweStripped.replace(/#/g, '').replace(/\s+/g, ' ').trim();
+    const year = event.date ? event.date.slice(0, 4) : '';
+
+    // Saturday Night's Main Event — broad name + year, no date.
+    if (/saturday\s*night.?s?\s*main\s*event/i.test(bare)) {
+      out.add('WWE Saturday Nights Main Event');
+      if (year) out.add('WWE Saturday Nights Main Event ' + year);
+      return Array.from(out).filter(Boolean);
+    }
+
+    // Bare event name as-is (already scene-style)
+    out.add(bare);
+    out.add('WWE ' + bare);
+    // If the name doesn't already carry a year/edition number, append the year
+    // — disambiguates annually-recurring PLEs (Royal Rumble, SummerSlam, etc).
+    if (year && !/\b(?:19|20)\d{2}\b|\b\d{1,3}\b/.test(bare)) {
+      out.add(bare + ' ' + year);
+      out.add('WWE ' + bare + ' ' + year);
+    }
+    return Array.from(out).filter(Boolean);
+  },
+
+  isRelevantStreamTitle(title, event) {
+    if (!title) return { ok: false, reason: 'no-title' };
+    const t = title.toLowerCase();
+    if (!/\b(wwe|nxt)\b/i.test(title)) return { ok: false, reason: 'no-wwe-context' };
+    const eventName = (event.name || '').toLowerCase();
+    const tokens = eventName.split(/\s+/).filter((x) => x.length >= 4);
+    if (tokens.length === 0) return { ok: true };
+    const hits = tokens.filter((tok) => t.includes(tok));
+    if (hits.length === 0) return { ok: false, reason: 'no-event-name-overlap' };
+    // Edition number: "WrestleMania 42" must NOT match WrestleMania 40 / 35 /
+    // Anthology, all of which contain the word "wrestlemania". Require the
+    // event's edition number as a standalone token in the title. Only a 1–3
+    // digit number counts as an edition (4-digit numbers are years, handled
+    // below). Skip Saturday Night's Main Event — those rips are titled by air
+    // date, not by the event number, so a number check would wrongly reject
+    // them (their date-based queries handle matching instead).
+    const isSNME = /saturday\s*night.?s?\s*main\s*event/i.test(event.name || '');
+    if (!isSNME) {
+      const editionMatch = (event.name || '').match(/\b(\d{1,3})\b/);
+      if (editionMatch) {
+        const n = editionMatch[1];
+        if (!new RegExp('\\b' + n + '\\b').test(title)) {
+          return { ok: false, reason: 'wrong-event-number' };
+        }
+      }
+    }
+    // WWE PPV names repeat annually (Backlash 2023 vs 2026 etc.) — reject
+    // candidates whose year token doesn't match the event's year.
+    if (!yearMatchesEvent(title, event)) return { ok: false, reason: 'wrong-year' };
+    return { ok: true };
+  },
+
+  catalogs: [
+    { id: 'wwe-upcoming', name: 'WWE Upcoming',
+      filter: (ev) => ev.date && ev.date > isoToday(),
+      sort: (a, b) => (a.date || '').localeCompare(b.date || '') },
+    { id: 'wwe-recent', name: 'WWE Recent',
+      filter: (ev) => ev.date && ev.date <= isoToday(),
+      sort: (a, b) => (b.date || '').localeCompare(a.date || '') },
+  ],
+
+  eventScope: defaultEventScope,
+
+  // TSDB league 4444 mixes WWE PPVs with weekly TV. Drop names that look
+  // like a weekly episode of RAW/SmackDown/EVOLVE/LFG, and numbered NXT
+  // episodes — but KEEP named NXT events (Vengeance Day, Stand & Deliver,
+  // etc.) and Saturday Night's Main Event PLEs. "WWE Main Event" is a
+  // weekly show, despite TSDB sometimes listing it alongside PLEs.
+  includeEvent(ev) {
+    const n = (ev.name || '').trim();
+    if (/^(Saturday|Sunday)\s*Night.?s?\s*Main\s*Event\b/i.test(n)) return true;
+    if (/^(?:WWE\s+)?Main\s*Event\b/i.test(n)) return false;
+    if (/^(?:WWE\s+)?NXT\s*#\d/i.test(n)) return false;   // numbered NXT = weekly
+    if (/^(?:WWE\s+)?(RAW|SmackDown|EVOLVE|LFG)\b/i.test(n)) return false;
+    if (/^World\s*At\s*WrestleMania/i.test(n)) return false; // panel/recap show
+    if (/^(NXT\s*)?Countdown\s*To\b/i.test(n)) return false; // pre-show countdown
+    return true;
+  },
+  genres(ev) {
+    const g = ['Sports', 'Wrestling', 'WWE'];
+    if (ev.kind === 'nxt') g.push('NXT');
+    if (ev.kind === 'mania') g.push('WrestleMania');
+    return g;
+  },
+
+  // Sanity filter: reported bad metadata was two differently-named,
+  // already-scoped WWE events (e.g. "Money In The Bank" and "Saturday
+  // Nights Main Event") sharing the exact same dateEvent from TSDB.
+  // WWE does not run two televised shows on the same calendar day, so a
+  // same-date collision between distinct names is an upstream TSDB data
+  // error, not a real schedule. (Distinct WWE Main Event episodes each
+  // carrying their own date, as TSDB's mini-PLE series does, is expected
+  // and NOT a collision — this only fires when two DIFFERENT dates would
+  // otherwise be identical.)
+  //
+  // Rather than guess which record is correct, keep the one with richer
+  // metadata (a venue, and per-event art rather than the branded
+  // fallback) and drop the other, logging the collision so it can be
+  // reviewed — a silently-kept wrong date is worse than a dropped event.
+  sanitizeEvents(events, log) {
+    log = log || (() => {});
+    const byDate = new Map();
+    for (const ev of events || []) {
+      if (!ev || !ev.date) continue;
+      if (!byDate.has(ev.date)) byDate.set(ev.date, []);
+      byDate.get(ev.date).push(ev);
+    }
+    const drop = new Set();
+    for (const [date, group] of byDate) {
+      if (group.length < 2) continue;
+      const distinctNames = new Set(group.map((e) => e.name));
+      if (distinctNames.size < 2) continue; // same name/date = a true dupe id, not this bug
+      const scored = group
+        .map((e) => ({
+          ev: e,
+          score: (e.venue ? 1 : 0) + (e.poster && e.poster !== (wwe.defaults.poster || null) ? 1 : 0),
+        }))
+        .sort((a, b) => b.score - a.score);
+      for (let i = 1; i < scored.length; i++) drop.add(scored[i].ev.id);
+      log('  [wwe] date collision on ' + date + ' between: ' + group.map((e) => '"' + e.name + '"').join(' / ')
+        + ' — keeping "' + scored[0].ev.name + '", dropping ' + (scored.length - 1) + ' other(s) as likely bad upstream date(s)');
+    }
+    return (events || []).filter((e) => !drop.has(e.id));
+  },
+};
+
+const aew = {
+  id: 'aew',
+  name: 'AEW',
+  idPrefix: 'aew',
+  enabled: true,
+  // AEW publishes its own schedule, so ask AEW.
+  //
+  // TheSportsDB's free key cannot reach AEW's upcoming cards: eventsnextleague
+  // returns one event, eventsseason returns fifteen, and AEW runs about three
+  // weekly tapings a week, so the fifteen are spent before February and every
+  // PPV falls outside them. Three rounds of workarounds — named-card lookups
+  // against a hand-written list of recurring names — and the Upcoming row was
+  // still empty or carrying the wrong dates.
+  //
+  // allelitewrestling.com/events lists every announced card, with AEW's own
+  // LOCAL dates and real artwork. TheSportsDB had All Out on the 27th and Full
+  // Gear on the 15th; AEW says the 26th and the 14th, and releases are named by
+  // the local date — so the old dates were wrong for matching as well as for
+  // the catalogue. TheSportsDB · AEW is still offered as a selectable source
+  // for anyone with a premium key who prefers it.
+  source: { type: 'aew' },
+
+  // TSDB strThumb is landscape; we prefer it for the poster field.
+  posterShape: 'landscape',
+
+  // TSDB-hosted AEW league art (verified reachable). The previous Wikipedia
+  // SVG-derived URL returned 404, leaving Upcoming tiles blank.
+  defaults: {
+    poster: 'https://r2.thesportsdb.com/images/media/league/banner/brkflv1574635493.jpg',
+    fanart: 'https://r2.thesportsdb.com/images/media/league/fanart/sw5kmu1582130686.jpg',
+    logo:   'https://r2.thesportsdb.com/images/media/league/badge/zb3zn01708517335.png',
+  },
+
+  wikipediaTitle(name) { return null; },
+  classify(name) { return 'ppv'; },
+  shortHandle(name) { return name ? name.trim().replace(/\s+/g, ' ') : null; },
+
+  buildAliases(name) {
+    if (!name) return [];
+    const out = new Set();
+    const t = name.trim();
+    out.add(t);
+    out.add(t.replace(/\s+/g, '.'));
+    out.add('AEW ' + t);
+    out.add('AEW.' + t.replace(/\s+/g, '.'));
+    return Array.from(out).filter(Boolean);
+  },
+
+  // 0.30.0: short queries for Usenet/Newsnab. AEW PPV names recur annually
+  // (Revolution 2026 vs 2025) so we always pin the year. The promotion's
+  // weekly-TV slip-through (Dynamite/Collision/Rampage) is already filtered
+  // by includeEvent, but if any escape we date-key them.
+  searchTitles(event) {
+    const name = event && event.name;
+    if (!name) return [];
+    const out = new Set();
+    // Strip any "AEW " prefix already on the event name so we don't double it
+    // (TSDB sometimes returns "AEW Revolution", sometimes just "Revolution").
+    const bareRaw = name.split(':')[0].trim();
+    const bare = bareRaw.replace(/^AEW\s+/i, '').trim();
+    const year = event.date ? event.date.slice(0, 4) : '';
+    // Already-year-tagged ("All In London 2026") — don't append another year.
+    const hasYearAlready = /\b(?:19|20)\d{2}\b/.test(bare);
+    // Weekly TV (shouldn't normally reach here, but safe fallback)
+    if (/^(Dynamite|Collision|Rampage)\b/i.test(bare)) {
+      const which = bare.match(/^(Dynamite|Collision|Rampage)/i)[1];
+      if (event.date) {
+        out.add('AEW ' + which + ' ' + event.date);
+        out.add('AEW ' + which + ' ' + event.date.replace(/-/g, '.'));
+      }
+      return Array.from(out).filter(Boolean);
+    }
+    // PPVs — "Revolution", "Dynasty", "Double or Nothing", "Forbidden Door", "All In"
+    //
+    // AEW's own schedule names its cards WITH the year — "All Out 2026", "Full
+    // Gear 2026" — where TheSportsDB named them without. That is better data,
+    // but it collapsed this builder to a single query: the year was already
+    // present, so the only branch that added anything was skipped and the
+    // promotion went to the indexers with one string.
+    //
+    // So work from the stem instead of from whatever the source happened to
+    // call it, and emit both halves either way. Order is the usual rule — the
+    // form observed in real releases first, because a bounded provider may only
+    // send one or two.
+    const stem = bare.replace(/\s*\b(?:19|20)\d{2}\b\s*$/, '').trim() || bare;
+    const eventYear = hasYearAlready
+      ? (bare.match(/\b((?:19|20)\d{2})\b/) || [])[1] || year
+      : year;
+    if (eventYear) out.add('AEW ' + stem + ' ' + eventYear);
+    // Plenty of releases omit the year entirely.
+    out.add('AEW ' + stem);
+    // Prefix-free, for the groups that lead with the card name.
+    if (eventYear) out.add(stem + ' ' + eventYear);
+    return Array.from(out).filter(Boolean);
+  },
+
+  isRelevantStreamTitle(title, event) {
+    if (!title) return { ok: false, reason: 'no-title' };
+    if (!/\baew\b/i.test(title)) return { ok: false, reason: 'no-aew-context' };
+
+    // Match the card's NAME as a phrase, not its long words.
+    //
+    // This used to keep only tokens of four characters or more and accept the
+    // title if any one of them appeared — and if none survived the filter, it
+    // returned ok for anything AEW at all. "All Out" has no word that long, so
+    // every AEW release in existence matched it. AEW's own schedule then made
+    // it worse by naming cards with the year: "All Out 2026" left exactly one
+    // token, "2026", so "AEW Full Gear 2026" matched an All Out fixture.
+    //
+    // The card name is short, distinctive and always present in the release, so
+    // require it whole. Separators vary (AEW.All.Out.2026, AEW All Out 2026),
+    // which is what the flattening is for.
+    const flatten = (value) => String(value || '').toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
+    const haystack = flatten(title);
+    const stem = flatten(String(event.name || '')
+      .split(':')[0].replace(/^AEW\s+/i, '')
+      .replace(/\s*\b(?:19|20)\d{2}\b\s*$/, ''));
+    if (!stem) return { ok: false, reason: 'no-event-name' };
+    if (!(' ' + haystack + ' ').includes(' ' + stem + ' ')) {
+      return { ok: false, reason: 'no-event-name-overlap' };
+    }
+    // AEW PPV names repeat annually (Revolution, Double or Nothing, etc.).
+    // Reject candidates whose year token doesn't match the event's year.
+    if (!yearMatchesEvent(title, event)) return { ok: false, reason: 'wrong-year' };
+    return { ok: true };
+  },
+
+  catalogs: [
+    { id: 'aew-upcoming', name: 'AEW Upcoming',
+      filter: (ev) => ev.date && ev.date > isoToday(),
+      sort: (a, b) => (a.date || '').localeCompare(b.date || '') },
+    { id: 'aew-recent', name: 'AEW Recent',
+      filter: (ev) => ev.date && ev.date <= isoToday(),
+      sort: (a, b) => (b.date || '').localeCompare(a.date || '') },
+  ],
+
+  eventScope: defaultEventScope,
+
+  // TSDB league 4563 mixes AEW PPVs with weekly TV (Dynamite, Collision,
+  // Rampage). Drop those — keep PPVs (Revolution, Dynasty, Double or
+  // Nothing, Forbidden Door, All In, etc.) and specials.
+  includeEvent(ev) {
+    const n = (ev.name || '').trim();
+    if (/^(?:AEW\s+)?(Dynamite|Collision|Rampage|Battle\s+of\s+the\s+Belts)\b/i.test(n)) return false;
+    // Non-broadcast fan events. AEW's own schedule lists these alongside the
+    // cards — "All Out Afternoon Block Party" is a party in a beer garden, and
+    // there is nothing to stream. They were not in TheSportsDB's data, so this
+    // rule arrived with the source that publishes them.
+    if (/\b(Block\s*Party|Fan\s*Fest|Watch\s*Party|Meet\s*(?:and|&)\s*Greet|Signing)\b/i.test(n)) {
+      return false;
+    }
+    return true;
+  },
+  genres(ev) { return ['Sports', 'Wrestling', 'AEW']; },
+};
+
+// Weekly television sits in the same TSDB leagues as the premium cards, but
+// has different release naming and a much shorter useful history. Give each
+// show its own catalog and strict brand/show/date matching. The parent WWE
+// and AEW promotions keep their premium events without duplicate episodes.
+// TheSportsDB's dateEvent for these weekly leagues (4444 WWE, 4563 AEW) is
+// the UTC calendar day of the broadcast's start time. Raw, SmackDown, NXT,
+// Dynamite and Collision all air in the evening, US Eastern — which is past
+// midnight UTC — so the UTC date lands on the day AFTER the real, advertised
+// air date (an 8pm ET Monday Raw is stored as Tuesday). The PPV catalogs
+// don't have this problem: WWE's known-wrong dates get a manual override
+// (see correctDate above) and AEW's PPVs come from AEW's own site instead of
+// TheSportsDB (lib/sources/aew.js). The weekly episodes get neither, so
+// recompute the broadcast's US Eastern calendar date from the source
+// timestamp instead of trusting TSDB's UTC date part.
+//
+// Only runs off a raw TSDB record (never the bare cached-event repair call in
+// scripts/refresh.js, which passes no third argument) — that keeps this
+// idempotent: it always recomputes from the unchanging source fields rather
+// than from a date that may already have been corrected.
+function correctWeeklyShowDate(name, date, raw) {
+  if (!raw) return date;
+  const utcDate = String(raw.dateEvent || date || '');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(utcDate)) return date;
+  const time = /^\d{2}:\d{2}:\d{2}$/.test(String(raw.strTime || '')) ? raw.strTime : '00:00:00';
+  const instant = new Date(utcDate + 'T' + time + 'Z');
+  if (Number.isNaN(instant.getTime())) return date;
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(instant);
+  const map = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+  const local = map.year + '-' + map.month + '-' + map.day;
+  return /^\d{4}-\d{2}-\d{2}$/.test(local) ? local : date;
+}
+
+function weeklyWrestlingShow({ id, name, brand, show, leagueId, pattern, includePattern, parent }) {
+  const promotion = createGenericPromotion({
+    id, name, idPrefix: id, source: 'tsdb', leagueId,
+    posterShape: 'landscape',
+    poster: parent.defaults.poster, fanart: parent.defaults.fanart,
+    logo: parent.defaults.logo,
+    promotionAliases: [brand + ' ' + show],
+    searchTitleTemplates: ['{name} {date_dotted}', '{name} {date_compact}'],
+    relevanceKeywords: [brand.toLowerCase(), show.toLowerCase()],
+    requireDateInTitle: true,
+  });
+  promotion.isCustom = false;
+  promotion.defaultMetadataStartDate = new Date().getUTCFullYear() + '-01-01';
+  promotion.weeklyShow = true;
+  promotion.preferThumb = true;
+  promotion.includeEvent = (event) => (includePattern || pattern).test(String(event && event.name || '').trim());
+  promotion.normaliseName = (rawName) => {
+    const raw = String(rawName || '').trim();
+    return brand + ' ' + show + raw.replace(pattern, '');
+  };
+  promotion.correctDate = (evName, date, raw) => correctWeeklyShowDate(evName, date, raw);
+  promotion.searchTitles = (event) => {
+    const date = String(event && event.date || '');
+    if (!date) return [];
+    const title = brand + ' ' + show;
+    // Bitmagnet tokenizes punctuation in release names but its query parser
+    // does not reliably match dotted dates supplied as search terms.
+    const out = [title + ' ' + date.replace(/-/g, ' '),
+      title + ' ' + date.replace(/-/g, '.'),
+      title + ' ' + date.replace(/-/g, '')];
+    const number = String(event.name || '').match(/#(\d{2,5})\b/);
+    if (number) out.push(title + ' ' + number[1]);
+    return out;
+  };
+  const brandInTitle = new RegExp('\\b' + brand + '\\b', 'i');
+  const showInTitle = new RegExp('\\b' + show + '\\b', 'i');
+  promotion.isRelevantStreamTitle = (title, event) => {
+    const text = String(title || '');
+    if (!brandInTitle.test(text) || !showInTitle.test(text)) {
+      return { ok: false, reason: 'wrong-weekly-show' };
+    }
+    if (!yearMatchesEvent(text, event)) return { ok: false, reason: 'wrong-year' };
+    const date = dateMatchesEvent(text, event);
+    if (date !== 'match') return { ok: false, reason: date === 'wrong-date' ? 'wrong-date' : 'no-date-in-title' };
+    return { ok: true };
+  };
+  promotion.genres = () => ['Sports', 'Wrestling', brand, show];
+  return promotion;
+}
+
+const wrestlingWeeklyShows = [
+  weeklyWrestlingShow({ id: 'wwe-raw', name: 'WWE Raw', brand: 'WWE', show: 'Raw',
+    leagueId: '4444', pattern: /^(?:WWE\s+)?RAW\b/i, parent: wwe }),
+  weeklyWrestlingShow({ id: 'wwe-smackdown', name: 'WWE SmackDown', brand: 'WWE', show: 'SmackDown',
+    leagueId: '4444', pattern: /^(?:WWE\s+)?SmackDown\b/i, parent: wwe }),
+  weeklyWrestlingShow({ id: 'wwe-nxt', name: 'WWE NXT', brand: 'WWE', show: 'NXT',
+    leagueId: '4444', pattern: /^(?:WWE\s+)?NXT\b/i,
+    includePattern: /^(?:WWE\s+)?NXT\s*#\d/i, parent: wwe }),
+  weeklyWrestlingShow({ id: 'aew-dynamite', name: 'AEW Dynamite', brand: 'AEW', show: 'Dynamite',
+    leagueId: '4563', pattern: /^(?:AEW\s+)?Dynamite\b/i, parent: aew }),
+  weeklyWrestlingShow({ id: 'aew-collision', name: 'AEW Collision', brand: 'AEW', show: 'Collision',
+    leagueId: '4563', pattern: /^(?:AEW\s+)?Collision\b/i, parent: aew }),
+];
+
+// ===== Formula 1 =====
+// TheSportsDB splits a Grand Prix weekend into separate events: Practice 1/2/3,
+// Qualifying, Sprint Qualifying, Sprint, and the Race (plus pre-season Testing).
+// We surface EACH session as its own catalog item and match the corresponding
+// release — scene F1 rips are per-session, e.g.
+//   Formula.1.2026x34.R05.CanadianGP.Race.MULTi.1080p
+//   Formula.1.2026x33.R05.CanadianGP.Qualifying.F1TV.1080p
+//   Formula.1.2026x32.R05.CanadianGP.Sprint.MULTi.1080p
+//   Formula.1.2026x31.R05.CanadianGP.Sprint.Qualification.F1TV.1080p
+
+function f1Location(name) {
+  // GP name minus "Grand Prix" and any trailing session words.
+  return (name || '')
+    .replace(/\bgrand\s*prix\b.*$/i, '')
+    .replace(/\bf1\b|\bformula\s*1\b/i, '')
+    .trim();
+}
+
+// Which session a TSDB event represents (from its name).
+function f1Session(name) {
+  const n = (name || '').toLowerCase();
+  if (/testing|pre[\s-]*season/.test(n)) return 'testing';
+  if (/sprint[\s.\-_]*(qualifying|qualification|shootout)/.test(n)) return 'sprint-qualifying';
+  if (/\bsprint\b/.test(n)) return 'sprint';
+  if (/qualifying|qualification|\bquali\b/.test(n)) return 'qualifying';
+  if (/practice|free[\s.\-_]*practice|\bfp[1-3]\b/.test(n)) return 'practice';
+  return 'race';
+}
+
+// Which session a candidate release title represents.
+function f1TitleSession(title) {
+  const t = (title || '').toLowerCase();
+  if (/full[\s._-]*weekend|полный\s+уикэнд|(?:практики.*квалификация.*гонка)/i.test(t)) return 'full-weekend';
+  const sprint = /\bsprint\b|спринт/.test(t);
+  const quali = /qualif|квалификац/.test(t);
+  if (sprint && quali) return 'sprint-qualifying';
+  if (sprint) return 'sprint';
+  if (quali) return 'qualifying';
+  if (/\bpractice\b|free[\s.\-_]*practice|\bfp[1-3]\b|практик/.test(t)) return 'practice';
+  if (/\brace\b|гонка/.test(t)) return 'race';
+  return 'unlabelled';
+}
+
+const F1_SESSION_LABEL = {
+  race: 'Race', qualifying: 'Qualifying', sprint: 'Sprint',
+  'sprint-qualifying': 'Sprint Qualifying', practice: 'Practice',
+};
+
+// Adjective -> country/city noun mapping for F1 GPs. TSDB uses the adjective
+// form ("Canadian Grand Prix"); a meaningful chunk of scene rips use the
+// noun form ("Canada") instead, and our queries need to fire both shapes to
+// catch all the releases. Lower-case keys, matched case-insensitively.
+const F1_LOCATION_NOUN = {
+  'canadian': 'Canada',
+  'chinese': 'China',
+  'italian': 'Italy',
+  'spanish': 'Spain',
+  'british': 'Britain',        // also 'UK', 'Silverstone' — try main one first
+  'french': 'France',
+  'german': 'Germany',
+  'belgian': 'Belgium',
+  'hungarian': 'Hungary',
+  'austrian': 'Austria',
+  'dutch': 'Netherlands',
+  'japanese': 'Japan',
+  'brazilian': 'Brazil',
+  'australian': 'Australia',
+  'mexican': 'Mexico',
+  'qatari': 'Qatar',
+  'bahraini': 'Bahrain',
+  'azerbaijani': 'Azerbaijan',
+  'american': 'USA',
+  'saudi arabian': 'SaudiArabia',
+  'abu dhabi': 'AbuDhabi',
+};
+
+function f1LocationNoun(loc) {
+  if (!loc) return null;
+  const lower = loc.toLowerCase().trim();
+  return F1_LOCATION_NOUN[lower] || null;
+}
+
+const f1 = {
+  id: 'f1',
+  name: 'Formula 1',
+  idPrefix: 'f1',
+  enabled: true,
+  source: { type: 'thesportsdb', leagueId: '4370' },
+  posterShape: 'landscape',
+  // F1 ships a clean 16:9 per-session thumb (labelled circuit card: round,
+  // country, session, date, circuit) — use it. Fall back to the branded F1
+  // card for events with no thumb yet. (The wide GP-name banners that crop are
+  // strFanart/strBanner, which preferThumb skips.)
+  preferThumb: true,
+
+  defaults: {
+    poster: brandedPoster('f1-upcoming.jpg', 'https://r2.thesportsdb.com/images/media/league/banner/srsuyy1421852767.jpg'),
+    fanart: 'https://r2.thesportsdb.com/images/media/league/fanart/hreocd1620552411.jpg',
+    logo:   'https://r2.thesportsdb.com/images/media/league/logo/jiqa741556460666.png',
+  },
+
+  wikipediaTitle(name) { return null; },
+
+  classify(name) { return f1Session(name); },
+
+  shortHandle(name) { return name ? name.trim().replace(/\s+/g, ' ') : null; },
+
+  buildAliases(name) {
+    if (!name) return [];
+    const out = new Set();
+    const t = name.trim();
+    const loc = f1Location(t);
+    const after = t.replace(/^.*\bgrand\s*prix\b/i, '').replace(/\s+/g, ' ').trim();
+    out.add(t);
+    out.add('F1 ' + t);
+    out.add('Formula 1 ' + t);
+    if (loc) {
+      out.add(('F1 ' + loc + ' GP ' + after).trim());
+      out.add(('Formula 1 ' + loc + ' Grand Prix ' + after).trim());
+      out.add((loc.replace(/\s+/g, '') + 'GP ' + after).trim());
+    }
+    return Array.from(out).filter(Boolean);
+  },
+
+  // 0.30.0: short queries for Usenet/Newsnab. F1 scene naming is consistent
+  // ("Formula.1.YYYY.<location>.GP.<session>") so we generate that shape plus
+  // a couple of equally-valid common variants.
+  searchTitles(event) {
+    const name = event && event.name;
+    if (!name) return [];
+    const out = new Set();
+    const loc = f1Location(name).trim();
+    if (!loc) return [];
+    const session = f1Session(name);
+    const year = event.date ? event.date.slice(0, 4) : '';
+    const sessionLabel = F1_SESSION_LABEL[session] || '';
+    // Race: scene rips for F1 races use multiple naming conventions:
+    //   Formula.1.2026.Canadian.Grand.Prix.Race.WEB        (adjective)
+    //   F1.2026.R05.Canadian.Grand.Prix                    (round + adjective)
+    //   F1.2026.Round.5.Canada.Race                        (round + noun + Race)
+    //   F1.2026.Round05.Canada                             (compact)
+    // We fire enough variants to cover both adjective and country-noun
+    // forms, with a round-prefixed variant when TSDB gives us the round.
+    if (session === 'race') {
+      if (year) {
+        out.add(('Formula 1 ' + year + ' ' + loc + ' GP').trim());
+        out.add(('F1 ' + year + ' ' + loc + ' GP').trim());
+        out.add(('Formula 1 ' + year + ' ' + loc + ' Grand Prix').trim());
+        out.add(('F1 ' + year + ' ' + loc + ' Race').trim());
+
+        // Country-noun variants (Canadian -> Canada). Many groups label
+        // race-specific rips with the country noun.
+        const noun = f1LocationNoun(loc);
+        if (noun && noun.toLowerCase() !== loc.toLowerCase()) {
+          out.add(('F1 ' + year + ' ' + noun).trim());
+          out.add(('F1 ' + year + ' ' + noun + ' Race').trim());
+          out.add(('Formula 1 ' + year + ' ' + noun + ' Race').trim());
+        }
+
+        // Round-prefixed variants when TSDB ships a round number. Format
+        // 'R05' is the dominant scene convention.
+        if (event.round) {
+          const r = String(event.round).padStart(2, '0');
+          out.add(('F1 ' + year + ' R' + r + ' ' + loc + ' GP').trim());
+          if (noun && noun.toLowerCase() !== loc.toLowerCase()) {
+            out.add(('F1 ' + year + ' R' + r + ' ' + noun).trim());
+          }
+        }
+      }
+    } else if (sessionLabel) {
+      // Per-session: "Formula 1 2026 Monaco GP Qualifying"
+      if (year) {
+        out.add(('Formula 1 ' + year + ' ' + loc + ' GP ' + sessionLabel).trim());
+        out.add(('F1 ' + year + ' ' + loc + ' GP ' + sessionLabel).trim());
+        // F1 scene rips also use the compact location token without GP suffix
+        out.add(('Formula 1 ' + year + ' ' + loc + ' ' + sessionLabel).trim());
+      }
+    }
+    // Round-only variants recover international indexers whose translated
+    // location names do not match the English schedule. Keep them after the
+    // precise location/session forms so mainstream indexers see those first.
+    if (year && event.round) {
+      const round = String(parseInt(event.round, 10));
+      out.add(('Formula 1 ' + year + ' Round ' + round).trim());
+      out.add(('Formula 1 ' + year + ' Этап ' + round).trim());
+    }
+    return Array.from(out).filter(Boolean);
+  },
+
+  isRelevantStreamTitle(title, event) {
+    if (!title) return { ok: false, reason: 'no-title' };
+    if (/\b(?:formula|f)[\s._-]*[23]\b/i.test(title)) {
+      return { ok: false, reason: 'formula-2-or-3' };
+    }
+    if (!/\b(f1|formula\s*1|formula1|formula\.1)\b/i.test(title)
+        && !/формула\s*1/i.test(title)) {
+      return { ok: false, reason: 'no-f1-context' };
+    }
+    const t = title.toLowerCase();
+    // Event match: round (R05 / Round 5) or location stem.
+    const round = event.round ? String(parseInt(event.round, 10)) : '';
+    const roundOk = !!round && new RegExp('(?:\\br|round|этап)[\\s._-]*0*' + round + '\\b', 'i').test(title);
+    const loc = f1Location(event.name || '').toLowerCase().replace(/\s+/g, '');
+    const locStem = loc.replace(/(ese|ian|ish|an|n)$/, '').slice(0, 6);
+    const locOk = locStem.length >= 4 && t.replace(/\s+/g, '').includes(locStem);
+    if (!roundOk && !locOk) return { ok: false, reason: 'no-event-match' };
+    if (!yearMatchesEvent(title, event)) return { ok: false, reason: 'wrong-year' };
+    // Session must match the specific session this catalog item represents.
+    const want = f1Session(event.name);
+    const got = f1TitleSession(title);
+    if (want === 'race') {
+      if (got !== 'race' && got !== 'unlabelled' && got !== 'full-weekend') {
+        return { ok: false, reason: 'session(' + got + '≠race)' };
+      }
+    } else if (got !== want) {
+      return { ok: false, reason: 'session(' + got + '≠' + want + ')' };
+    }
+    return { ok: true };
+  },
+
+  catalogs: [
+    // Upcoming = the main Race only, so the "what's next" view isn't cluttered
+    // with every practice/qualifying session of future weekends.
+    { id: 'f1-upcoming', name: 'F1 Upcoming',
+      filter: (ev) => f1Session(ev.name) === 'race' && ev.date && ev.date > isoToday(),
+      sort: (a, b) => (a.date || '').localeCompare(b.date || '') },
+    // One catalog per session stage — completed sessions (today or earlier),
+    // newest first.
+    { id: 'f1-race', name: 'F1 Race',
+      filter: (ev) => f1Session(ev.name) === 'race' && ev.date && ev.date <= isoToday(),
+      sort: (a, b) => (b.date || '').localeCompare(a.date || '') },
+    { id: 'f1-qualifying', name: 'F1 Qualifying',
+      filter: (ev) => f1Session(ev.name) === 'qualifying' && ev.date && ev.date <= isoToday(),
+      sort: (a, b) => (b.date || '').localeCompare(a.date || '') },
+    { id: 'f1-sprint', name: 'F1 Sprint',
+      filter: (ev) => f1Session(ev.name) === 'sprint' && ev.date && ev.date <= isoToday(),
+      sort: (a, b) => (b.date || '').localeCompare(a.date || '') },
+    { id: 'f1-sprint-qualifying', name: 'F1 Sprint Qualifying',
+      filter: (ev) => f1Session(ev.name) === 'sprint-qualifying' && ev.date && ev.date <= isoToday(),
+      sort: (a, b) => (b.date || '').localeCompare(a.date || '') },
+    { id: 'f1-practice', name: 'F1 Practice',
+      filter: (ev) => f1Session(ev.name) === 'practice' && ev.date && ev.date <= isoToday(),
+      sort: (a, b) => (b.date || '').localeCompare(a.date || '') },
+  ],
+
+  eventScope: defaultEventScope,
+
+  // Keep every session of a race weekend (Practice/Qualifying/Sprint/Race);
+  // drop only pre-season Testing.
+  includeEvent(ev) {
+    return !/testing|pre[\s-]*season/i.test((ev.name || '').trim());
+  },
+
+  genres(ev) {
+    const g = ['Sports', 'Motorsport', 'Formula 1'];
+    const label = F1_SESSION_LABEL[f1Session(ev.name)];
+    if (label) g.push(label);
+    return g;
+  },
+};
+
+// ===== Boxing (0.23.0) =====
+// TheSportsDB league 4445 — sport "Fighting", league "Boxing". A single
+// catch-all bucket for big PPV cards from all promoters (Top Rank, PBC,
+// Matchroom, MVPW, etc). Event names are typically "Promoter NN Fighter vs
+// Fighter" or just "Fighter vs Fighter". Release titles are fighter-name-
+// based and rarely contain the word "boxing", so relevance keys off the
+// surnames extracted from the matchup rather than a "boxing" keyword.
+
+// Extract the surnames of the two fighters in a boxing event name. The old
+// (0.23.0) version used a single greedy regex and grabbed whatever word came
+// next to "vs", which produced wrong results like:
+//   "Foster v Ray Ford"          → { left: 'Foster', right: 'Ray' }   ❌
+//   "Azim v Steve Claggett"      → { left: 'Azim',   right: 'Steve' } ❌
+// The corrected version (0.23.2) splits on the "vs" separator, then on each
+// side takes the LAST name-like word — i.e. the surname — skipping trailing
+// numbers / Roman-numeral sequel markers (II, III, 2).
+//   "MVPW 03 Han vs Holm 2"         → { left: 'Han',     right: 'Holm' }
+//   "Foster v Ray Ford"             → { left: 'Foster',  right: 'Ford' }
+//   "Tyson Fury vs Arslanbek Makh." → { left: 'Fury',    right: 'Makh' }
+//   "Crawford vs Spence"            → { left: 'Crawford',right: 'Spence' }
+function boxingMatchup(name) {
+  if (!name) return null;
+  const parts = String(name).split(/\s+(?:vs\.?|v)\s+/i);
+  if (parts.length < 2) return null;
+  const leftSide  = parts[0].trim();
+  const rightSide = parts.slice(1).join(' v ').trim();
+  function lastName(s) {
+    const words = s.split(/\s+/).filter((w) =>
+      /^[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'’-]*$/.test(w));
+    // Drop trailing single-letter / Roman / number sequel markers, but keep
+    // the last actual name. "Holm 2" → "Holm". "Fury II" → "Fury".
+    while (words.length > 1 && /^(?:I{1,3}V?|IV|V|VI{1,3}|\d+)$/.test(words[words.length - 1])) {
+      words.pop();
+    }
+    return words[words.length - 1] || null;
+  }
+  const left = lastName(leftSide);
+  const right = lastName(rightSide);
+  if (!left || !right) return null;
+  return { left, right };
+}
+
+const boxing = {
+  id: 'boxing',
+  name: 'Boxing',
+  idPrefix: 'boxing',
+  enabled: true,
+  source: { type: 'thesportsdb', leagueId: '4445' },
+
+  // 0.25.1: poster shape is portrait ('poster' = Stremio's 2:3 default).
+  // TSDB's per-event strPoster for boxing IS portrait fight-card art (the
+  // actual matchup poster) — perfect for a portrait tile. Switching from
+  // landscape avoids the BOXING-wordmark badge getting center-cropped to
+  // "VG"/"NG" in a landscape tile, AND lets per-event TSDB art show
+  // through. useDefaultArt was wrong — it forced every event onto the
+  // generic fallback badge instead of the per-event fight poster. Removed.
+  // The badge in defaults below stays as the FALLBACK for events without
+  // their own poster.
+  posterShape: 'poster',
+  defaults: {
+    poster: brandedPoster('boxing-upcoming.jpg', 'https://r2.thesportsdb.com/images/media/league/badge/6enin21740228549.png'),
+    fanart: 'https://r2.thesportsdb.com/images/media/league/fanart/xcz8th1503953153.jpg',
+    logo:   'https://r2.thesportsdb.com/images/media/league/badge/6enin21740228549.png',
+  },
+
+  wikipediaTitle(name) { return null; },
+  classify(name) { return 'fight-card'; },
+  shortHandle(name) { return name ? name.trim().replace(/\s+/g, ' ') : null; },
+
+  buildAliases(name) {
+    if (!name) return [];
+    const out = new Set();
+    const t = name.trim();
+    out.add(t);
+    out.add(t.replace(/\s+/g, '.'));
+    // Just the matchup, stripping any promoter prefix ("MVPW 03 Han vs Holm 2"
+    // → "Han vs Holm 2"). Release groups usually drop the promoter tag.
+    const m = boxingMatchup(t);
+    if (m) {
+      // Capture the matchup and any trailing "2" / "II" sequel marker.
+      const after = t.match(/[A-Za-z][A-Za-z'’-]+\s+(?:vs?\.?|v)\s+[A-Za-z][A-Za-z'’-]+(?:\s+\S+)?/i);
+      if (after) {
+        out.add(after[0]);
+        out.add(after[0].replace(/\s+/g, '.'));
+      }
+      out.add(m.left + ' vs ' + m.right);
+      out.add(m.left + '.vs.' + m.right);
+      out.add(m.left + ' v ' + m.right);
+    }
+    return Array.from(out).filter(Boolean);
+  },
+
+  // 0.30.0: short queries for Usenet/Newsnab. Boxing release titles almost
+  // always use just surnames (no promoter, no "BOXING" keyword). The 0.23.2
+  // surname extractor already produces the right tokens; we just emit them
+  // in scene-style "vs" forms.
+  searchTitles(event) {
+    const name = event && event.name;
+    if (!name) return [];
+    const out = new Set();
+    const m = boxingMatchup(name);
+    if (!m) return [];
+    // Detect a trailing sequel marker (2 / II / 3 / III)
+    const seqMatch = name.match(/\b([2-9]|II|III|IV|V)\s*$/);
+    const seq = seqMatch ? seqMatch[1] : '';
+    out.add(m.left + ' vs ' + m.right);
+    out.add(m.left + ' ' + m.right);
+    if (seq) {
+      out.add(m.left + ' vs ' + m.right + ' ' + seq);
+      out.add(m.left + ' ' + m.right + ' ' + seq);
+    }
+    // Append year for rematch disambiguation
+    const year = event.date ? event.date.slice(0, 4) : '';
+    if (year) {
+      out.add(m.left + ' vs ' + m.right + ' ' + year);
+    }
+    return Array.from(out).filter(Boolean);
+  },
+
+  isRelevantStreamTitle(title, event) {
+    if (!title) return { ok: false, reason: 'no-title' };
+    const t = title.toLowerCase();
+    // Require BOTH fighter surnames (when extractable) — the strongest signal
+    // for a boxing release. Without a parseable matchup, fall back to a
+    // generic event-name-overlap check.
+    const m = boxingMatchup(event.name || '');
+    if (m) {
+      const left = m.left.toLowerCase(), right = m.right.toLowerCase();
+      if (!t.includes(left) || !t.includes(right)) {
+        return { ok: false, reason: 'missing-fighter-name' };
+      }
+    } else {
+      const tokens = (event.name || '').toLowerCase().split(/\s+/).filter((x) => x.length >= 4);
+      const hits = tokens.filter((tok) => t.includes(tok));
+      if (tokens.length > 0 && hits.length === 0) {
+        return { ok: false, reason: 'no-event-name-overlap' };
+      }
+    }
+    // Boxing matchups recur (rematches, anniversary fights). Reject candidates
+    // whose year token doesn't match the event's year.
+    if (!yearMatchesEvent(title, event)) return { ok: false, reason: 'wrong-year' };
+    return { ok: true };
+  },
+
+  catalogs: [
+    { id: 'boxing-upcoming', name: 'Boxing Upcoming',
+      filter: (ev) => ev.date && ev.date > isoToday(),
+      sort: (a, b) => (a.date || '').localeCompare(b.date || '') },
+    { id: 'boxing-recent', name: 'Boxing Recent',
+      filter: (ev) => ev.date && ev.date <= isoToday(),
+      sort: (a, b) => (b.date || '').localeCompare(a.date || '') },
+  ],
+
+  eventScope: defaultEventScope,
+
+  // TSDB's Boxing league includes amateur / undercard events alongside the
+  // headline cards. Drop anything explicitly tagged as undercard/prelim or
+  // press-conference; keep everything else and let relevance filter further.
+  includeEvent(ev) {
+    const n = (ev.name || '').trim();
+    if (/\b(undercard|press[\s-]*conf|weigh[\s-]*in|workout)\b/i.test(n)) return false;
+    return true;
+  },
+
+  genres(ev) { return ['Sports', 'Boxing']; },
+};
+
+// ===== MotoGP =====
+// TheSportsDB league 4407. TSDB only catalogues two event types per round:
+// the Sunday Race ("<Country> GP") and the Saturday Sprint Race ("<Country>
+// Sprint Race"). Qualifying / Practice / Warm Up sessions are not on TSDB,
+// so we don't expose catalogs for them. Country names appear as nouns in
+// both TSDB events and scene rips ("Italy" not "Italian"), so location
+// extraction is a simple suffix strip rather than the adjectival mapping
+// F1 uses.
+
+function motogpLocation(name) {
+  return (name || '')
+    .replace(/\bmotogp\b/i, '')
+    // Strip the complete session suffix before shorter alternatives. Matching
+    // `practice` first would leave "Free" attached to the venue and create
+    // aliases such as "Aragón Free". This also handles common FP labels from
+    // configurable metadata sources without venue-specific exceptions.
+    .replace(/\b(sprint\s*race|sprint|qualifying|qualification|qualif|free[\s.\-_]*practice|practice|fp[1-4]|warm[\s.\-_]*up|gp|grand\s*prix)\b.*$/i, '')
+    .trim();
+}
+
+// 0.34.0: MotoGP release-naming aliases. Country/round names from TSDB don't
+// match the actual scene release tokens, which vary wildly by group:
+//   - Dorna-rip pattern: "MotoGP 2026 - Round06 - CatalanGP - Full Weekend"
+//   - MWR pattern:       "MotoGP 2026 Round06 Spain Catalunya Race WEB-DL"
+//   - Polsat HDTV:       "Moto Grand Prix ... 2026 Этап 06 Spain (Barcelona)"
+//   - Bare scene:        "MotoGP.2026.Italy.1080p.WEB.h264-VERUM"
+//
+// Each TSDB location expands to multiple aliases — adjective forms, compact
+// "<adj>GP" forms, circuit names, country+region combos. searchTitles emits
+// queries for each; isRelevantStreamTitle accepts ANY alias in the title.
+//
+// Keys lowercased. Add new rounds here as the 2026/2027 calendar evolves.
+const MOTOGP_LOCATION_ALIASES = {
+  'spain':         ['spain', 'spanish', 'spanishgp', 'jerez'],
+  'france':        ['france', 'french', 'frenchgp', 'le mans', 'lemans'],
+  'italy':         ['italy', 'italian', 'italiangp', 'mugello'],
+  'germany':       ['germany', 'german', 'germangp', 'sachsenring'],
+  'netherlands':   ['netherlands', 'dutch', 'dutchgp', 'assen'],
+  'great britain': ['great britain', 'british', 'britishgp', 'uk', 'silverstone'],
+  'britain':       ['britain', 'british', 'britishgp', 'uk', 'silverstone'],
+  'czechia':       ['czechia', 'czech', 'czechgp', 'brno'],
+  'czech republic':['czechia', 'czech', 'czechgp', 'brno'],
+  'hungary':       ['hungary', 'hungarian', 'hungariangp', 'balaton'],
+  'austria':       ['austria', 'austrian', 'austriangp', 'red bull ring', 'redbull ring'],
+  'catalonia':     ['catalonia', 'catalunya', 'catalan', 'catalangp', 'spain catalunya', 'spain barcelona'],
+  'catalunya':     ['catalonia', 'catalunya', 'catalan', 'catalangp', 'spain catalunya', 'spain barcelona'],
+  'aragon':        ['aragon', 'aragón', 'aragongp', 'motorland'],
+  'aragón':        ['aragon', 'aragón', 'aragongp', 'motorland'],
+  'san marino':    ['san marino', 'sanmarino', 'sanmarinogp', 'misano'],
+  'usa':           ['usa', 'americas', 'american', 'americasgp', 'cota'],
+  'united states': ['usa', 'americas', 'american', 'americasgp', 'cota'],
+  'argentina':     ['argentina', 'argentine', 'argentinegp', 'termas'],
+  'qatar':         ['qatar', 'qatari', 'qatargp', 'losail', 'lusail'],
+  'portugal':      ['portugal', 'portuguese', 'portuguesegp', 'portimao'],
+  'malaysia':      ['malaysia', 'malaysian', 'malaysiangp', 'sepang'],
+  'thailand':      ['thailand', 'thai', 'thaigp', 'buriram', 'chang'],
+  'japan':         ['japan', 'japanese', 'japanesegp', 'motegi'],
+  'indonesia':     ['indonesia', 'indonesian', 'indonesiangp', 'mandalika'],
+  'india':         ['india', 'indian', 'indiangp', 'buddh'],
+  'brazil':        ['brazil', 'brazilian', 'braziliangp'],
+  'finland':       ['finland', 'finnish', 'finnishgp', 'kymiring'],
+};
+
+// Return the list of search/match aliases for a TSDB location string.
+// Falls back to [loc] verbatim for unknown locations (new venues etc.).
+//
+// 0.35.0: pulls admin-added aliases from lib/match-overrides on every call so
+// the /admin/match-editor changes take effect WITHOUT a container restart.
+// The merged-with-defaults map gets recomputed each call; overhead is
+// negligible (file is < 1KB and only 7 hardcoded promos to scan).
+function motogpLocationAliases(loc) {
+  if (!loc) return [];
+  const lc = loc.toLowerCase().trim();
+  const merged = MOTOGP_LOCATION_ALIASES;
+  const direct = merged[lc];
+  if (direct && direct.length) return direct;
+  // No mapping (hardcoded or override) — fall back to verbatim so the
+  // location at least matches itself.
+  return [lc];
+}
+
+function motogpSession(name) {
+  const n = (name || '').toLowerCase();
+  if (/testing|pre[\s-]*season/.test(n)) return 'testing';
+  if (/\bsprint\b/.test(n)) return 'sprint';
+  // 'qualifying' is only ever set on synthesised events (TSDB doesn't track
+  // qualifying separately for MotoGP). See `expandEvents` below.
+  if (/qualif/.test(n)) return 'qualifying';
+  if (/\bpractice\b|\bfp[1-4]\b|warm[\s.\-_]*up/.test(n)) return 'practice';
+  return 'race';
+}
+
+function motogpTitleSession(title) {
+  const t = (title || '').toLowerCase();
+  if (/\bsprint\b/.test(t)) return 'sprint';
+  if (/qualif/.test(t)) return 'qualifying';
+  if (/\bpractice\b|free[\s.\-_]*practice|\bfp[1-3]\b|warm[\s.\-_]*up/.test(t)) return 'practice';
+  if (/\brace\b/.test(t)) return 'race';
+  return 'unlabelled';
+}
+
+const MOTOGP_SESSION_LABEL = {
+  race: 'Race', sprint: 'Sprint', qualifying: 'Qualifying',
+};
+
+// Add days to an ISO date (YYYY-MM-DD), return the result in the same format.
+function shiftIsoDate(iso, days) {
+  if (!iso || !/^\d{4}-\d{2}-\d{2}$/.test(iso)) return iso;
+  const d = new Date(iso + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+const motogp = {
+  id: 'motogp',
+  name: 'MotoGP',
+  idPrefix: 'motogp',
+  enabled: true,
+  source: { type: 'thesportsdb', leagueId: '4407' },
+  posterShape: 'landscape',
+  preferThumb: true,
+
+  // Real TSDB URLs scraped from thesportsdb.com/league/4407-motogp.
+  defaults: {
+    poster: brandedPoster('motogp-upcoming.jpg', 'https://r2.thesportsdb.com/images/media/league/banner/qrxpqu1441138872.jpg'),
+    fanart: 'https://r2.thesportsdb.com/images/media/league/banner/qrxpqu1441138872.jpg',
+    logo:   'https://r2.thesportsdb.com/images/media/league/logo/tkd2rt1733231583.png',
+  },
+
+  wikipediaTitle(name) { return null; },
+
+  classify(name) { return motogpSession(name); },
+
+  shortHandle(name) { return name ? name.trim().replace(/\s+/g, ' ') : null; },
+
+  buildAliases(name) {
+    if (!name) return [];
+    const out = new Set();
+    const t = name.trim();
+    const loc = motogpLocation(t);
+    out.add(t);
+    out.add('MotoGP ' + t);
+    if (loc) {
+      out.add(('MotoGP ' + loc).trim());
+      out.add(('MotoGP ' + loc + ' GP').trim());
+    }
+    return Array.from(out).filter(Boolean);
+  },
+
+  // Scene rips drop the "GP" / "Grand Prix" word entirely and tag the
+  // session inline:
+  //   MotoGP.2026.Italy.1080p.WEB.h264-VERUM            (Sunday race)
+  //   MotoGP.2026.Italy.Sprint.Race.1080p.WEB.h264-VERUM
+  //   MotoGP.2026.Italy.Sprint.1080p.WEB.h264-BILLIE     (same event, different group)
+  //
+  // 0.34.0: also generate adjective + circuit aliases for each location
+  // (FrenchGP / SpanishGP / CatalanGP / Spain Catalunya / Mugello / etc.)
+  // and round-number variants if event.round is present (DornaRip uses
+  // "Round04" / "Round 04" interchangeably).
+  searchTitles(event) {
+    const name = event && event.name;
+    if (!name) return [];
+    const out = new Set();
+    const loc = motogpLocation(name).trim();
+    if (!loc) return [];
+    const session = motogpSession(name);
+    const year = event.date ? event.date.slice(0, 4) : '';
+    if (!year) return [];
+    const aliases = motogpLocationAliases(loc);
+    // Round number, if TSDB provided it (otherwise '' — skip round variants).
+    const roundNum = event.round ? String(event.round).padStart(2, '0') : '';
+
+    // Per-session variants for each alias.
+    for (const alias of aliases) {
+      if (session === 'race') {
+        out.add(('MotoGP ' + year + ' ' + alias).trim());
+        if (roundNum) {
+          out.add(('MotoGP ' + year + ' Round' + roundNum + ' ' + alias).trim());
+          out.add(('MotoGP ' + year + ' Round ' + roundNum + ' ' + alias).trim());
+        }
+      } else if (session === 'sprint') {
+        out.add(('MotoGP ' + year + ' ' + alias + ' Sprint').trim());
+        out.add(('MotoGP ' + year + ' ' + alias + ' Sprint Race').trim());
+        if (roundNum) {
+          out.add(('MotoGP ' + year + ' Round' + roundNum + ' ' + alias + ' Sprint').trim());
+        }
+      } else if (session === 'qualifying') {
+        out.add(('MotoGP ' + year + ' ' + alias + ' Qualifying').trim());
+        if (roundNum) {
+          out.add(('MotoGP ' + year + ' Round' + roundNum + ' ' + alias + ' Qualifying').trim());
+        }
+      } else if (session === 'practice') {
+        out.add(('MotoGP ' + year + ' ' + alias + ' Practice').trim());
+        out.add(('MotoGP ' + year + ' ' + alias + ' Free Practice').trim());
+        out.add(('MotoGP ' + year + ' ' + alias + ' FP1').trim());
+        out.add(('MotoGP ' + year + ' ' + alias + ' FP2').trim());
+      }
+      // Broad fallback for non-race sessions — see comment block above.
+      if (session && session !== 'race') {
+        out.add(('MotoGP ' + year + ' ' + alias).trim());
+      }
+    }
+    return Array.from(out).filter(Boolean);
+  },
+
+  isRelevantStreamTitle(title, event) {
+    if (!title) return { ok: false, reason: 'no-title' };
+    if (!/\bmotogp\b/i.test(title)) return { ok: false, reason: 'no-motogp-context' };
+    const t = title.toLowerCase().replace(/[._-]/g, ' ');
+    const loc = motogpLocation(event.name || '').toLowerCase().trim();
+    if (!loc) return { ok: false, reason: 'no-event-location' };
+    // 0.34.0: accept ANY alias for this location (adjective forms, compact
+    // "<adj>GP", circuit names, country+region combos). Old code only
+    // accepted the bare location string, which missed DornaRip's "CatalanGP",
+    // MWR's "Spain Catalunya", Polsat's "Spain (Barcelona)" etc.
+    const aliases = motogpLocationAliases(loc);
+    const aliasMatch = aliases.some((a) => t.includes(a.toLowerCase()));
+    if (!aliasMatch) return { ok: false, reason: 'no-location-match(' + loc + ')' };
+    if (!yearMatchesEvent(title, event)) return { ok: false, reason: 'wrong-year' };
+    // Reject Moto2 / Moto3 rips that share the year+location with MotoGP.
+    const hasJuniorClass = /\bmoto[23]\b/i.test(title);
+    const isCombinedWeekend = /\bmotogp\b/i.test(title) && /\bmoto2\b/i.test(title) && /\bmoto3\b/i.test(title);
+    if (hasJuniorClass && !isCombinedWeekend) return { ok: false, reason: 'moto2-or-moto3' };
+    // 0.34.0: round-number cross-check disambiguates same-country events
+    // (e.g. Spain GP at Jerez vs. Catalonia GP at Barcelona — both contain
+    // "spain" in scene titles). If the title carries a "Round XX" / "RoundXX"
+    // token AND we know event.round, they must match.
+    if (event.round) {
+      const tRound = title.match(/\bround\s*[._-]?\s*(\d{1,2})\b/i);
+      if (tRound) {
+        const titleRound = parseInt(tRound[1], 10);
+        if (titleRound !== Number(event.round)) {
+          return { ok: false, reason: 'wrong-round(' + titleRound + '≠' + event.round + ')' };
+        }
+      }
+    }
+    const want = motogpSession(event.name);
+    const got = motogpTitleSession(title);
+    if (want === 'race') {
+      // Race events: reject sprint/qualifying/practice rips. Accept 'race'
+      // OR 'unlabelled' (the bare scene format `MotoGP.YYYY.Italy.1080p`
+      // has no session tag and is the race).
+      if (got !== 'race' && got !== 'unlabelled') {
+        return { ok: false, reason: 'session(' + got + '≠race)' };
+      }
+    } else if (want === 'sprint') {
+      // Sprint events: must have 'sprint' in the title.
+      if (got !== 'sprint') return { ok: false, reason: 'session(' + got + '≠sprint)' };
+    } else if (want === 'qualifying') {
+      // Qualifying events: must have 'qualif' (matches Qualifying One/Two).
+      if (got !== 'qualifying') return { ok: false, reason: 'session(' + got + '≠qualifying)' };
+    }
+    return { ok: true };
+  },
+
+  catalogs: [
+    { id: 'motogp-upcoming', name: 'MotoGP Upcoming',
+      filter: (ev) => motogpSession(ev.name) === 'race' && ev.date && ev.date > isoToday(),
+      sort: (a, b) => (a.date || '').localeCompare(b.date || '') },
+    { id: 'motogp-race', name: 'MotoGP Race',
+      filter: (ev) => motogpSession(ev.name) === 'race' && ev.date && ev.date <= isoToday(),
+      sort: (a, b) => (b.date || '').localeCompare(a.date || '') },
+    { id: 'motogp-qualifying', name: 'MotoGP Qualifying',
+      filter: (ev) => motogpSession(ev.name) === 'qualifying' && ev.date && ev.date <= isoToday(),
+      sort: (a, b) => (b.date || '').localeCompare(a.date || '') },
+    { id: 'motogp-sprint', name: 'MotoGP Sprint',
+      filter: (ev) => motogpSession(ev.name) === 'sprint' && ev.date && ev.date <= isoToday(),
+      sort: (a, b) => (b.date || '').localeCompare(a.date || '') },
+  ],
+
+  eventScope: defaultEventScope,
+
+  includeEvent(ev) {
+    return !/testing|pre[\s-]*season/i.test((ev.name || '').trim());
+  },
+
+  // 0.31.1: TSDB only catalogues the Sunday Race and the Saturday Sprint
+  // Race for MotoGP — no separate Qualifying entries. Synthesise a
+  // Qualifying event for each Race event (Q1+Q2 happen Saturday morning,
+  // day before the Sunday race). Sprint Race events are NOT cloned because
+  // their corresponding Sprint Qualifying is rare to find as a standalone
+  // scene release.
+  expandEvents(events) {
+    const out = [];
+    for (const ev of events) {
+      if (!ev || motogpSession(ev.name || '') !== 'race') continue;
+      const loc = motogpLocation(ev.name || '').trim();
+      if (!loc) continue;
+      const qualDate = shiftIsoDate(ev.date, -1);
+      if (!qualDate) continue;
+      out.push(Object.assign({}, ev, {
+        id: ev.id + '-qualifying',
+        sourceId: (ev.sourceId || '') + '-qualifying',
+        name: loc + ' Qualifying',
+        kind: 'qualifying',
+        date: qualDate,
+        dateLocal: qualDate,
+        timestamp: qualDate + 'T' + (ev.time || '00:00:00'),
+        genres: ['Sports', 'Motorsport', 'MotoGP', 'Qualifying'],
+        aliases: motogp.buildAliases(loc + ' Qualifying'),
+      }));
+    }
+    return out;
+  },
+
+  genres(ev) {
+    const g = ['Sports', 'Motorsport', 'MotoGP'];
+    const label = MOTOGP_SESSION_LABEL[motogpSession(ev.name)];
+    if (label) g.push(label);
+    return g;
+  },
+};
+
+// 0.35.0: Generic TSDB-backed promotion factory.
+//
+// Turns a user-supplied spec (data/custom-promotions.json) into a promotion
+// object conforming to the same interface as the hardcoded promotions above.
+// Intentionally limited to TSDB sources with name + year + keyword matching —
+// works for NFL, NBA, MLB, NHL, soccer leagues, MMA promotions without
+// complex numbering. Bespoke promotions stay hand-written in this file.
+//
+// Spec shape (validated upstream in lib/custom-promotions.js):
+//   { id, name, idPrefix, leagueId, poster, fanart, logo, posterShape,
+//     searchTitleTemplates: ['{name}', '{name} {year}'],
+//     relevanceKeywords:    ['nfl', 'football'] }
+//
+// Template placeholders: {name} {promotion} {year} {date}, plus scene-style
+// date layouts learned from real release examples.
+function applyTitleTemplate(template, ctx) {
+  return String(template || '')
+    .replace(/\{name\}/g, ctx.name || '')
+    .replace(/\{promotion\}/g, ctx.promotion || '')
+    .replace(/\{year\}/g, ctx.year || '')
+    .replace(/\{date_spaced\}/g, String(ctx.date || '').replace(/-/g, ' '))
+    .replace(/\{date_dotted\}/g, String(ctx.date || '').replace(/-/g, '.'))
+    // 0.95.0 — compact YYYYMMDD. This is the form rgfootball and most of the
+    // football scene actually use, and until now SSS emitted it zero times:
+    // of 832 queries in a real run, 340 were dotted, 279 spaced, 26 short-dmy
+    // and 22 ISO. Not one was compact.
+    .replace(/\{date_compact\}/g, String(ctx.date || '').replace(/-/g, ''))
+    .replace(/\{date\}/g, ctx.date || '');
+}
+
+// Indexers that AND their query terms — Bitmagnet, which is now the primary
+// source, does — require EVERY word of a query to appear in the release name.
+// A multi-word league prefix therefore costs one AND term per word. Measured
+// against the live 10.1M-row index:
+//
+//   MCI COV                 -> 2
+//   EPL MCI COV             -> 2
+//   Premier League MCI COV  -> 0
+//
+// so the prefix itself is not the problem; the second word is. Single-token
+// aliases ("EPL", "LaLiga", "Bundesliga") survive being combined with an
+// already-constrained matchup. Where a league has no single-token alias
+// ("Serie A", "Ligue 1") the full list is kept, because those competitions
+// genuinely are named that way in releases and dropping the prefix entirely
+// would cost more recall than the extra AND term does.
+function narrowLeaguePrefixes(aliases) {
+  const list = (aliases || []).map((a) => String(a || '').trim()).filter(Boolean);
+  const single = list.filter((a) => !/\s/.test(a));
+  return single.length ? single : list;
+}
+
+// Release titles commonly replace spaces with dots, underscores, or hyphens.
+// Normalise only for phrase recognition; date parsing and the original title
+// remain untouched. This lets "match of the day" recognise
+// "Match.Of.The.Day" consistently across torrent and Usenet sources.
+function normaliseSceneText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[._-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// 0.40.0 — football matchup splitter.
+//
+// football-data.org returns event names like "Manchester United FC vs
+// Nottingham Forest FC" (canonical, includes FC). Release groups use every
+// abbreviation imaginable: "Man United v Nottm Forest", "MUFC vs NFFC",
+// "United vs Forest". splitMatchup / expandTeamAliases handle both search
+// generation and the relevance check.
+// "at" is how North American fixtures are written ("Bears at Seahawks") and is
+// what the ESPN adapter produces. Leaving it out meant those names never split,
+// so every consumer that reaches a team list by splitting quietly did nothing.
+const MATCHUP_SEPARATOR_RE = /\s+(vs\.?|v\.?|at|@|-)\s+/i;
+function splitMatchup(eventName) {
+  if (!eventName) return null;
+  const parts = String(eventName).split(MATCHUP_SEPARATOR_RE);
+  // split with capture gives [home, separator, away]; anything else and it
+  // wasn't a matchup format.
+  if (parts.length < 3) return null;
+  return { home: parts[0].trim(), away: parts.slice(2).join(' ').trim() };
+}
+
+// 0.40.1 — Build a bidirectional lookup from the canonical → aliases table.
+//
+// Every form (canonical + every alias + optional FC-trimmed variant) becomes
+// a KEY pointing at the same full alias list. Lets us resolve regardless of
+// which form the source data returns:
+//   football-data.org returns "Man United" (shortName)
+//   TheSportsDB returns "Manchester United" (name)
+//   Wikipedia might return "Manchester United F.C."
+// All three lookups return the same list, so search-title generation and
+// relevance-check both work.
+//
+// Keys are lower-cased for case-insensitive matching.
+//
+// 0.90.1 — AMBIGUOUS FORMS ARE DROPPED.
+//
+// This used to let the last-registered club win a shared form, on the reasoning
+// that "any form works" was worth a rare collision. That reasoning only held
+// while every consumer was a LEAGUE promotion, where both clubs sharing the form
+// are inside the same promotion anyway and the matchup splitter sorts them out.
+// The "select your team" wizard broke it: a single-club promotion built on the
+// `epl` preset inherits "Manchester" — listed under BOTH Manchester clubs — and
+// so a Man United catalog pulled in "EPL Manchester City vs Arsenal". The
+// promotion the wizard replaces carried a bespoke guard against exactly that.
+//
+// So a form that identifies two or more clubs identifies none: it is dropped as
+// a lookup key AND from every club's form list, because those lists are what the
+// relevance check matches release titles against. A club's own canonical name is
+// never dropped — if one club's alias happens to be another's canonical name, the
+// canonical owner keeps it. "Man Utd", "Wolves" and "Spurs" are unaffected;
+// "Manchester" and "United" stop meaning anybody.
+function buildAliasLookup(aliasMap) {
+  const lookup = Object.create(null);
+  if (!aliasMap || typeof aliasMap !== 'object') return lookup;
+
+  const norm = (value) => String(value || '').toLowerCase().trim();
+  const trimFc = (value) => String(value || '')
+    .replace(/\s+(F\.?C\.?|C\.?F\.?|A\.?F\.?C\.?|SC|BC|AC|SS|SSC|VfB)$/i, '').trim();
+
+  const entries = [];
+  const owners = new Map();   // form key → Set of canonical keys claiming it
+  const canonicalKeys = new Set();
+
+  for (const canonical of Object.keys(aliasMap)) {
+    const aliases = Array.isArray(aliasMap[canonical]) ? aliasMap[canonical] : [];
+    const forms = new Set([canonical, ...aliases]);
+    // Also add an FC-trimmed variant so "Manchester United FC" → "Manchester United"
+    // works even if the alias list didn't include it explicitly.
+    const trimmedFc = trimFc(canonical);
+    if (trimmedFc && trimmedFc !== canonical) forms.add(trimmedFc);
+    entries.push({ canonical, forms: Array.from(forms) });
+    canonicalKeys.add(norm(canonical));
+    for (const form of forms) {
+      const key = norm(form);
+      if (!key) continue;
+      if (!owners.has(key)) owners.set(key, new Set());
+      owners.get(key).add(norm(canonical));
+    }
+  }
+
+  const ambiguous = new Set();
+  for (const [key, claimants] of owners) {
+    // A form claimed by one club is fine. A form that is itself some club's
+    // canonical name belongs to that club, however many others borrow it.
+    if (claimants.size > 1 && !canonicalKeys.has(key)) ambiguous.add(key);
+  }
+
+  // Sharing a form outright is the obvious collision; being a WORD-RUN INSIDE
+  // another club's form is the same collision one step removed, and is the more
+  // common one. "United" is listed only under Manchester United, but it sits
+  // inside Newcastle United, Leeds United and West Ham United, so a release
+  // naming any of them satisfies a Man United check. Same for "City" against
+  // Leicester City. Both are dropped; nothing that identifies exactly one club
+  // ("Man Utd", "Wolves", "Spurs", "Magpies") is touched.
+  const wordRun = (haystack, needle) => (' ' + haystack + ' ').includes(' ' + needle + ' ');
+  for (const entry of entries) {
+    const canonicalKey = norm(entry.canonical);
+    for (const form of entry.forms) {
+      const key = norm(form);
+      if (!key || ambiguous.has(key) || canonicalKeys.has(key)) continue;
+      const collides = entries.some((other) => norm(other.canonical) !== canonicalKey
+        && other.forms.some((otherForm) => {
+          const otherKey = norm(otherForm);
+          return otherKey !== key && wordRun(otherKey, key);
+        }));
+      if (collides) ambiguous.add(key);
+    }
+  }
+
+  for (const entry of entries) {
+    const canonicalKey = norm(entry.canonical);
+    const fullList = entry.forms.filter((form) => {
+      const key = norm(form);
+      if (!key) return false;
+      if (key === canonicalKey) return true;
+      return !ambiguous.has(key);
+    });
+    for (const form of fullList) {
+      const key = norm(form);
+      // A form that is another club's canonical name resolves to that club.
+      if (canonicalKeys.has(key) && key !== canonicalKey) continue;
+      lookup[key] = fullList;
+    }
+  }
+  return lookup;
+}
+
+// Return every known form for `teamName` given a pre-built lookup.
+// Falls through with just [teamName] if we don't recognise it.
+function expandTeamAliases(teamName, aliasLookup) {
+  if (!teamName) return [];
+  const canonical = String(teamName).trim();
+  if (!aliasLookup) return [canonical];
+  const key = canonical.toLowerCase();
+  if (aliasLookup[key]) return aliasLookup[key];
+  // FC-trimmed retry
+  const trimmedFc = canonical.replace(/\s+(F\.?C\.?|C\.?F\.?|A\.?F\.?C\.?|SC|BC|AC|SS|SSC|VfB)$/i, '').trim();
+  if (trimmedFc && trimmedFc !== canonical) {
+    const trimmedKey = trimmedFc.toLowerCase();
+    if (aliasLookup[trimmedKey]) return aliasLookup[trimmedKey];
+  }
+  return [canonical];
+}
+
+// Does a supplied name list actually describe the team we were asked about?
+//
+// The event NAME is authoritative here: it is the string splitMatchup just
+// split, so `fallbackName` is definitely one of the two teams. A structured
+// list that shares no form with it is describing the OTHER team.
+function suppliedNamesDescribe(list, fallbackName, aliasLookup) {
+  if (!Array.isArray(list) || !list.length || !fallbackName) return false;
+  const forms = new Set(
+    expandTeamAliases(fallbackName, aliasLookup)
+      .concat([fallbackName])
+      .map((form) => String(form || '').toLowerCase().trim())
+      .filter(Boolean));
+  return list.some((value) => forms.has(String(value || '').toLowerCase().trim()));
+}
+
+function eventTeamAliases(event, side, fallbackName, aliasLookup) {
+  const sourceKey = side === 'home' ? 'homeTeamNames' : 'awayTeamNames';
+  const otherSide = side === 'home' ? 'away' : 'home';
+  const otherSourceKey = side === 'home' ? 'awayTeamNames' : 'homeTeamNames';
+  const listFor = (which, key) => (event && event.teamNames && Array.isArray(event.teamNames[which]))
+    ? event.teamNames[which]
+    : (event && event.source && Array.isArray(event.source[key]) ? event.source[key] : []);
+
+  // "home" and "away" do not mean the same thing to every producer of these
+  // two things, and when they disagree both sides end up holding both teams.
+  //
+  // ESPN names an event "<away> at <home>" and also ships teamNames.home /
+  // .away. splitMatchup reads the string left to right, so ITS home is ESPN's
+  // away. The two were merged without checking, so the alias list for each
+  // side contained the curated forms of one team and the supplied forms of the
+  // other, and the cross product produced fixtures against themselves. From a
+  // real request for Arizona Cardinals at Green Bay Packers:
+  //
+  //   "ARI-ARI", "ARI ARI", "NFL 2026.08.29 Arizona Cardinals vs Arizona Cardinals"
+  //
+  // "ARI ARI" is the expensive one: on a substring index it matches anything
+  // containing "ari", so the torrent pipeline filled up with Tai-Ari deshita
+  // and Ari Aster and the real release never made the cut.
+  //
+  // The name wins, because it is what was split. A supplied list that shares
+  // no form with it belongs to the other side; take that side's list if it
+  // fits, and otherwise use no supplied names at all.
+  let suppliedFromEvent = listFor(side, sourceKey);
+  if (suppliedFromEvent.length
+    && !suppliedNamesDescribe(suppliedFromEvent, fallbackName, aliasLookup)) {
+    const swapped = listFor(otherSide, otherSourceKey);
+    suppliedFromEvent = suppliedNamesDescribe(swapped, fallbackName, aliasLookup) ? swapped : [];
+  }
+  const supplied = suppliedFromEvent.length ? suppliedFromEvent : [
+    teamIdentities.sceneForm(fallbackName),
+    teamIdentities.stripLegalAffixes(fallbackName),
+    fallbackName,
+  ];
+  const curated = expandTeamAliases(fallbackName, aliasLookup);
+  // A recognized preset normally expands to several forms. Keep its curated
+  // canonical identity first; otherwise prefer provider-derived mechanical
+  // names so an unknown qualifier searches "Celje" before "NK Celje".
+  const seeds = curated.length > 1 ? curated.concat(supplied) : supplied.concat(curated);
+  const output = [];
+  const seen = new Set();
+  for (const seed of seeds) {
+    for (const form of expandTeamAliases(seed, aliasLookup)) {
+      const value = String(form || '').trim();
+      const key = value.toLowerCase();
+      if (value && !seen.has(key)) { seen.add(key); output.push(value); }
+    }
+  }
+  return output.length ? output : [fallbackName];
+}
+
+// 0.42.3 — Rank alias forms by search-worthiness and take the top N per team
+// for cross-product. Longer forms are more specific (less noise) and generally
+// what release groups use. TLAs and short abbreviations are match-only —
+// useful for the relevance regex but poor as search terms.
+//
+// Ranking (highest first):
+//   - 3+ words (e.g. "Manchester United") — always ranked highest
+//   - 2 words (e.g. "Man United") — canonical short form
+//   - Single word with 5+ chars (e.g. "Villa", "Spurs") — medium confidence
+//   - 3-4 char abbreviations (MCFC, MUN) — lowest, drop from search
+const TOP_FORMS_PER_TEAM_FOR_SEARCH = 2;
+function rankForSearch(list) {
+  const eligible = list.filter((s) => s && s.length >= 4); // drop 3-char TLAs
+  if (!eligible.length) return [];
+  // Alias presets deliberately put the release-friendly canonical identity
+  // first. Preserve it before ranking the remaining variants by specificity;
+  // otherwise a longer formal provider name can crowd the canonical query
+  // out of a bounded search set (Atletico Madrid vs Atlético de Madrid).
+  const canonical = eligible[0];
+  const remaining = eligible.slice(1).sort((a, b) => {
+      // Prefer forms with more words, then by length within same word count
+      const wa = a.split(/\s+/).length;
+      const wb = b.split(/\s+/).length;
+      if (wa !== wb) return wb - wa;
+      return b.length - a.length;
+    });
+  return [canonical].concat(remaining);
+}
+function crossProductMatchups(homes, aways) {
+  const topHomes = rankForSearch(homes).slice(0, TOP_FORMS_PER_TEAM_FOR_SEARCH);
+  const topAways = rankForSearch(aways).slice(0, TOP_FORMS_PER_TEAM_FOR_SEARCH);
+  const src = topHomes.length && topAways.length ? [topHomes, topAways] : [homes, aways];
+  const out = [];
+  for (const h of src[0]) {
+    for (const a of src[1]) {
+      out.push(h + ' vs ' + a);
+    }
+  }
+  return out;
+}
+
+// 0.41.1 — Some alias forms are useful for RELEVANCE MATCHING but useless
+// as SEARCH QUERIES because no release group uses them in titles. Drop them
+// from the search-variant fan-out so we don't waste queries.
+//
+// Rules:
+//   1. Forms ending in " FC" / " CF" / " AFC" / " SC" / " BC" / " AC" / " SS" /
+//      " SSC" / " VfB" — release groups always drop the suffix.
+//   2. Fan-nickname forms — a curated list. These are noisy and rarely used
+//      in scene/p2p naming (release groups use short names, not nicknames).
+const NON_SEARCH_SUFFIX_RE = /\s+(F\.?C\.?|C\.?F\.?|A\.?F\.?C\.?|SC|BC|AC|SS|SSC|VfB)$/i;
+const NON_SEARCH_NICKNAMES = new Set([
+  'gunners', 'cottagers', 'seagulls', 'eagles', 'toffees', 'tractor boys',
+  'foxes', 'reds', 'citizens', 'red devils', 'magpies', 'tricky trees',
+  'saints', 'hammers', 'irons', 'blues', 'cherries', 'bees', 'la real',
+  'yellow submarine', 'los blancos', 'blaugrana', 'la dea', 'la vecchia signora',
+  'bhoys',
+  'tigers',
+].map((s) => s.toLowerCase()));
+
+// The nickname list above is a list of FOOTBALL FAN nicknames: nobody names a
+// release "Gunners vs Toffees", so spending an AND term on one is wasted. That
+// reasoning does not carry to the American leagues, where the nickname IS the
+// release name -- NFL.2021.10.28.Cardinals.Vs.Packers is one of the most
+// common forms on the indexers. Several of the words collide outright
+// (Eagles is Crystal Palace and Philadelphia; Saints is Southampton and New
+// Orleans; Reds is Liverpool and Cincinnati; Tigers is Hull and Detroit), so
+// applying the list globally would have silently dropped exactly the queries
+// these presets were added to emit. Scope it to the presets it was written
+// for.
+const NICKNAME_IS_THE_RELEASE_NAME = new Set(['nfl', 'nba', 'mlb']);
+
+// Leagues whose releases are keyed by week number instead of by date:
+//
+//   NFL.2025-2026.W04.Packers-Cowboys.1080p.ACC.2CH.MKV-CG
+//
+// American football only. Basketball and baseball play too many games a week
+// for a week number to identify a fixture, and their releases are dated
+// ("NBA.2025.12.05.", "MLB.2024.04.14.") — a W-form there would be a query
+// that matches nothing. College football is named the same way as the NFL but
+// has not been observed yet, so it is not listed until it has been.
+const WEEK_NUMBERED_RELEASES = new Set(['nfl']);
+
+function isSearchWorthyForm(form, presetName) {
+  if (!form) return false;
+  if (NON_SEARCH_SUFFIX_RE.test(form)) return false;
+  if (NICKNAME_IS_THE_RELEASE_NAME.has(String(presetName || '').toLowerCase())) return true;
+  if (NON_SEARCH_NICKNAMES.has(form.toLowerCase())) return false;
+  return true;
+}
+
+// 0.42.1 — word-boundary match test for team-alias hits.
+//
+// The naive substring check (title.includes(alias)) false-positives on
+// short aliases that are substrings of other words. Concrete disasters
+// observed in production:
+//   CHE (Chelsea TLA)     → hits "manCHEster"          → Chelsea events pick up Man United fixtures
+//   MUN (Man United TLA)  → hits "aMUNition" (unlikely but possible)
+//   ARS (Arsenal TLA)     → hits "parseley" or "wARShip"
+//   ATM (Atletico TLA)    → hits "atmosphere"
+//   CFC (Chelsea abbrev)  → hits any release with "cfc." accidentally
+// Fix: precompile a case-insensitive word-boundary regex per alias and
+// test() it against the (lowercased) title. \b is the boundary between a
+// word char (A-Za-z0-9_) and a non-word char, so "che" surrounded by "." /
+// " " / "_" / "-" matches, but "che" between letters (as in "manchester")
+// does not.
+//
+// Regex objects are cached on the alias string itself via a WeakMap-like
+// pattern (plain object; aliases are short so memory is fine) so we don't
+// rebuild the regex for every candidate title.
+const ALIAS_REGEX_CACHE = Object.create(null);
+function aliasBoundaryMatch(lcTitle, alias) {
+  if (!alias) return false;
+  const key = alias.toLowerCase();
+  let re = ALIAS_REGEX_CACHE[key];
+  if (!re) {
+    // Two-pass build:
+    //   1. escape all regex metacharacters (dot, star, etc.)
+    //   2. replace any run of whitespace inside the alias with a flexible
+    //      separator class [\s._-]+ so multi-word aliases match releases
+    //      that use dot/underscore/dash separators — the standard scene &
+    //      p2p convention.
+    // Concrete: "manchester city" → /manchester[\s._-]+city/ matches
+    //   "manchester city", "manchester.city", "manchester_city",
+    //   "manchester-city", and even "manchester . city".
+    const escaped = key
+      .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      .replace(/\s+/g, '[\\s._-]+');
+    // Note: boundary class deliberately EXCLUDES underscore — scene naming
+    // treats "_" as a separator (EPL_2026_Manchester_City), not as an
+    // internal word character. JS \b would say no boundary between
+    // "_" and "m" — we override that here.
+    re = new RegExp('(?:^|[^A-Za-z0-9])' + escaped + '(?:$|[^A-Za-z0-9])', 'i');
+    ALIAS_REGEX_CACHE[key] = re;
+  }
+  return re.test(lcTitle);
+}
+
+// Connector words that one feed keeps and another drops: "Celta de Vigo" and
+// "Celta Vigo" are the same club. Removed from BOTH sides, so the match stays
+// contiguous — dropping that would let "Real Madrid" match a title reading
+// "Real Sociedad vs Atletico Madrid".
+const TEAM_CONNECTOR_RE = /\b(?:de|del|da|do|dos|du|di|of|the|und|and)\b/g;
+
+function plainTeamMatch(title, teamName) {
+  // foldAscii first: the old normaliser stripped every non-ASCII character, so
+  // "München" became "m nchen" and could never match "Munchen" in a release.
+  const normalise = (value) => teamIdentities.foldAscii(String(value || ''))
+    .toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
+  const condense = (value) => value.replace(TEAM_CONNECTOR_RE, ' ').replace(/\s+/g, ' ').trim();
+  const haystackFull = normalise(title);
+  const needleFull = normalise(teamName);
+  if (needleFull.length < 3) return false;
+  // sceneForm additionally strips the legal affixes providers carry and
+  // releases omit — "Manchester City FC" against a "Manchester City" release.
+  const needleScene = normalise(teamIdentities.sceneForm(teamName));
+  const forms = [
+    [haystackFull, needleFull],
+    [condense(haystackFull), condense(needleFull)],
+    [haystackFull, needleScene],
+    [condense(haystackFull), condense(needleScene)],
+  ];
+  return forms.some(([hay, needle]) =>
+    needle.length >= 3 && (' ' + hay + ' ').includes(' ' + needle + ' '));
+}
+
+// Words that legitimately sit in front of a club name in a release title.
+const TEAM_LEADING_TOKENS = new Set(['vs', 'v', 'at', 'versus', 'and']);
+
+// Competition, sport and broadcast words. None of these is ever a club on its
+// own, so finding one in front of a team name says "this release is labelled
+// with its competition", not "this is a different club".
+//
+// This list exists because the rule below, shipped in 0.87.1, only accepted a
+// preceding word that belonged to the club — which quietly rejected the single
+// most common naming convention indexers use: "EPL Manchester United vs
+// Arsenal", "Premier League Real Madrid vs Barcelona". Events that had Usenet
+// and torrent coverage stopped returning any links at all. The Sport-Video
+// diagnostics could not see it, because that site names releases bare, with no
+// competition prefix.
+const COMPETITION_CONTEXT_TOKENS = new Set([
+  'football', 'soccer', 'basketball', 'baseball', 'hockey', 'rugby', 'cricket',
+  'league', 'liga', 'serie', 'bundesliga', 'ligue', 'eredivisie', 'primeira',
+  'premier', 'primera', 'division', 'championship', 'cup', 'copa', 'coupe',
+  'pokal', 'trophy', 'epl', 'efl', 'mls', 'uefa', 'fifa', 'concacaf', 'conmebol',
+  'champions', 'europa', 'conference', 'nations', 'euro', 'euros', 'worldcup',
+  'nfl', 'nba', 'wnba', 'mlb', 'nhl', 'ncaa', 'ncaaf', 'cfb', 'afl', 'nrl',
+  'matchday', 'round', 'week', 'gameweek', 'season', 'regular', 'playoffs',
+  'semi', 'final', 'finals', 'quarter', 'group', 'stage', 'leg',
+  'live', 'full', 'match', 'game', 'replay', 'coverage', 'sports', 'sport',
+]);
+
+// A club name can be a whole word inside a DIFFERENT club's name: AC Milan's
+// short name is "Milan", which is present in "Inter Milan". Both the boundary
+// regex and the contiguous matcher say yes, and Serie A would then attach an
+// Inter fixture to a Milan one.
+//
+// The rule that separates them: whatever word precedes the match must belong to
+// this same club. "Borussia Dortmund" is fine for a club named "Dortmund"
+// because "Borussia" appears in one of its own naming forms; "Inter Milan" is
+// not, because "Inter" appears in none of Milan's.
+function teamPresent(title, forms, contextTokens, opponentForms) {
+  const normalise = (value) => teamIdentities.foldAscii(String(value || ''))
+    .toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
+  const condense = (value) => value.replace(TEAM_CONNECTOR_RE, ' ').replace(/\s+/g, ' ').trim();
+  const list = (Array.isArray(forms) ? forms : [forms]).filter(Boolean);
+  if (!list.length) return false;
+
+  // 0.94.0 — the word before a club's name may be the OTHER club in this
+  // fixture, which is the strongest evidence there is, not a reason to reject.
+  //
+  // EPL releases are routinely named with bare three-letter codes joined by a
+  // separator: "EPL.26-27.5th.round.ARS-CHE_06.09.26_2160.mkv". Matching CHE
+  // found the token, looked at the word before it, saw "ars" — not a word
+  // Chelsea owns, not a competition word, not a number — and rejected the
+  // release as belonging to a different club. Every HOME-AWAY release in that
+  // style was discarded, which is most of the 2160p EPL output.
+  //
+  // The guard below exists to stop "Inter Milan" matching an AC Milan fixture.
+  // That guard is right; it was only missing the case where the preceding word
+  // is the opponent we are already matching on the other side.
+  const opponentTokens = new Set();
+  for (const form of (Array.isArray(opponentForms) ? opponentForms : []).filter(Boolean)) {
+    for (const variant of [normalise(form), normalise(teamIdentities.sceneForm(form))]) {
+      for (const token of variant.split(' ')) if (token) opponentTokens.add(token);
+    }
+  }
+
+  // Every word this club is known by, in any supplied or derived form.
+  const owned = new Set();
+  // Letters of any initialism the provider uses in place of a spelled-out
+  // prefix. football-data registers Atlético Mineiro as "CA Mineiro", and the
+  // release writes "Atletico Mineiro" — so the leading word the release adds is
+  // the expansion of a letter the provider abbreviated. Without this the rule
+  // below rejects a club's own fuller name.
+  const initials = new Set();
+  for (const form of list) {
+    for (const variant of [normalise(form), normalise(teamIdentities.sceneForm(form))]) {
+      for (const token of variant.split(' ')) {
+        if (!token) continue;
+        owned.add(token);
+      }
+    }
+  }
+  // Only the short prefix of a MULTI-WORD form counts as an abbreviation the
+  // release might spell out. A standalone three-letter code must not: MIL is
+  // AC Milan's tla, and letting its letters license a leading word would put
+  // "Inter" (i, from MIL) straight back through the gap this rule closes.
+  for (const form of list) {
+    const tokens = normalise(form).split(' ');
+    if (tokens.length < 2) continue;
+    for (const token of tokens.slice(0, -1)) {
+      if (token.length <= 3) for (const letter of token) initials.add(letter);
+    }
+  }
+
+  const haystacks = [normalise(title)];
+  haystacks.push(condense(haystacks[0]));
+  for (const form of list) {
+    const variants = new Set();
+    for (const base of [normalise(form), normalise(teamIdentities.sceneForm(form))]) {
+      if (base) { variants.add(base); variants.add(condense(base)); }
+    }
+    for (const needle of variants) {
+      if (needle.length < 3) continue;
+      const needleTokens = needle.split(' ');
+      for (const hay of haystacks) {
+        const tokens = hay.split(' ');
+        for (let i = 0; i + needleTokens.length <= tokens.length; i += 1) {
+          if (needleTokens.some((token, offset) => tokens[i + offset] !== token)) continue;
+          const before = i > 0 ? tokens[i - 1] : null;
+          if (before === null) return true;
+          if (owned.has(before)) return true;
+          // The opposing club in this very fixture — "ARS-CHE", "LIV.NFO".
+          if (opponentTokens.has(before)) return true;
+          if (TEAM_LEADING_TOKENS.has(before)) return true;
+          // A number is a date fragment or a seeding, never another club.
+          if (/^\d+$/.test(before)) return true;
+          // A week label is a position in the schedule, for the same reason —
+          // "NFL.2025-2026.W04.Packers-Cowboys" puts it immediately before the
+          // away side, and without this every week-numbered release was
+          // rejected as no-away-team-alias even once the query found it. The
+          // home side already passed, because the word before IT is the
+          // opponent.
+          if (/^(?:w(?:k|eek)?|md|matchday|r|round|gw|gameweek)\d{1,2}$/.test(before) || before === 'week') return true;
+          // UEFA releases put stage labels immediately before the first club:
+          // League.Phase.Manchester.United and LP_MD1_MUN. These describe the
+          // competition, while arbitrary words (Inter before Milan) still do
+          // not license a match against another club's short name.
+          if (before === 'phase' && /^(?:league|group|knockout)$/.test(tokens[i-2] || '')) return true;
+          if (before === 'lp' || before === 'leaguephase') return true;
+          // A spelled-out word standing in for a letter the provider
+          // abbreviated: "Atletico" for the A of "CA Mineiro". Deliberately
+          // narrow — "Inter" before "Milan" starts with I, which is in none of
+          // AC Milan's initials, so that collision stays rejected.
+          if (before.length >= 4 && initials.has(before[0])) return true;
+          // The release is labelled with its competition, which is what nearly
+          // every indexer does: "EPL Manchester United vs Arsenal".
+          if (COMPETITION_CONTEXT_TOKENS.has(before)) return true;
+          if (contextTokens && contextTokens.has(before)) return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+function createGenericPromotion(spec) {
+  if (!spec || !spec.id) return null;
+  const id = String(spec.id);
+  const name = String(spec.name || id);
+  const idPrefix = String(spec.idPrefix || id);
+  const posterShape = spec.posterShape || 'landscape';
+
+  // 0.38.0: source dispatch. Backward compat: specs without `source` are
+  // treated as TSDB (the only source pre-0.38.0). For football-data,
+  // competitionId replaces leagueId as the per-source identifier.
+  // Per-team scoping. A league feed is fetched whole (one call either way) and
+  // then narrowed to one club's fixtures, which is what lets the Configure-page
+  // wizard turn "my team" into a catalog without a per-team endpoint existing
+  // for every sport. football-data is the exception: its team feed is already
+  // scoped, so a teamId there needs no filter.
+  const teamFilter = (spec.teamFilter && (spec.teamFilter.id || (spec.teamFilter.names || []).length))
+    ? {
+      id: String(spec.teamFilter.id || '').trim(),
+      names: (Array.isArray(spec.teamFilter.names) ? spec.teamFilter.names : [])
+        .map((value) => String(value || '').trim()).filter(Boolean),
+    }
+    : null;
+
+  const sourceKind = String(spec.source || 'tsdb');
+  let sourceObj;
+  if (sourceKind === 'football-data') {
+    sourceObj = spec.teamId
+      ? { type: 'football-data', teamId: String(spec.teamId) }
+      : { type: 'football-data', competitionId: String(spec.competitionId || '') };
+  } else if (sourceKind === 'sport-video') {
+    // Release-first ingestion: the "source" is SSS's own record of what the
+    // discovery index published and no fixture feed claimed.
+    sourceObj = { type: 'sport-video', sport: String(spec.sport || '') };
+  } else if (sourceKind === 'api-football') {
+    sourceObj = { type: 'api-football', leagueId: String(spec.leagueId || '') };
+  } else if (sourceKind === 'uefa') {
+    sourceObj = { type: 'uefa', competitionId: String(spec.competitionId || '') };
+  } else if (sourceKind === 'tmdb') {
+    // 0.42.13 - TMDB TV show (Match of the Day, ITV highlights, etc.).
+    // scripts/refresh.js dispatches to lib/sources/tmdb.js which returns one
+    // record per episode with air_date. transform.fromTmdb converts each to
+    // an event whose date drives DARKSPORT-style search title generation.
+    sourceObj = Array.isArray(spec.tvIds) && spec.tvIds.length
+      ? { type: 'tmdb', tvIds: spec.tvIds.map(String) }
+      : { type: 'tmdb', tvId: String(spec.tvId || '') };
+  } else if (sourceKind === 'onefc') {
+    sourceObj = { type: 'onefc' };
+  } else if (sourceKind === 'mlb') {
+    sourceObj = { type: 'mlb' };
+  } else if (sourceKind === 'espn') {
+    // ESPN's scoreboard serves several leagues from one adapter, so the
+    // league identifier travels with the source rather than the type.
+    sourceObj = { type: 'espn', league: String(spec.league || '').trim().toLowerCase() };
+  } else {
+    sourceObj = { type: 'thesportsdb', leagueId: String(spec.leagueId || '') };
+  }
+  const templates = Array.isArray(spec.searchTitleTemplates) && spec.searchTitleTemplates.length
+    ? spec.searchTitleTemplates : ['{name}', '{name} {year}'];
+  const keywords = (Array.isArray(spec.relevanceKeywords) ? spec.relevanceKeywords : [])
+    .map((k) => String(k || '').toLowerCase().trim()).filter(Boolean);
+  const promotionAliases = (Array.isArray(spec.promotionAliases) ? spec.promotionAliases : [])
+    .map((alias) => promotionRuleTools.stripEventStageSuffix(String(alias || '').trim()))
+    .filter(Boolean)
+    .filter((alias, index, allAliases) => allAliases.findIndex((value) =>
+      value.toLowerCase() === alias.toLowerCase()) === index)
+    .slice(0, 20);
+  const matchKeywords = Array.from(new Set(keywords.concat(
+    promotionAliases.map((alias) => alias.toLowerCase())
+  )));
+  // Every word this promotion is known by. Used only to decide whether a word
+  // sitting in front of a team name is a competition label rather than another
+  // club — see teamPresent and COMPETITION_CONTEXT_TOKENS.
+  const promotionContextTokens = new Set();
+  for (const phrase of [name].concat(promotionAliases, matchKeywords,
+    Array.isArray(spec.leagueAliases) ? spec.leagueAliases : [])) {
+    for (const token of teamIdentities.foldAscii(String(phrase || ''))
+      .toLowerCase().split(/[^a-z0-9]+/)) {
+      if (token && token.length >= 2) promotionContextTokens.add(token);
+    }
+  }
+
+  const rawExclusionKeywords = (Array.isArray(spec.exclusionKeywords) ? spec.exclusionKeywords : [])
+    .map((term) => String(term || '').toLowerCase().trim()).filter(Boolean).slice(0, 20);
+  const sanitizedRules = promotionRuleTools.sanitizeMatchingRules(
+    name, promotionAliases, matchKeywords, rawExclusionKeywords
+  );
+  const exclusionKeywords = sanitizedRules.exclusions;
+
+  // 0.40.0 — resolve team + league aliases.
+  //   - `teamAliasPreset` pulls a baked-in table (e.g. all 20 EPL clubs).
+  //   - `teamAliases` object overrides / extends the preset entry-by-entry.
+  //   - `leagueAliases` array supplies league-prefix variants for search.
+  // Preset gives users comprehensive coverage without hand-typing 40+ clubs;
+  // overrides let them fix any single-entry issue without editing the preset.
+  const aliasPresets = require('./team-alias-presets.cjs');
+  const presetName = spec.teamAliasPreset ? String(spec.teamAliasPreset) : null;
+  const presetTable = presetName ? aliasPresets.getPreset(presetName) : null;
+  const overrideTable = (spec.teamAliases && typeof spec.teamAliases === 'object')
+    ? spec.teamAliases : null;
+  let teamAliasLookup = null;
+  if (presetTable || overrideTable) {
+    const teamAliasMap = Object.assign({}, presetTable || {}, overrideTable || {});
+    // 0.40.1 — pre-build the bidirectional lookup once per promotion load.
+    // Every form (canonical, alias, FC-trimmed) becomes a key so we can match
+    // shortName from football-data OR long-form from TSDB with one code path.
+    teamAliasLookup = buildAliasLookup(teamAliasMap);
+  }
+  const explicitLeagueAliases = Array.isArray(spec.leagueAliases) ? spec.leagueAliases : null;
+  const presetLeagueAliases = presetName ? aliasPresets.getLeagueAliasDefaults(presetName) : [];
+  const leagueAliasList = (explicitLeagueAliases && explicitLeagueAliases.length)
+    ? explicitLeagueAliases.map((s) => String(s || '').trim()).filter(Boolean)
+    : presetLeagueAliases;
+
+  // 0.42.3 — Football-specific "require a date in the release title" strictness.
+  // Football scene releases almost universally include YYYY.MM.DD; anything
+  // without one is highlights, season review, documentary, or noise. Auto-on
+  // when a team-alias preset is chosen; the operator can override via spec.
+  const requireDateInTitle = (spec.requireDateInTitle !== undefined)
+    ? !!spec.requireDateInTitle
+    : !!presetName;      // default: football promotions on, others off
+
+  // Per-promotion provider toggles ('torbox' | 'uu' | 'easynews').
+  // Consumed in lib/streams.js handleStream to skip specific pipelines for
+  // events from this promotion. Especially useful for football where the
+  // TorBox/Prowlarr pipeline is slow-and-mostly-empty and just blocks the
+  // faster provider pipelines.
+  const disabledPipelines = Array.isArray(spec.disabledPipelines)
+    ? spec.disabledPipelines.map((s) => String(s || '').toLowerCase().trim()).filter(Boolean)
+    : [];
+
+  return {
+    id,
+    name,
+    idPrefix,
+    // A spec may switch itself off — see the note in custom-promotions'
+    // normaliseSpec. Disabled means "known but not served": it stays in
+    // promotions.all (so its events are not orphans) and out of
+    // promotions.enabled (so it leaves the manifest).
+    enabled: spec.enabled === undefined ? true : spec.enabled !== false,
+    isCustom: true,                                     // admin-UI provenance marker
+    autoTeam: spec.autoTeam === true,
+    source: sourceObj,
+    posterShape,
+    ignoredExclusionKeywords: sanitizedRules.removedExclusions,
+    disabledPipelines,
+    allowForeignLanguage: !!spec.allowForeignLanguage,
+    // UU fans a single request out across its configured indexers. Keep the
+    // default compact so a generated promotion cannot overload that stack.
+    uuMaxQueries: Math.max(1, Math.min(12, Number(spec.uuMaxQueries) || 6)),
+    defaults: {
+      poster: String(spec.poster || ''),
+      fanart: String(spec.fanart || ''),
+      logo:   String(spec.logo   || ''),
+    },
+    wikipediaTitle(_n)   { return null; },
+    classify(_n)         { return 'event'; },
+    shortHandle(eventName) {
+      return eventName ? String(eventName).trim().replace(/\s+/g, ' ') : null;
+    },
+    buildAliases(eventName) {
+      if (!eventName) return [];
+      const t = String(eventName).trim();
+      return [t, t.replace(/\s+/g, '.')];
+    },
+    searchTitles(event) {
+      const eventName = event && event.name;
+      if (!eventName) return [];
+      const date = event.date || '';
+      const year = date ? date.slice(0, 4) : '';
+
+      // 0.40.0 — if this is a matchup event AND we have a team alias map,
+      // expand into every home×away variant + apply templates over each.
+      // Also emit league-prefixed variants ("EPL Man United vs Forest") to
+      // catch releases whose league prefix comes before the teams.
+      let nameVariants = [eventName];
+      const plainSplit = splitMatchup(eventName);
+      if (teamAliasLookup || (event && event.teamNames)) {
+        const split = plainSplit;
+        if (split) {
+          // 0.41.1 — filter to search-worthy forms only. FC/CF-suffixed and
+          // fan-nickname forms are relevance-match-only (used later in
+          // isRelevantStreamTitle) but never as search queries.
+          const searchWorthy = (form) => isSearchWorthyForm(form, presetName);
+          const homes = eventTeamAliases(event, 'home', split.home, teamAliasLookup).filter(searchWorthy);
+          const aways = eventTeamAliases(event, 'away', split.away, teamAliasLookup).filter(searchWorthy);
+          if (homes.length && aways.length) {
+            nameVariants = crossProductMatchups(homes, aways);
+          }
+          if (nameVariants.length === 0) nameVariants = [eventName];
+        }
+      }
+
+      // Generic matchup coverage without a curated alias preset. Metadata
+      // normally uses home vs away; releases often reverse it or use `@`.
+      if (plainSplit) {
+        nameVariants.push(plainSplit.away + ' vs ' + plainSplit.home);
+        nameVariants.push(plainSplit.home + ' @ ' + plainSplit.away);
+        nameVariants.push(plainSplit.away + ' @ ' + plainSplit.home);
+        nameVariants = Array.from(new Set(nameVariants));
+      }
+
+      const out = new Set();
+      // Queries that go out FIRST regardless of how many template
+      // permutations exist. Without this the 60-query cap below was spent
+      // entirely on template output — a league with eight aliases and four
+      // templates fills it before the loop ends — and the code-pair forms
+      // added at the bottom of this function, which are the most precise
+      // queries the promotion can make, were sliced off and never sent.
+      const priority = new Set();
+      const seasonQueries = new Set();
+      if (plainSplit && (sourceObj.type === 'football-data' || event.competitionCode) && Number(event.season)>1900 && Number(event.round)>0) {
+        const sides = ['home','away'].map(side=>eventTeamAliases(event,side,plainSplit[side],teamAliasLookup).filter(value=>/[a-z]{4}/i.test(value)));
+        // Expand schedule abbreviations and omit the vs/at separator. Keep
+        // both teams and the season so undated releases can be discovered.
+        for (const home of sides[0].slice(0,3)) for (const away of sides[1].slice(0,3)) {
+          seasonQueries.add(home+' '+away+' '+event.season+' '+(Number(event.season)+1));
+        }
+      }
+      for (const nameVariant of nameVariants) {
+        for (const tpl of templates) {
+          const usesPromotion = tpl.includes('{promotion}');
+          // Deliberately NOT narrowed to single-token aliases here. That was
+          // tried and reverted: the Champions League releases genuinely are
+          // named "UEFA.Champions.League.2026.05.05.<matchup>", and the UCL
+          // overlay below reorders on exactly that string. Where a promotion's
+          // prefix+date combination is unproductive, the fix is to drop the
+          // template (see FOOTBALL_LEAGUES), not to silently rewrite what
+          // every promotion's templates asked for.
+          const promotionVariants = usesPromotion
+            ? (promotionAliases.length ? promotionAliases.slice(0, 8) : [name])
+            : [''];
+          const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const canonicalPrefix = new RegExp('^' + escapedName + '(?:[\\s._-]+|$)', 'i');
+          const templateName = usesPromotion
+            ? (nameVariant.replace(canonicalPrefix, '').trim() || nameVariant)
+            : nameVariant;
+          for (const promotionVariant of promotionVariants) {
+            const ctx = { name: templateName, promotion: promotionVariant, year, date };
+            const filled = applyTitleTemplate(tpl, ctx).trim().replace(/\s+/g, ' ');
+            if (filled) out.add(filled);
+          }
+        }
+      }
+      if (plainSplit && date) {
+        const parts = date.split('-');
+        const dmy = parts.length === 3 ? parts[2] + '.' + parts[1] + '.' + parts[0] : '';
+        out.add(eventName + ' ' + date);
+        if (dmy) out.add(plainSplit.away + ' @ ' + plainSplit.home + ' ' + dmy);
+      }
+      // League-prefix variants for the shortest matchup variant only — this
+      // keeps the query count bounded while still covering "EPL team-a vs team-b".
+      if (leagueAliasList.length && nameVariants.length) {
+        const shortest = nameVariants
+          .slice()
+          .sort((a, b) => a.length - b.length)[0];
+        for (const prefix of narrowLeaguePrefixes(leagueAliasList).slice(0, 4)) {
+          out.add((prefix + ' ' + shortest).replace(/\s+/g, ' ').trim());
+        }
+      }
+
+      // 0.94.0 — three-letter code pairs, the naming style most EPL 2160p
+      // releases actually use: "EPL.26-27.5th.round.ARS-CHE_06.09.26_2160.mkv",
+      // "EPL.26_27.2nd.round.LIV-NFO_29.08.26_2160.mkv".
+      //
+      // rankForSearch deliberately drops lone three-letter codes, and rightly:
+      // "ARS" alone is a hopeless query. But a PAIR of them is the opposite —
+      // "ARS CHE" is more specific than "Arsenal vs Chelsea", because only a
+      // fixture between those two clubs contains both codes. Dropping the
+      // codes individually silently dropped the pair as well, so not one of
+      // the 37 queries generated for an EPL fixture contained the form the
+      // releases are named with.
+      //
+      // Added with the date, because that is what the scorer rewards and what
+      // separates this fixture from the reverse tie later in the season.
+      // Three-letter code pairs are an EPL 2160p naming convention. The
+      // American leagues do not use them -- their releases are
+      // "NFL.2026.08.28.Cardinals.Vs.Packers" -- so for those presets these
+      // seven queries returned nothing and took the first seven priority
+      // slots. One of them was actively harmful: "ARI GNB" against a substring
+      // index matched every title containing "ari".
+      // ...and only where a curated preset says which codes are real. Without
+      // this, every ESPN league emitted them from the abbreviations ESPN
+      // supplies: a college-football fixture opened with "DUQ AFA", "DUQ-AFA",
+      // "DUQ-AFA 20260905" — three of its first queries, all returning nothing,
+      // on every event of every such promotion. The form was measured on EPL
+      // 2160p releases and belongs to the presets that were built for it.
+      if (plainSplit && teamAliasLookup
+        && !NICKNAME_IS_THE_RELEASE_NAME.has(String(presetName || '').toLowerCase())) {
+        const codesFor = (side, plainName) =>
+          eventTeamAliases(event, side, plainName, teamAliasLookup)
+            .filter((form) => /^[A-Za-z]{3}$/.test(String(form || '').trim()))
+            .map((form) => String(form).trim().toUpperCase());
+        const homeCodes = Array.from(new Set(codesFor('home', plainSplit.home))).slice(0, 2);
+        const awayCodes = Array.from(new Set(codesFor('away', plainSplit.away))).slice(0, 2);
+        if (homeCodes.length && awayCodes.length) {
+          const parts = date.split('-');
+          const dmyShort = parts.length === 3
+            ? parts[2] + '.' + parts[1] + '.' + parts[0].slice(2) : '';
+          const compact = date ? date.replace(/-/g, '') : '';
+          const leaguePrefix = (narrowLeaguePrefixes(leagueAliasList)[0] || name || '').trim();
+          for (const home of homeCodes) {
+            for (const away of awayCodes) {
+              const pair = home + '-' + away;
+              // The bare pair is the highest-value query this promotion can
+              // emit and SSS never emitted it: a fixture between exactly these
+              // two clubs is the only thing that contains both codes, so it is
+              // already more specific than the full club names, and it adds no
+              // AND term that a release might spell differently. Measured:
+              // "MCI COV" -> 2, "Man City vs Coventry City" -> 0.
+              priority.add(pair);
+              priority.add(home + ' ' + away);
+              // Dated forms. Compact first — that is what the releases use.
+              // The ISO form is kept only because Sport-Video names files that
+              // way; it returns nothing on Bitmagnet ("MCI COV 2026-09-05" -> 0
+              // against "MCI COV 20260905" -> 2).
+              if (compact) priority.add((pair + ' ' + compact).trim());
+              if (dmyShort) priority.add((pair + ' ' + dmyShort).trim());
+              if (date) priority.add((pair + ' ' + date).trim());
+              if (leaguePrefix) priority.add((leaguePrefix + ' ' + pair).trim());
+              // Deliberately NOT league-prefix + pair + date. In the last full
+              // run, 169 queries carried both a league prefix and a date and
+              // produced zero results between them; each extra AND term is one
+              // more chance the release spells it differently.
+              priority.add(home + ' vs ' + away);
+            }
+          }
+        }
+      }
+
+      // 0.95.1 — one-word team pairs, the naming style the American leagues
+      // actually use.
+      //
+      // Measured against the live indexers for one fixture:
+      //   NFL.Pre.Season.2026.08.28.Arizona.Cardinals.Vs.Green.Bay.Packers...
+      //   NFL.2021.10.28.Cardinals.Vs.Packers.1080p.WEB.h264-SPORTSNET
+      //   NFL.2021.10.28.Packers.at.Cardinals.720p.HDTV...-720pier
+      // Two of the three name the teams by nickname alone, and every query SSS
+      // emitted carried the full "Arizona Cardinals" that ESPN supplies, so on
+      // an ANDing index none of them could return those releases.
+      //
+      // The separator is left out on purpose: the same fixture appears as
+      // ".Vs." and as ".at.", so spending an AND term on it halves the reach
+      // for nothing. The date stays, because without it a nickname pair
+      // matches every meeting of those two teams in the league's history.
+      if (plainSplit && date && teamAliasLookup) {
+        const dotted = date.replace(/-/g, '.');
+        // The stored date and the date in the release name are not always the
+        // same day. ESPN timestamps are UTC, and an American night game kicks
+        // off after midnight UTC: Arizona at Green Bay was stored as
+        // 2026-08-29 while every release of it is named 2026.08.28. Every
+        // dated query for that fixture missed, and the only one that returned
+        // anything was the undated fallback.
+        //
+        // Fixing the stored date would move the event in the catalog and the
+        // calendar, which is a separate decision. Asking for the day before as
+        // well costs two queries and covers it either way. Only the day before
+        // -- a local date is never AHEAD of the UTC one.
+        const dayBefore = new Date(date + 'T00:00:00Z');
+        dayBefore.setUTCDate(dayBefore.getUTCDate() - 1);
+        const beforeIso = dayBefore.toISOString().slice(0, 10);
+        const toDmy = (iso) => {
+          const parts = String(iso || '').split('-');
+          return parts.length === 3 ? parts[2] + '.' + parts[1] + '.' + parts[0] : '';
+        };
+        // Two date formats, because two halves of the index write them
+        // differently and both have the content.
+        //
+        // The usenet groups use dotted ISO — NFL.2026.08.28.Team.Vs.Team — and
+        // rutracker, which has by far the deepest NFL catalogue, uses DMY
+        // inside a slash-delimited title:
+        //
+        //   NFL 2026-2027 / Preseason / Week 03 / 28.08.2026 /
+        //     Houston Texans @ Carolina Panthers [Американский футбол, ...]
+        //
+        // Every one of those is reachable — the matcher already accepts that
+        // title, Cyrillic and all — but not one dated query SSS emitted could
+        // AND-match it, so the whole catalogue was invisible. DMY for the day
+        // before comes first of the two: rutracker names by the American local
+        // date, which is the day the UTC timestamp has already rolled past.
+        // Alternating, not grouped by format. A bounded provider is the whole
+        // reason this order exists: Prowlarr gets six queries and finishes
+        // about two of them before its deadline, so whatever sits at index 0
+        // and 1 is, in practice, everything it asks. Grouped by format, both
+        // of those were dotted ISO and the DMY form landed at index 4 — which
+        // Prowlarr never reached. Bitmagnet sends all sixty and found the
+        // content; Prowlarr, the one source that can reach rutracker, was
+        // never given the query that matches a rutracker title.
+        //
+        // One of each format in the first two, so a two-query provider covers
+        // both halves of the index.
+        const datesToTry = NICKNAME_IS_THE_RELEASE_NAME.has(String(presetName || '').toLowerCase())
+          ? [dotted, toDmy(beforeIso), beforeIso.replace(/-/g, '.'), toDmy(date)]
+            .filter(Boolean)
+          : [dotted];
+        const oneWord = (side, plainName) =>
+          eventTeamAliases(event, side, plainName, teamAliasLookup)
+            .map((form) => String(form || '').trim())
+            // One or two words. Single-word only looked right until a team
+            // whose nickname is two words came up: Toronto Blue Jays and
+            // Boston Red Sox produced "Boston Toronto <date>", a pair of
+            // cities that cannot match MLB.2026.07.25.Blue.Jays.Vs.Red.Sox at
+            // all. Red Sox, Blue Jays, White Sox and Trail Blazers are
+            // nicknames like any other; they just carry a space.
+            .filter((form) => form && form.length >= 4
+              && form.trim().split(/\s+/).length <= 2
+              && !/^[A-Z]{2,4}$/.test(form))
+            // Same search-worthiness rule as the template loop above, or this
+            // block reintroduces exactly what that rule removes: without it an
+            // Arsenal-Everton fixture emitted "EPL 2026.09.06 Toffees Gunners".
+            .filter((form) => isSearchWorthyForm(form, presetName))
+            // Drop the canonical "City Nickname" when a shorter form exists.
+            // Allowing two-word forms let it back in at the head — an NFL pair
+            // became "Carolina Panthers Houston Texans <date>", which is just
+            // the full-name template again and cannot match a nickname-only
+            // release. The point of this block is the short form; the long one
+            // is already covered by the templates.
+            .filter((form, _i, all) => all.length === 1
+              || String(form).toLowerCase() !== String(plainName || '').toLowerCase())
+            .slice(0, 2);
+        const homeWords = oneWord('home', plainSplit.home);
+        const awayWords = oneWord('away', plainSplit.away);
+        const leaguePrefix = (narrowLeaguePrefixes(leagueAliasList)[0] || name || '').trim();
+        // League prefix AND date together is normally a losing combination —
+        // 169 such queries returned nothing between them in the last full
+        // football run, because each extra AND term is one more chance the
+        // release spells it differently. The American leagues are the measured
+        // exception: their releases literally begin "NFL.2021.10.28.",
+        // "NBA.2025.12.05.", "MLB.2024.04.14.", so the prefix and the date are
+        // the two terms most certain to be present. Emit it only where that
+        // has been observed, and keep the prefix-free form everywhere.
+        const prefixWithDate = NICKNAME_IS_THE_RELEASE_NAME.has(
+          String(presetName || '').toLowerCase());
+        for (const away of awayWords) {
+          for (const home of homeWords) {
+            if (away.toLowerCase() === home.toLowerCase()) continue;
+            // Every prefix-free form first, then the prefixed ones. Mixing
+            // them cost two of the four date formats their place in a bounded
+            // provider's list for no gain: the prefixed variant of a date is
+            // strictly weaker than the prefix-free one (measured: "NFL
+            // 2026.08.28 Cardinals Packers" -> 0, "Cardinals Packers
+            // 2026.08.28" -> 1), so it should never displace a format that has
+            // not been tried at all.
+            for (const day of datesToTry) {
+              // Prefix-free FIRST, and it is not a stylistic choice. Measured
+              // against the live Prowlarr/usenet stack, same terms, same
+              // fixture, only the order different:
+              //
+              //   "NFL 2026.08.28 Cardinals Packers" -> 0
+              //   "Cardinals Packers 2026.08.28"     -> 1  (the real release)
+              //
+              // The release is NFL.Pre.Season.2026.08.28.Arizona.Cardinals...,
+              // so "NFL" is not adjacent to the date and a query that puts them
+              // together matches nothing. "NFL 2021.10.28 Cardinals Packers"
+              // returns 3 for a season whose releases ARE named that way, which
+              // is the same rule seen from the other side.
+              //
+              // This matters far more than it looks: a slow provider gets a
+              // bounded list and may only reach the first query before its
+              // budget expires, so the order here decides whether it finds
+              // anything at all.
+              priority.add((away + ' ' + home + ' ' + day).trim());
+            }
+            for (const day of datesToTry) {
+              if (prefixWithDate && leaguePrefix) {
+                priority.add((leaguePrefix + ' ' + day + ' ' + away + ' ' + home)
+                  .replace(/\s+/g, ' ').trim());
+              }
+            }
+          }
+        }
+
+        // Week-numbered releases, which carry no date at all:
+        //
+        //   NFL.2025-2026.W04.Packers-Cowboys.1080p.ACC.2CH.MKV-CG
+        //
+        // Every query above keys on a date, so this entire catalogue was
+        // unreachable — not badly ranked, absent. The week number now travels
+        // on the event (lib/sources/espn.js), so it can be asked for.
+        //
+        // This is the one place a league prefix next to the key term is right.
+        // The rule elsewhere is that prefix AND date lose, because the release
+        // rarely puts them together; here the release literally opens
+        // "NFL.2025-2026.W04", so the prefix, the span and the week are
+        // adjacent and all three are certain to be present.
+        //
+        // Placed after the dated forms rather than in front of them, because
+        // unlike those this ordering has not been measured against the live
+        // stack — the dated forms are known to work and must not be displaced
+        // by a form that is only reasoned about. Bitmagnet sends the whole list
+        // in 65ms and is where this catalogue would be found anyway.
+        //
+        // Only the first name of each side is used: at three forms a pair, the
+        // full cross-product would push a dozen unmeasured queries into a
+        // budget that fits about two.
+        const weekNumber = Number(event && event.week);
+        if (WEEK_NUMBERED_RELEASES.has(String(presetName || '').toLowerCase())
+            && Number.isInteger(weekNumber) && weekNumber > 0
+            && leaguePrefix && awayWords[0] && homeWords[0]
+            && awayWords[0].toLowerCase() !== homeWords[0].toLowerCase()) {
+          const pair = awayWords[0] + ' ' + homeWords[0];
+          const padded = 'W' + String(weekNumber).padStart(2, '0');
+          const span = String((event && event.seasonSpan) || '').trim();
+          const weekQueries = [];
+          // Season span first — it is what the observed release carries.
+          const phase = event.seasonPhase === 'preseason' ? ' PS' : '';
+          if (span) weekQueries.push(leaguePrefix + ' ' + span + phase + ' ' + padded + ' ' + pair);
+          weekQueries.push(leaguePrefix + phase + ' ' + padded + ' ' + pair);
+          // Unpadded, because "W4" and "W04" are both in use and one extra
+          // query is cheaper than missing half the catalogue.
+          if (weekNumber < 10) weekQueries.push(leaguePrefix + phase + ' W' + weekNumber + ' ' + pair);
+          for (const query of weekQueries) priority.add(query.replace(/\s+/g, ' ').trim());
+        }
+      }
+
+
+      // Promotion aliases learned from real releases. Replace a canonical
+      // promotion prefix where possible; otherwise prefix the shortest event
+      // variant. Capped to avoid multiplying provider calls unexpectedly.
+      if (promotionAliases.length && nameVariants.length) {
+        const shortest = nameVariants.slice().sort((a, b) => a.length - b.length)[0];
+        const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const canonicalPrefix = new RegExp('^' + escapedName + '(?:[\\s._-]+|$)', 'i');
+        for (const alias of promotionAliases.slice(0, 8)) {
+          const aliasVariant = canonicalPrefix.test(shortest)
+            ? shortest.replace(canonicalPrefix, alias + ' ')
+            : alias + ' ' + shortest;
+          out.add(aliasVariant.replace(/\s+/g, ' ').trim());
+          // Dated show names repeat the promotion and a separated air date.
+          // Query the alias with the compact date as well; do not remove team
+          // names or episode/session information from other event names.
+          if (canonicalPrefix.test(shortest) && /^\d{1,4}(?:[\s._-]+\d{1,4}){2}$/.test(shortest.replace(canonicalPrefix, '').trim())) {
+            out.add(alias + ' ' + String(event.date || '').replace(/-/g, ''));
+          }
+        }
+      }
+
+      // Hard cap so an operator with a giant alias table doesn't fan out
+      // 200 queries per event.
+      const datedPriority = Array.from(priority);
+      return Array.from(new Set([].concat(datedPriority.slice(0,2),Array.from(seasonQueries),datedPriority.slice(2),Array.from(out)))).slice(0, 60);
+    },
+    isRelevantStreamTitle(title, event) {
+      if (!title) return { ok: false, reason: 'no-title' };
+      const t = title.toLowerCase();
+      const sceneText = normaliseSceneText(title);
+      if (/\bsample\b/.test(sceneText)) return { ok: false, reason: 'excluded:sample' };
+      const excluded = exclusionKeywords.find((term) =>
+        t.includes(term) || sceneText.includes(normaliseSceneText(term))
+      );
+      if (excluded) return { ok: false, reason: 'excluded:' + excluded };
+
+      // 0.41.1 — check team-alias match FIRST. If both home AND away team
+      // aliases hit, we're highly confident this is the right event — so
+      // the keyword check becomes redundant (a title like "Man United vs
+      // Nottingham Forest 1080p WEB-DL" is unambiguous even without "EPL"
+      // in it). Skip keyword check in that case.
+      //
+      // 0.42.1 — use word-boundary regex, NOT substring includes(). The old
+      // check treated "CHE" (Chelsea TLA) as a hit inside "manCHEster",
+      // which caused Chelsea streams to include Manchester United fixtures.
+      // \bche\b won't match "manchester" because c is preceded by n (both
+      // word chars, no boundary). Precompiled per-alias so we amortise the
+      // regex construction cost across all candidate titles.
+      let teamAliasPassed = false;
+      let teamAliasApplicable = false;
+      // The promotion's own words — its name, aliases, league aliases and
+      // relevance keywords. A release prefixed with any of them is labelling
+      // its competition, not naming a different club.
+      const contextTokens = promotionContextTokens;
+
+      // 0.86.2 — structured names from the adapter are authoritative, and are
+      // used WITHOUT parsing the fixture title.
+      //
+      // Every branch below reaches its team lists by splitting event.name on a
+      // separator, which silently does nothing when the name uses a separator
+      // the splitter does not know. ESPN names a fixture "Away at Home", and
+      // " at " was not in the list, so for NFL and NBA no team check ran at
+      // all: relevance fell through to the keyword check, the keyword was
+      // satisfied by Sport-Video's category blurb, and every NFL fixture
+      // matched every American-football release on its date. Reading the
+      // supplied names directly removes the dependency on title formatting —
+      // and on getting home and away the right way round, which splitting
+      // "Away at Home" as home-first also got wrong.
+      const suppliedNames = (event && event.teamNames) || null;
+      const suppliedHome = suppliedNames && Array.isArray(suppliedNames.home) ? suppliedNames.home : [];
+      const suppliedAway = suppliedNames && Array.isArray(suppliedNames.away) ? suppliedNames.away : [];
+      if (suppliedHome.length && suppliedAway.length) {
+        teamAliasApplicable = true;
+        const homes = eventTeamAliases(event, 'home', suppliedHome[0], teamAliasLookup);
+        const aways = eventTeamAliases(event, 'away', suppliedAway[0], teamAliasLookup);
+        // plainTeamMatch is the second chance: aliasBoundaryMatch compares the
+        // alias literally, so it misses the accents and legal affixes that one
+        // feed keeps and another drops.
+        if (!teamPresent(title, homes, contextTokens, aways)) return { ok: false, reason: 'no-home-team-alias' };
+        if (!teamPresent(title, aways, contextTokens, homes)) return { ok: false, reason: 'no-away-team-alias' };
+        teamAliasPassed = true;
+      } else if ((teamAliasLookup || (event && event.teamNames)) && event && event.name) {
+        const split = splitMatchup(event.name);
+        if (split) {
+          teamAliasApplicable = true;
+          const homes = eventTeamAliases(event, 'home', split.home, teamAliasLookup);
+          const aways = eventTeamAliases(event, 'away', split.away, teamAliasLookup);
+          const homeHit = teamPresent(title, homes, contextTokens, aways) || homes.some((h) => aliasBoundaryMatch(t, h));
+          const awayHit = teamPresent(title, aways, contextTokens, homes) || aways.some((a) => aliasBoundaryMatch(t, a));
+          if (!homeHit) return { ok: false, reason: 'no-home-team-alias' };
+          if (!awayHit) return { ok: false, reason: 'no-away-team-alias' };
+          teamAliasPassed = true;
+        }
+      }
+
+      // Canonical team names are still strong evidence when no alias preset
+      // exists. Team order is deliberately irrelevant.
+      if (!teamAliasApplicable && event && event.name) {
+        const split = splitMatchup(event.name);
+        if (split) {
+          teamAliasApplicable = true;
+          const homeHit = plainTeamMatch(title, split.home);
+          const awayHit = plainTeamMatch(title, split.away);
+          // Tournament aliases (for example "UCL") identify a competition,
+          // not a fixture. Missing either selected team is a hard rejection.
+          if (!homeHit) return { ok: false, reason: 'no-home-team' };
+          if (!awayHit) return { ok: false, reason: 'no-away-team' };
+          teamAliasPassed = true;
+        }
+      }
+
+      const dateVerdict = dateMatchesEvent(title, event, this.id);
+      // Both teams plus the exact fixture date outrank generated promotion
+      // keywords, which may be overly narrow in quick-created promotions.
+      if (teamAliasPassed && dateVerdict === 'match') return { ok: true };
+      if (teamAliasPassed && dateVerdict === 'wrong-date') return { ok: false, reason: 'wrong-date' };
+
+      // Keyword check — enforced UNLESS both team aliases matched above.
+      // For non-matchup promotions (UFC PPV, WWE, F1) team-alias is not
+      // applicable and the keyword check remains the primary filter.
+      if (!teamAliasPassed && matchKeywords.length > 0) {
+        const kwHit = matchKeywords.some((kw) =>
+          t.includes(kw) || sceneText.includes(normaliseSceneText(kw))
+        );
+        if (!kwHit) return { ok: false, reason: 'no-keyword-match' };
+      }
+
+      // 0.42.3 — Date-precise match. For football (and any promotion where
+      // requireDateInTitle is set), the release title MUST contain a date
+      // matching the fixture within ±1 day. This is what distinguishes
+      // "EPL.2026.05.24.Man.City.vs.Villa" from an old
+      // "EPL.2025.05.24.Man.City.vs.Villa" — same teams, different year, both
+      // pass a naive team+year check but only one is the fixture we want.
+      if (dateVerdict === 'match') return { ok: true };   // date match is stronger than any other check
+      if (dateVerdict === 'wrong-date') return { ok: false, reason: 'wrong-date' };
+      if (teamAliasPassed && (sourceObj.type === 'football-data' || event?.competitionCode)) {
+        const roundVerdict = footballRoundVerdict(title,event,[name,...promotionAliases]);
+        if (roundVerdict === 'match') return {ok:true};
+        if (roundVerdict !== 'none') return {ok:false,reason:roundVerdict};
+      }
+      // dateVerdict === 'none' — no date detected
+      // A week-numbered release carries no date by design; the week and the
+      // season span are its identifier. See weekMatchesEvent.
+      if (weekMatchesEvent(title, event)) return { ok: true };
+      if (requireDateInTitle) {
+        return { ok: false, reason: 'no-date-in-title' };
+      }
+
+      // Fallback: year check (only for promotions where date isn't required —
+      // UFC PPV, WWE, F1, MotoGP, boxing all have their own numbering-based
+      // isRelevantStreamTitle and don't reach this codepath).
+      if (!yearMatchesEvent(title, event)) return { ok: false, reason: 'wrong-year' };
+      return { ok: true };
+    },
+    catalogs: [
+      { id: id + '-upcoming', name: name + ' Upcoming',
+        filter: (ev) => ev.date && ev.date > isoToday(),
+        sort: (a, b) => (a.date || '').localeCompare(b.date || '') },
+      { id: id + '-recent', name: name + ' Recent',
+        filter: (ev) => ev.date && ev.date <= isoToday(),
+        sort: (a, b) => (b.date || '').localeCompare(a.date || '') },
+    ],
+    eventScope: defaultEventScope,
+    includeEvent(event) {
+      if (!teamFilter) return true;
+      if (!event) return false;
+      const source = event.source || {};
+      if (teamFilter.id
+        && (String(source.homeTeamId || '') === teamFilter.id
+          || String(source.awayTeamId || '') === teamFilter.id)) return true;
+      const sides = event.teamNames || {};
+      for (const side of [sides.home, sides.away]) {
+        if (!Array.isArray(side)) continue;
+        for (const supplied of side) {
+          for (const wanted of teamFilter.names) {
+            if (String(supplied).toLowerCase() === String(wanted).toLowerCase()) return true;
+          }
+        }
+      }
+      // Last resort for a feed that supplies neither ids nor structured sides.
+      return teamFilter.names.some((wanted) => plainTeamMatch(event.name || '', wanted));
+    },
+    genres(_ev)          { return ['Sports']; },
+  };
+}
+
+// Match of the Day and Match of the Day 2 are separate TMDB shows, but their
+// releases belong together in one SSS catalog. Both are normalised to the
+// indexer naming convention "Match of the Day DD MM YYYY".
+const matchOfTheDay = createGenericPromotion({
+  id: 'motd',
+  name: 'Match of the Day',
+  idPrefix: 'motd',
+  source: 'tmdb',
+  tvId: '224',
+  posterShape: 'landscape',
+  poster: brandedPoster(
+    'motd-placeholder.png',
+    'https://raw.githubusercontent.com/Monkfish1337/Serioussportsync/main/public/motd-placeholder.png'
+  ),
+  fanart: brandedPoster(
+    'motd-placeholder.png',
+    'https://raw.githubusercontent.com/Monkfish1337/Serioussportsync/main/public/motd-placeholder.png'
+  ),
+  searchTitleTemplates: ['{name}'],
+  relevanceKeywords: ['match of the day'],
+  requireDateInTitle: true,
+});
+matchOfTheDay.isCustom = false;
+matchOfTheDay.source = { type: 'tmdb', tvIds: ['224', '3231'] };
+matchOfTheDay.formatEventName = function formatMatchOfTheDayName(_sourceName, raw) {
+  const parts = String((raw && raw.air_date) || '').split('-');
+  if (parts.length !== 3) return 'Match of the Day';
+  return 'Match of the Day ' + parts[2] + ' ' + parts[1] + ' ' + parts[0];
+};
+
+// The football season runs July-June. Keeping MOTD to the active season
+// prevents the broad global archive window from filling this weekly-show
+// catalog with stale episodes. The same predicate is used by refresh pruning
+// and both catalogs, so events naturally move from Upcoming to Recent after
+// their air date without duplication.
+function matchOfTheDaySeasonBounds() {
+  const today = new Date(); today.setUTCHours(0, 0, 0, 0);
+  const currentYear = today.getUTCFullYear();
+  const startYear = today.getUTCMonth() >= 6 ? currentYear : currentYear - 1;
+  return { dateFrom: startYear + '-07-01', dateTo: (startYear + 1) + '-06-30' };
+}
+function matchOfTheDayInCurrentSeason(ev) {
+  if (!ev || !ev.date) return false;
+  const bounds = matchOfTheDaySeasonBounds();
+  return ev.date >= bounds.dateFrom && ev.date <= bounds.dateTo;
+}
+matchOfTheDay.sourceDateRange = matchOfTheDaySeasonBounds;
+matchOfTheDay.eventScope = matchOfTheDayInCurrentSeason;
+matchOfTheDay.catalogs = [
+  { id: 'motd-upcoming', name: 'Match of the Day Upcoming',
+    filter: (ev) => matchOfTheDayInCurrentSeason(ev) && ev.date > isoToday(),
+    sort: (a, b) => (a.date || '').localeCompare(b.date || '') },
+  // Keep the original id so existing user catalog selections continue to
+  // resolve; only its label becomes explicit now that Upcoming also exists.
+  { id: 'motd', name: 'Match of the Day Recent',
+    filter: (ev) => matchOfTheDayInCurrentSeason(ev) && ev.date <= isoToday(),
+    sort: (a, b) => (b.date || '').localeCompare(a.date || '') },
+];
+
+// MLB ships with the public official schedule and the release layout observed
+// across sports indexers: "MLB YEAR / RS / DD.MM.YYYY / Away @ Home".
+// Keep the punctuation out of the actual queries because indexers tokenize it,
+// but preserve the field order and @ variant that uploaders consistently use.
+const mlb = createGenericPromotion({
+  id: 'mlb',
+  name: 'MLB',
+  idPrefix: 'mlb',
+  source: 'mlb',
+  // Square, because the artwork is a team badge.
+  //
+  // These leagues have no per-event photography: ESPN, the MLB schedule and
+  // football-data all supply a team logo and nothing else, and a logo is
+  // square. Declared as landscape, the client scaled it to fill a 16:9 tile
+  // and cropped the top and bottom off every crest on the home screen. The
+  // promotions that keep 'landscape' — UFC, WWE, AEW, ONE, F1, MotoGP, Match
+  // of the Day — do have real widescreen artwork to put in it.
+  posterShape: 'square',
+  promotionAliases: ['MLB', 'Major League Baseball'],
+  teamAliasPreset: 'mlb',
+  // Catalog-level artwork. MLB shipped with none at all, so its tile and meta
+  // backdrop were empty while every TSDB-backed promotion had all three.
+  // Looked up from TheSportsDB's MLB league record and each URL checked to
+  // return 200 with an image content type before being written down here.
+  //
+  // Top-level keys, not a `defaults` object: this promotion is built by
+  // createGenericPromotion, which reads spec.poster / spec.fanart / spec.logo
+  // and assembles `defaults` itself. A `defaults` block here is silently
+  // ignored — which is how it can look set and render nothing.
+  poster: 'https://r2.thesportsdb.com/images/media/league/banner/wgxylj1570730728.jpg',
+  fanart: 'https://r2.thesportsdb.com/images/media/league/fanart/9ppjtt1521040145.jpg',
+  logo:   'https://r2.thesportsdb.com/images/media/league/badge/c5r83j1521893739.png',
+  searchTitleTemplates: [
+    '{promotion} {date_dotted} {name}',
+    '{promotion} {date_spaced} {name}',
+    '{promotion} {year} {name}',
+    '{name} {date_dotted}',
+  ],
+  relevanceKeywords: ['mlb', 'major league baseball'],
+  exclusionKeywords: ['mlb network', 'highlights'],
+  requireDateInTitle: true,
+});
+mlb.isCustom = false;
+mlb.uuMaxQueries = 6;
+const mlbBaseSearchTitles = mlb.searchTitles.bind(mlb);
+mlb.searchTitles = function mlbSearchTitles(event) {
+  if (!event || !event.name) return [];
+  const matchup = splitMatchup(event.name);
+  const date = String(event.date || '');
+  const parts = date.split('-');
+  const year = parts.length === 3 ? parts[0] : '';
+  const dotted = date.replace(/-/g, '.');
+  const dmy = parts.length === 3 ? parts[2] + '.' + parts[1] + '.' + parts[0] : '';
+  const observed = matchup && year && dmy ? [
+    'MLB ' + year + ' RS ' + dmy + ' ' + matchup.home + ' @ ' + matchup.away,
+    'MLB ' + year + ' ' + dmy + ' ' + matchup.home + ' @ ' + matchup.away,
+    'MLB ' + dotted + ' ' + matchup.home + ' vs ' + matchup.away,
+    'MLB ' + matchup.home + ' @ ' + matchup.away + ' ' + dmy,
+  ] : [];
+  // Base first, observed after.
+  //
+  // These four hand-written forms predate the alias presets and used to lead
+  // the list. Every one of them is a full-name query carrying both a league
+  // prefix and a date — the shape measured to be weakest — and putting them at
+  // the head pushed the nickname pairs, which are what actually reach Bitmagnet
+  // and rutracker, to index 4 and beyond. Combined with the four-query slice
+  // below that meant the torrent pipeline saw ONLY these four and never one
+  // good query, which is why MLB kept returning nothing while NFL, which has no
+  // override at all, worked.
+  //
+  // They are kept because they were taken from real releases, just no longer in
+  // front of the queries that are generated from measurement. Appending them
+  // outright was the first attempt and it dropped them entirely — the
+  // generated list fills the 60-query cap on its own — so they are spliced in
+  // behind the first block of pair queries instead: far enough back not to
+  // spend a bounded provider's budget, far enough forward to survive.
+  const base = mlbBaseSearchTitles(event);
+  const OBSERVED_AT = 8;
+  return Array.from(new Set(
+    base.slice(0, OBSERVED_AT).concat(observed, base.slice(OBSERVED_AT)))).slice(0, 60);
+};
+// No torrentSearchTitles override any more. It existed to keep a slow fan-out
+// short, back when neither Bitmagnet nor Prowlarr had a budget of its own.
+// Both do now — Bitmagnet takes the full list at 65ms a query, and Prowlarr is
+// capped by the operator's own Discovery timing setting — so slicing here only
+// removed the good queries before either of them could choose.
+mlb.genres = function mlbGenres() {
+  return ['Sports', 'Baseball', 'MLB'];
+};
+
+// Champions League ships ready to use with UEFA's official public match feed.
+// It needs no provider account or key and can still be reassigned in Metadata.
+const championsLeague = createGenericPromotion({
+  id: 'ucl',
+  name: 'UEFA Champions League',
+  idPrefix: 'ucl',
+  source: 'uefa',
+  competitionId: '1',
+  // Square, because the artwork is a team badge.
+  //
+  // These leagues have no per-event photography: ESPN, the MLB schedule and
+  // football-data all supply a team logo and nothing else, and a logo is
+  // square. Declared as landscape, the client scaled it to fill a 16:9 tile
+  // and cropped the top and bottom off every crest on the home screen. The
+  // promotions that keep 'landscape' — UFC, WWE, AEW, ONE, F1, MotoGP, Match
+  // of the Day — do have real widescreen artwork to put in it.
+  posterShape: 'square',
+  teamAliasPreset: 'ucl',
+  promotionAliases: ['UEFA Champions League', 'Champions League', 'UCL'],
+  leagueAliases: ['UEFA Champions League', 'Champions League', 'UCL', 'UEFA CL'],
+  searchTitleTemplates: [
+    '{promotion} {date_dotted} {name}',
+    '{promotion} {name} {date_dotted}',
+    '{name} {date_dotted}',
+  ],
+  relevanceKeywords: ['uefa champions league', 'champions league', 'ucl'],
+  exclusionKeywords: ['women', 'womens', 'u19', 'youth', 'highlights'],
+  requireDateInTitle: true,
+});
+championsLeague.isCustom = false;
+// UU waits for its complete Prowlarr fan-out before responding. Three focused
+// variants keep the request inside SSS's stream deadline even when Prowlarr
+// serialises indexer responses, while the curated exact scene form stays first.
+championsLeague.uuMaxQueries = 3;
+const championsLeagueBaseSearchTitles = championsLeague.searchTitles.bind(championsLeague);
+championsLeague.searchTitles = function championsLeagueSearchTitles(event) {
+  if (!event || !event.name) return [];
+  const date = String(event.date || '');
+  const dotted = date.replace(/-/g, '.');
+  const generated = championsLeagueBaseSearchTitles(event);
+  // Put the curated, release-friendly identity first while retaining UEFA's
+  // formal full identity immediately behind it. This lets the source preserve
+  // "Atlético de Madrid" while searches start with "Atletico Madrid" and does
+  // the same generically for FC suffixes and every club in the UCL alias set.
+  const preferred = dotted && generated.find((title) =>
+    title.startsWith('UEFA Champions League ' + dotted + ' '));
+  const preferredMatchup = preferred
+    ? preferred.slice(('UEFA Champions League ' + dotted + ' ').length)
+    : event.name;
+  const dateParts = date.split('-');
+  const dmy = dateParts.length === 3 ? dateParts[2] + '.' + dateParts[1] + '.' + dateParts[0] : '';
+  const dmyHyphen = dateParts.length === 3 ? dateParts[2] + '-' + dateParts[1] + '-' + dateParts[0] : '';
+  const readableLeg = String(event.leg || '').replace(/^1st\s+leg$/i, 'First Leg')
+    .replace(/^2nd\s+leg$/i, 'Second Leg');
+  const stage = [event.round, readableLeg].map((value) => String(value || '').trim()).filter(Boolean).join(' ');
+  const observedVariants = [];
+  if (dotted && stage) observedVariants.push(
+    'UEFA Champions League ' + dotted + ' ' + stage + ' ' + preferredMatchup
+  );
+  if (dmy) observedVariants.push('UEFA Champions League ' + dmy + ' ' + preferredMatchup);
+  if (dmyHyphen && /final/i.test(String(event.round || ''))) observedVariants.push(
+    'UEFA Champions League FINAL ' + dmyHyphen + ' ' + preferredMatchup
+  );
+  const precise = dotted ? [
+    'UEFA Champions League ' + dotted + ' ' + event.name,
+    'Champions League ' + dotted + ' ' + event.name,
+    'UCL ' + dotted + ' ' + event.name,
+    event.name + ' ' + dotted,
+  ] : [event.name];
+  return Array.from(new Set((preferred ? [preferred] : []).concat(observedVariants, precise, generated))).slice(0, 60);
+};
+// Three focused queries FIRST, then everything else — rather than three and
+// nothing else.
+//
+// These three are right, and were measured to be: UCL releases genuinely are
+// named "UEFA.Champions.League.<date>.<matchup>", with the same fixture also
+// appearing under "Champions League" and "UCL", and the `Vs` capitalisation is
+// what the scene uses. That is why they lead.
+//
+// What was wrong was the `.slice(0, 3)`. It threw the other forty away, so the
+// torrent sources saw only these three — every one of them a full-name query
+// carrying both a league prefix and a date, which is the shape measured to be
+// weakest everywhere else. The same slice on MLB was why MLB returned nothing
+// from Bitmagnet or rutracker at all.
+//
+// Nothing needs to be dropped to fix it: Bitmagnet takes the whole list at 65ms
+// a query, and Prowlarr is bounded by the operator's own Discovery timing
+// setting, so ordering is the only thing that has to be right. The focused
+// three still go first and a bounded provider still sends them first.
+championsLeague.torrentSearchTitles = function championsLeagueTorrentSearchTitles(event) {
+  const queries = championsLeague.searchTitles(event);
+  if (!queries.length) return [];
+  const focused = [queries[0],
+    queries.find((query) => /^Champions League\b/i.test(query)),
+    queries.find((query) => /^UCL\b/i.test(query)),
+  ].filter(Boolean).map((query) => query.replace(/\s+vs\s+/i, ' Vs '));
+  return Array.from(new Set(focused.concat(queries)));
+};
+championsLeague.genres = function championsLeagueGenres() {
+  return ['Sports', 'Football', 'UEFA Champions League'];
+};
+
+// NFL and NBA ride the ESPN adapter for the reason documented in
+// lib/sources/espn.js: TheSportsDB's shared key caps a season at ~15 events.
+// Both are matchup leagues with the same "Away at Home" naming MLB uses, so
+// they reuse its query shape rather than inventing another.
+const nfl = createGenericPromotion({
+  id: 'nfl',
+  name: 'NFL',
+  idPrefix: 'nfl',
+  source: 'espn',
+  league: 'nfl',
+  // Square, because the artwork is a team badge.
+  //
+  // These leagues have no per-event photography: ESPN, the MLB schedule and
+  // football-data all supply a team logo and nothing else, and a logo is
+  // square. Declared as landscape, the client scaled it to fill a 16:9 tile
+  // and cropped the top and bottom off every crest on the home screen. The
+  // promotions that keep 'landscape' — UFC, WWE, AEW, ONE, F1, MotoGP, Match
+  // of the Day — do have real widescreen artwork to put in it.
+  posterShape: 'square',
+  promotionAliases: ['NFL', 'National Football League'],
+  // Nicknames, cities and abbreviations for all 32 franchises. Without this
+  // the matcher knew only the full "City Nickname" that ESPN hands us, and
+  // rejected NFL.2021.10.28.Cardinals.Vs.Packers -- a real release from one of
+  // the most prolific groups -- with `no-home-team`. See team-alias-presets.
+  teamAliasPreset: 'nfl',
+  // Measured against the live indexers rather than guessed: the dominant form
+  // is NFL.<YYYY.MM.DD>.<Away>.Vs.<Home>, with NFL.Pre.Season. before the date
+  // in August. Dotted is therefore right, and the bare {name} template earns
+  // its place because preseason releases carry words between the league and
+  // the date that no template can predict.
+  searchTitleTemplates: [
+    '{promotion} {date_dotted} {name}',
+    '{name} {date_dotted}',
+    '{promotion} {year} {name}',
+    '{promotion} {name}',
+  ],
+  relevanceKeywords: ['nfl', 'national football league'],
+  // "RedZone" and the weekly studio shows carry team names and would otherwise
+  // match a fixture on the same day.
+  exclusionKeywords: ['redzone', 'red zone', 'nfl network', 'hard knocks',
+    'total access', 'highlights', 'all 22', 'condensed'],
+  requireDateInTitle: true,
+});
+nfl.isCustom = false;
+nfl.uuMaxQueries = 6;
+
+const nba = createGenericPromotion({
+  id: 'nba',
+  name: 'NBA',
+  idPrefix: 'nba',
+  source: 'espn',
+  league: 'nba',
+  // Square, because the artwork is a team badge.
+  //
+  // These leagues have no per-event photography: ESPN, the MLB schedule and
+  // football-data all supply a team logo and nothing else, and a logo is
+  // square. Declared as landscape, the client scaled it to fill a 16:9 tile
+  // and cropped the top and bottom off every crest on the home screen. The
+  // promotions that keep 'landscape' — UFC, WWE, AEW, ONE, F1, MotoGP, Match
+  // of the Day — do have real widescreen artwork to put in it.
+  posterShape: 'square',
+  promotionAliases: ['NBA', 'National Basketball Association'],
+  teamAliasPreset: 'nba',
+  searchTitleTemplates: [
+    '{promotion} {date_dotted} {name}',
+    '{name} {date_dotted}',
+    '{promotion} {year} {name}',
+    '{promotion} {name}',
+  ],
+  relevanceKeywords: ['nba', 'national basketball association'],
+  exclusionKeywords: ['nba tv', 'summer league', 'g league', 'highlights',
+    'condensed', 'all access'],
+  requireDateInTitle: true,
+});
+nba.isCustom = false;
+nba.uuMaxQueries = 6;
+
+// Domestic leagues on football-data.org, chosen from a real Sport-Video scan:
+// these are the competitions whose releases the site actually carries and that
+// no promotion claimed, so every fixture here was being discovered and thrown
+// away. Codes are football-data's own; a key without access to one fails that
+// promotion's refresh with a clear message and leaves the rest working.
+//
+// Matching needs no league keyword: Sport-Video names these bare ("Toulouse vs
+// Lille 03.09.2026"), and both team names plus the fixture date already
+// outrank keywords in isRelevantStreamTitle. The aliases below are for search
+// title generation against indexers, which do prefix the competition.
+const FOOTBALL_LEAGUES = [
+  { id: 'epl', name: 'Premier League', code: 'PL',
+    // 0.95.0 — the club alias table was never wired up here. Every code-pair
+    // query in searchTitles is gated on it, so the three-letter-code form the
+    // EPL scene actually names its releases with ("...ARS-CHE_06.09.26...")
+    // had never once been emitted for an EPL fixture.
+    preset: 'epl',
+    aliases: ['EPL', 'Premier League', 'English Premier League'],
+    keywords: ['epl', 'premier league'] },
+];
+
+const footballLeagues = FOOTBALL_LEAGUES.map((league) => {
+  const promotion = createGenericPromotion({
+    id: league.id,
+    name: league.name,
+    idPrefix: league.id,
+    source: 'football-data',
+    competitionId: league.code,
+    // Square — football-data supplies a club crest and nothing else, and a
+    // crest is square. See the note on the MLB promotion above.
+    posterShape: 'square',
+    teamAliasPreset: league.preset || null,
+    promotionAliases: league.aliases,
+    // 0.95.0 — reshaped from measurement, not guesswork. The old first two
+    // templates put a league prefix AND a date around the fixture name; in the
+    // last full run 169 queries of that shape returned nothing at all, because
+    // an ANDing index needs every one of those words to appear verbatim and no
+    // release carries all of them. The prefix and the date are each fine on
+    // their own, so they are emitted separately, and the compact date is added
+    // because it is the form these releases actually use.
+    searchTitleTemplates: [
+      '{promotion} {name}',
+      '{name} {date_compact}',
+      '{name} {date_dotted}',
+      '{name}',
+    ],
+    relevanceKeywords: league.keywords,
+    exclusionKeywords: ['highlights', 'review', 'preview', 'match of the day'],
+    requireDateInTitle: true,
+  });
+  promotion.isCustom = false;
+  // Same reasoning as Man United: fixture queries are precise, and fanning
+  // twelve of them across a local indexer stack times out before any of them
+  // returns.
+  promotion.uuMaxQueries = 4;
+  return promotion;
+});
+const HARDCODED = [ufc, one, wwe, aew, ...wrestlingWeeklyShows, f1, boxing, motogp, matchOfTheDay, championsLeague, mlb, nfl, nba]
+  .concat(footballLeagues);
+
+// Replayarr registry. Built-in promotions are fixed; custom promotions and
+// per-promotion alias overlays come from Replayarr's own database and are
+// applied with configure(). Containers are mutated in place so callers that
+// hold `all` or `byPrefix` see the new state.
+const all = [];
+const byPrefix = {};
+const BUILTIN_BASE = new WeakMap();
+
+function buildCustomPromotions(specs) {
+  const hardcodedIds = new Set(HARDCODED.map((p) => p.id));
+  const out = [];
+  for (const spec of specs || []) {
+    if (!spec || hardcodedIds.has(spec.id)) continue;
+    const promotion = createGenericPromotion(spec);
+    if (promotion) out.push(promotion);
+  }
+  return out;
+}
+
+// Operator-learned aliases layered over a built-in matcher. Same precedence
+// as SSS's applyPromotionMatchingOverrides: a learned acceptance wins, a
+// learned hard rejection (exclusion, date, season) wins, anything else falls
+// back to the built-in verdict.
+function applyOverlays(items, overlays) {
+  for (const promotion of items) {
+    if (promotion.isCustom) continue;
+    let base = BUILTIN_BASE.get(promotion);
+    if (!base) {
+      base = { searchTitles: promotion.searchTitles, isRelevantStreamTitle: promotion.isRelevantStreamTitle };
+      BUILTIN_BASE.set(promotion, base);
+    }
+    promotion.searchTitles = base.searchTitles;
+    promotion.isRelevantStreamTitle = base.isRelevantStreamTitle;
+    delete promotion.matchingOverride;
+    let saved = overlays && overlays[promotion.id];
+    if (!saved) continue;
+    if (promotion.weeklyShow) saved = Object.assign({}, saved, { searchTitleTemplates: [] });
+    const overlay = createGenericPromotion({
+      id: promotion.id, name: promotion.name, source: 'tsdb', leagueId: '1',
+      promotionAliases: saved.promotionAliases,
+      relevanceKeywords: saved.relevanceKeywords,
+      exclusionKeywords: saved.exclusionKeywords,
+      searchTitleTemplates: saved.searchTitleTemplates,
+      requireDateInTitle: saved.requireDateInTitle,
+      allowForeignLanguage: saved.allowForeignLanguage,
+    });
+    const baseSearch = base.searchTitles.bind(promotion);
+    const baseRelevant = base.isRelevantStreamTitle.bind(promotion);
+    promotion.searchTitles = function overriddenSearchTitles(event) {
+      const output = [], seen = new Set();
+      for (const value of baseSearch(event).concat(overlay.searchTitles(event))) {
+        const clean = String(value || '').trim();
+        const key = clean.toLowerCase();
+        if (clean && !seen.has(key)) { seen.add(key); output.push(clean); }
+      }
+      return output.slice(0, 60);
+    };
+    promotion.isRelevantStreamTitle = function overriddenRelevance(title, event) {
+      if (promotion.weeklyShow) {
+        const builtIn = baseRelevant(title, event);
+        if (!builtIn.ok) return builtIn;
+        const learned = overlay.isRelevantStreamTitle(title, event);
+        if (/^(?:excluded:|foreign-language)/.test(String(learned.reason || ''))) return learned;
+        return builtIn;
+      }
+      const learned = overlay.isRelevantStreamTitle(title, event);
+      if (learned.ok) return learned;
+      if (/^(?:excluded:|wrong-date|wrong-season|wrong-round|no-date-in-title|foreign-language)/.test(String(learned.reason || ''))) {
+        return learned;
+      }
+      return baseRelevant(title, event);
+    };
+    promotion.matchingOverride = true;
+  }
+}
+
+function configure(options) {
+  const opts = options || {};
+  all.length = 0;
+  for (const p of HARDCODED) all.push(p);
+  for (const p of buildCustomPromotions(opts.customPromotions)) all.push(p);
+  applyOverlays(all, opts.overlays || {});
+  for (const k of Object.keys(byPrefix)) delete byPrefix[k];
+  for (const p of all) if (p.enabled) byPrefix[p.idPrefix] = p;
+}
+
+configure();
+
+function getByEventId(eventId) {
+  if (!eventId || typeof eventId !== 'string') return null;
+  const idx = eventId.indexOf(':');
+  if (idx === -1) return null;
+  return byPrefix[eventId.slice(0, idx)] || null;
+}
+
+function getById(id) {
+  return all.find((p) => p.id === id) || null;
+}
+
+module.exports = {
+  all, byPrefix, configure, getByEventId, getById, createGenericPromotion,
+  extractReleaseDates, dateMatchesEvent, splitMatchup, normaliseSceneText,
+};
