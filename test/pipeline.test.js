@@ -73,7 +73,7 @@ async function fakeServices(downloadDir) {
       if (req.headers.cookie !== 'SID=abc' && req.headers.authorization !== 'Bearer qbt_testkey1234567890123456789') return res.writeHead(403).end('Forbidden');
       if (url.pathname === '/api/v2/torrents/add') {
         const form = new URLSearchParams(body);
-        state.torrents.push({ hash, url: form.get('urls'), tags: form.get('tags'), category: form.get('category'), state: 'downloading', progress: 0.4, content_path: '/downloads/Premier.League.Arsenal.City' });
+        state.torrents.push({ hash, url: form.get('urls'), tags: form.get('tags'), category: form.get('category'), savepath: form.get('savepath'), state: 'downloading', progress: 0.4, content_path: '/downloads/Premier.League.Arsenal.City' });
         return res.end('Ok.');
       }
       if (url.pathname === '/api/v2/torrents/info') return json(state.torrents.filter((t) => t.hash === url.searchParams.get('hashes')));
@@ -328,4 +328,32 @@ test('an interrupted Easynews download resumes from the partial file', async (t)
   assert.equal(status.state, 'completed');
   assert.deepEqual(env.fake.state.easynewsRanges, [1024 * 1024], 'resumed with a Range request');
   assert.deepEqual(await readFile(join(folder, 'Premier.League.2026.09.21.Arsenal.vs.Manchester.City.720p.WEB.mkv')), Buffer.alloc(2 * 1024 * 1024, 7));
+});
+
+test('an unmapped client path fails with a fix-it message, and Retry imports once mapped', async (t) => {
+  const env = await setup();
+  t.after(() => env.cleanup());
+  const { service, store, fake } = env;
+  saveSettings(store, { qbittorrent: { savePath: '/downloads/replays' }, pathMappings: [] });
+  const request = await service.requestEvent('epl:101');
+  await service.searchRequest(request.id);
+  const torrent = store.listCandidates(request.id).find((c) => c.protocol === 'torrent' && c.decision === 'matched');
+  await service.approve(request.id, torrent.id);
+  assert.equal(fake.state.torrents[0].savepath, '/downloads/replays', 'the save path is sent with the torrent');
+
+  // qBittorrent reports the path as it sees it inside its own container.
+  const folder = join(env.downloads, 'replays', 'Premier.League.Arsenal.City');
+  await mkdir(folder, { recursive: true });
+  await writeFile(join(folder, 'Premier.League.2026.09.21.Arsenal.vs.Manchester.City.1080p.mkv'), Buffer.alloc(2 * 1024 * 1024, 3));
+  Object.assign(fake.state.torrents[0], { state: 'stalledUP', progress: 1, content_path: '/downloads/replays/Premier.League.Arsenal.City' });
+  await service.tick();
+  const failed = store.getRequest(request.id);
+  assert.equal(failed.status, 'failed');
+  assert.match(failed.error, /ENOENT.*add a Remote Path Mapping/);
+
+  saveSettings(store, { pathMappings: [{ remote: '/downloads', local: env.downloads }] });
+  service.retry(request.id);
+  await service.tick();
+  assert.equal(store.getRequest(request.id).status, 'ready', store.getRequest(request.id).error || '');
+  assert.equal(fake.state.torrents.length, 1, 'retrying an import does not download again');
 });

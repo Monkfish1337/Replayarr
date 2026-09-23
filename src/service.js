@@ -287,7 +287,12 @@ export function createService(store, overrides = {}) {
         store.log('ready', `${event.title} imported (${result.method}) to ${result.path}`, request.id);
         return store.setStatus(request.id, 'ready');
       } catch (error) {
-        const message = error instanceof ImportError ? error.message : `Import failed: ${error.code || error.message}`;
+        let message = error instanceof ImportError ? error.message : `Import failed: ${error.code || error.message}`;
+        // The usual cause: the client reports a path from inside its own
+        // container and no Remote Path Mapping translates it.
+        if (job?.remotePath && /ENOENT|No video file found/.test(message) && mapRemotePath(settings, job.remotePath) === job.remotePath) {
+          message += `. ${CLIENT_NAMES[job.client] || 'The download client'} reported this path from its own container; add a Remote Path Mapping in Settings › Download Clients so Replayarr can find it, then Retry.`;
+        }
         store.log('warning', `${event.title}: ${message}`, request.id);
         return store.setStatus(request.id, 'failed', { error: message });
       }

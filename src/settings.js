@@ -9,7 +9,9 @@ export const DEFAULTS = {
   },
   // Search sources, like Sonarr's indexer list. See INDEXER_TYPES.
   indexers: [],
-  qbittorrent: { url: '', apiKey: '', username: '', password: '', category: 'replayarr' },
+  // savePath is where qBittorrent saves Replayarr's torrents, as qBittorrent
+  // sees it; blank uses the category's own save path.
+  qbittorrent: { url: '', apiKey: '', username: '', password: '', category: 'replayarr', savePath: '' },
   sabnzbd: { url: '', apiKey: '', category: 'replayarr' },
   library: {
     root: '',

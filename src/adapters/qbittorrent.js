@@ -63,6 +63,7 @@ async function call(config, path, init = {}, retried = false) {
 export async function add(config, candidate, { tag }) {
   const form = new URLSearchParams({ urls: candidate.downloadUrl, tags: tag });
   if (config.category) form.set('category', config.category);
+  if (config.savePath) form.set('savepath', config.savePath);
   const { text } = await call(config, '/api/v2/torrents/add', {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },

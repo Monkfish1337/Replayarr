@@ -469,6 +469,7 @@ const pages = {
         ${field('qbittorrent.username', 'Username', settings.qbittorrent.username, { help: 'Only needed without an API key.' })}
         ${field('qbittorrent.password', 'Password', settings.qbittorrent.password, { type: 'password' })}
         ${field('qbittorrent.category', 'Category', settings.qbittorrent.category)}
+        ${field('qbittorrent.savePath', 'Save Path', settings.qbittorrent.savePath, { placeholder: '/downloads/replays', help: 'Where qBittorrent saves Replayarr's torrents, as a path inside qBittorrent. Blank uses the category's save path. Add a Remote Path Mapping below if Replayarr sees that folder under a different path.' })}
         ${test('qbittorrent')}</fieldset>
         <fieldset class="fieldset" style="border:0;padding:0"><legend>SABnzbd</legend>
         ${field('sabnzbd.url', 'URL', settings.sabnzbd.url, { placeholder: 'http://sabnzbd:8080' })}
