@@ -243,6 +243,13 @@ export function createStore(db) {
         }
       });
     },
+    // Before a fresh search: drop the rejected releases earlier searches kept,
+    // except any that was grabbed (the request or a job points at it).
+    clearRejected(requestId) {
+      q(`DELETE FROM candidates WHERE request_id = ? AND decision = 'rejected'
+           AND id NOT IN (SELECT candidate_id FROM requests WHERE id = ? AND candidate_id IS NOT NULL)
+           AND id NOT IN (SELECT candidate_id FROM jobs WHERE request_id = ? AND candidate_id IS NOT NULL)`).run(requestId, requestId, requestId);
+    },
     listCandidates(requestId) {
       return q(`SELECT * FROM candidates WHERE request_id = ?
                 ORDER BY decision = 'matched' DESC, score DESC, id`).all(requestId).map(candidateRow);

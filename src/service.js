@@ -7,7 +7,7 @@ import * as jellyfinAdapter from './adapters/jellyfin.js';
 import { mkdir, rename as renameFile, stat } from 'node:fs/promises';
 import { dirname, extname } from 'node:path';
 import { episodeNumber, moveSidecars, pruneEmptyFolders, writeMediaFiles } from './mediaFiles.js';
-import { configurePromotions, evaluate, promotionFor, promotions, searchTitles } from './matching/index.js';
+import { configurePromotions, evaluate, promotionFor, promotions, queriesFor } from './matching/index.js';
 import { destinationFor, ImportError, importDownload } from './importer.js';
 import { scoreCandidate } from './scoring.js';
 import { indexerReady, loadSettings, mapRemotePath } from './settings.js';
@@ -39,6 +39,13 @@ const CLIENT_FOR = { torrent: 'qbittorrent', usenet: 'sabnzbd', easynews: 'easyn
 const CLIENT_NAMES = { qbittorrent: 'qBittorrent', sabnzbd: 'SABnzbd', easynews: 'Easynews' };
 // Easynews asks for a pause between queries; the others take them back to back.
 const QUERY_PAUSE_MS = { easynews: 800 };
+
+// Lowest priority number first, as in Sonarr; ties keep the settings order.
+export function byPriority(indexers) {
+  return indexers.map((indexer, index) => ({ indexer, index }))
+    .sort((a, b) => a.indexer.priority - b.indexer.priority || a.index - b.index)
+    .map(({ indexer }) => indexer);
+}
 
 export function createService(store, overrides = {}) {
   const adapters = {
@@ -123,6 +130,65 @@ export function createService(store, overrides = {}) {
     return settings.indexers.find((i) => i.type === 'easynews' && i.id === sourceId) || null;
   }
 
+  // Send queries to one indexer, collecting new releases into `found` (keyed
+  // by info hash or guid, first indexer wins). Returns false when the indexer
+  // is unusable (bad key, unreachable), in which case the rest are skipped.
+  // With `stopAtMatch`, stops once a release matching `event` has been found
+  // (by this indexer, or one before it: `attempt.matched` starts true then)
+  // and `stopAfter` has passed; with `deadline`, stops when its time is up.
+  async function runQueries(indexer, queries, attempt, found, { event = null, deadline = 0, stopAtMatch = false, stopAfter = 0 } = {}) {
+    for (const [index, query] of queries.entries()) {
+      if (index && stopAtMatch && attempt.matched && Date.now() >= stopAfter) {
+        searchLog.info(`${indexer.name}: found a match after ${index} of ${queries.length} queries; skipping the rest`);
+        break;
+      }
+      if (index && deadline && Date.now() >= deadline) {
+        searchLog.info(`${indexer.name}: out of time after ${index} of ${queries.length} queries (${indexer.searchMinutes} min budget)`);
+        attempt.partial = true;
+        break;
+      }
+      if (index && QUERY_PAUSE_MS[indexer.type]) await new Promise((r) => setTimeout(r, QUERY_PAUSE_MS[indexer.type]));
+      try {
+        attempt.queries.push(query);
+        const results = await adapters[indexer.type].search(indexer, query);
+        searchLog.debug(`${indexer.name}: "${query}" returned ${results.length} result(s)`);
+        for (const result of results) {
+          attempt.results += 1;
+          if (found.has(result.identity)) continue;
+          const tagged = { ...result, source: indexer.name, sourceId: indexer.id };
+          found.set(result.identity, tagged);
+          attempt.found.push(tagged);
+          if (event && !attempt.matched && evaluate(tagged.title, event).ok) attempt.matched = true;
+        }
+      } catch (error) {
+        attempt.error ||= error.message;
+        searchLog.warn(`${indexer.name}: "${query}" failed: ${error.message}`);
+        // A configuration problem, or an indexer that cannot be reached at
+        // all, fails every query the same way; skip the rest.
+        if (/not configured|rejected|HTTP 401|HTTP 403|ENOTFOUND|ECONNREFUSED|EHOSTUNREACH|EAI_AGAIN/.test(error.message)) {
+          searchLog.warn(`${indexer.name}: skipping its remaining queries this search`);
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  // Match and score releases found for an event, the same way for every kind
+  // of search.
+  function judge(event, releases, settings) {
+    return releases.map((result) => {
+      const verdict = evaluate(result.title, event);
+      const { score, quality, evidence } = scoreCandidate(result, {
+        verdict, preferences: settings.preferences, minSizeMb: settings.library.minSizeMb,
+      });
+      if (verdict.ok && !clientConfigured(settings, CLIENT_FOR[result.protocol], result.sourceId)) {
+        evidence.push(`No ${CLIENT_NAMES[CLIENT_FOR[result.protocol]]} connection configured`);
+      }
+      return { ...result, score, quality, evidence, decision: verdict.ok ? 'matched' : 'rejected', reason: verdict.ok ? null : `${verdict.stage}: ${verdict.reason}` };
+    });
+  }
+
   // Searching before an event has finished only returns older fixtures.
   function firstSearchAt(event) {
     const start = Date.parse(`${event.date}T${event.time || '00:00'}:00Z`);
@@ -185,58 +251,46 @@ export function createService(store, overrides = {}) {
       const event = store.getEvent(request.eventId);
       const settings = loadSettings(store);
       request = store.setStatus(request.id, 'searching', { searchCount: request.searchCount + 1 });
+      // Events saved before Replayarr kept the provider's full record (or by
+      // the old SSS sync) have no team names or codes, so the queries built
+      // from them ("MUN SAB", "Sabah Man Utd ...") are missing. Refreshing the
+      // promotion replaces the record; the next search uses it.
+      if (!event.payload && event.source !== 'manual' && event.promotionId) {
+        searchLog.warn(`${event.title} has no stored metadata (team names, codes), so some searches are missing; refreshing ${promotionName(event)} metadata`);
+        metadata.refresh([event.promotionId]);
+      }
 
-      const indexers = settings.indexers.filter(indexerReady);
+      const indexers = byPriority(settings.indexers.filter(indexerReady));
+      const stopAtFirstMatch = settings.preferences.stopAtFirstMatch !== 'no';
+      // A match only ends the search once it has run this long, so a fast
+      // first answer does not stop the others offering alternatives.
+      const stopAfter = Date.now() + settings.preferences.minSearchSeconds * 1000;
       const found = new Map();
       const errors = [];
       const attempts = [];
       if (!indexers.length) errors.push('No indexer is configured; add one under Settings › Indexers');
-      // Each indexer gets the promotion's search titles, most precise first,
-      // up to its own query budget. The first indexer to report a release
-      // (by info hash or indexer guid) keeps it.
-      searchLog.info(`Searching for ${event.title} (${event.date}) on ${indexers.length} indexer(s)`, { request: request.id, event: event.id, attempt: request.searchCount });
+      // Indexers are asked in priority order (fast ones first by default).
+      // Each gets the queries SSS would send it, stopping when its time is
+      // up, or once there is a match and the minimum search time has passed;
+      // then the indexers after it are not asked. The first indexer to report
+      // a release (by info hash or indexer guid) keeps it.
+      searchLog.info(`Searching for ${event.title} (${event.date}) on ${indexers.length} indexer(s)`, { request: request.id, event: event.id, attempt: request.searchCount, order: indexers.map((i) => `${i.name} (${i.priority})`).join(', ') });
       for (const indexer of indexers) {
-        const queries = searchTitles(event, indexer.maxQueries);
-        const attempt = { source: indexer.name, queries, started: Date.now(), results: 0, error: null, found: [] };
-        for (const [index, query] of queries.entries()) {
-          if (index && QUERY_PAUSE_MS[indexer.type]) await new Promise((r) => setTimeout(r, QUERY_PAUSE_MS[indexer.type]));
-          try {
-            const results = await adapters[indexer.type].search(indexer, query);
-            searchLog.debug(`${indexer.name}: "${query}" returned ${results.length} result(s)`);
-            for (const result of results) {
-              attempt.results += 1;
-              if (found.has(result.identity)) continue;
-              const tagged = { ...result, source: indexer.name, sourceId: indexer.id };
-              found.set(result.identity, tagged);
-              attempt.found.push(tagged);
-            }
-          } catch (error) {
-            attempt.error ||= error.message;
-            searchLog.warn(`${indexer.name}: "${query}" failed: ${error.message}`);
-            // A configuration problem, or an indexer that cannot be reached at
-            // all, fails every query the same way; skip the rest.
-            if (/not configured|rejected|HTTP 401|HTTP 403|ENOTFOUND|ECONNREFUSED|EHOSTUNREACH|EAI_AGAIN/.test(error.message)) {
-              searchLog.warn(`${indexer.name}: skipping its remaining queries this search`);
-              break;
-            }
-          }
+        if (stopAtFirstMatch && attempts.some((a) => a.matched) && Date.now() >= stopAfter) {
+          searchLog.info(`${indexer.name}: skipped, a higher-priority indexer already found a match`);
+          continue;
         }
-        searchLog.info(`${indexer.name}: ${attempt.results} result(s), ${attempt.found.length} new, from ${queries.length} quer${queries.length === 1 ? 'y' : 'ies'}`, { ms: Date.now() - attempt.started, error: attempt.error });
+        const queries = queriesFor(event, indexer.type, indexer.maxQueries);
+        const attempt = { source: indexer.name, queries: [], started: Date.now(), results: 0, error: null, found: [], matched: attempts.some((a) => a.matched) };
+        const deadline = attempt.started + indexer.searchMinutes * MINUTE;
+        await runQueries(indexer, queries, attempt, found, { event, deadline, stopAtMatch: stopAtFirstMatch, stopAfter });
+        attempt.matched = attempt.found.some((r) => evaluate(r.title, event).ok);
+        searchLog.info(`${indexer.name}: ${attempt.results} result(s), ${attempt.found.length} new, from ${attempt.queries.length} quer${attempt.queries.length === 1 ? 'y' : 'ies'}`, { ms: Date.now() - attempt.started, error: attempt.error });
         if (attempt.error) errors.push(attempt.error);
         attempts.push(attempt);
       }
 
-      const verify = (title) => evaluate(title, event);
-      const scored = [...found.values()].map((result) => {
-        const verdict = verify(result.title);
-        const { score, quality, evidence } = scoreCandidate(result, {
-          verdict, preferences: settings.preferences, minSizeMb: settings.library.minSizeMb,
-        });
-        if (verdict.ok && !clientConfigured(settings, CLIENT_FOR[result.protocol], result.sourceId)) {
-          evidence.push(`No ${CLIENT_NAMES[CLIENT_FOR[result.protocol]]} connection configured`);
-        }
-        return { ...result, score, quality, evidence, decision: verdict.ok ? 'matched' : 'rejected', reason: verdict.ok ? null : `${verdict.stage}: ${verdict.reason}` };
-      });
+      const scored = judge(event, [...found.values()], settings);
       // Every verdict, so "why wasn't X picked up?" can be answered from the log.
       for (const candidate of scored) {
         searchLog.debug(`${candidate.decision === 'matched' ? 'Matched' : 'Rejected'} ${candidate.title}`, {
@@ -246,6 +300,7 @@ export function createService(store, overrides = {}) {
       const matched = scored.filter((c) => c.decision === 'matched');
       const rejected = scored.filter((c) => c.decision === 'rejected').slice(0, MAX_REJECTED_KEPT);
       searchLog.info(`${event.title}: ${matched.length} matched, ${scored.length - matched.length} rejected of ${found.size} unique result(s)`);
+      store.clearRejected(request.id);
       store.saveCandidates(request.id, [...matched, ...rejected]);
       const matchedIds = new Set(matched.map((c) => c.identity));
       for (const attempt of attempts) {
@@ -272,12 +327,20 @@ export function createService(store, overrides = {}) {
       return store.setStatus(request.id, 'wanted', { nextSearchAt: iso(delay), error: message });
     },
 
-    async approve(requestId, candidateId) {
-      const request = requireRequest(requestId);
-      if (!['review', 'failed'].includes(request.status)) throw new UserError(`A ${request.status} request cannot take a new release.`, 409);
+    // Send a release to its download client. `override` sends one the matcher
+    // rejected: the operator has looked at it and says it is the event.
+    async approve(requestId, candidateId, { override = false } = {}) {
+      let request = requireRequest(requestId);
+      if (!['review', 'failed', 'wanted'].includes(request.status)) throw new UserError(`A ${request.status} request cannot take a new release.`, 409);
       const candidate = store.getCandidate(Number(candidateId));
       if (!candidate || candidate.requestId !== request.id) throw new UserError('That release does not belong to this request.', 404);
-      if (candidate.decision !== 'matched') throw new UserError('Only a release that matched this event can be sent.');
+      if (candidate.decision !== 'matched' && !override) throw new UserError('Only a release that matched this event can be sent; use Grab anyway to override.');
+      if (candidate.decision !== 'matched') downloadLog.warn(`Grabbing ${candidate.title} despite the matcher (${candidate.reason})`, { request: request.id });
+      // A still-wanted request (e.g. after a manual search) moves through review first.
+      if (request.status === 'wanted') {
+        store.setStatus(request.id, 'searching');
+        request = store.setStatus(request.id, 'review');
+      }
       const settings = loadSettings(store);
       const client = CLIENT_FOR[candidate.protocol];
       if (client === 'easynews' && !clientConfig(settings, client, candidate.sourceId)) {
@@ -306,6 +369,46 @@ export function createService(store, overrides = {}) {
       }
       store.log('download', `${event.title} sent to ${CLIENT_NAMES[client]}`, request.id);
       return store.setStatus(request.id, 'downloading', { candidateId: candidate.id });
+    },
+
+    // Search the operator's own words on one indexer or all of them. Results
+    // are matched and scored like any search and kept as candidates, so they
+    // can be grabbed (or grabbed anyway) from the same list. The request's
+    // status is left alone; grabbing moves it on.
+    async manualSearch(requestId, { query, indexerId } = {}) {
+      const request = requireRequest(requestId);
+      const text = String(query || '').trim().replace(/\s+/g, ' ');
+      if (text.length < 2) throw new UserError('Type something to search for.');
+      if (text.length > 200) throw new UserError('That search is too long.');
+      const settings = loadSettings(store);
+      const indexers = byPriority(settings.indexers.filter(indexerReady).filter((i) => !indexerId || i.id === indexerId));
+      if (!indexers.length) throw new UserError(indexerId ? 'That indexer is disabled or not set up.' : 'No indexer is configured; add one under Settings › Indexers.');
+      const event = store.getEvent(request.eventId);
+      searchLog.info(`Manual search for ${event.title}: "${text}"`, { indexers: indexers.map((i) => i.name).join(', ') });
+      const found = new Map();
+      const attempts = [];
+      for (const indexer of indexers) {
+        const attempt = { source: indexer.name, queries: [], started: Date.now(), results: 0, error: null, found: [] };
+        await runQueries(indexer, [text], attempt, found);
+        attempts.push(attempt);
+      }
+      const scored = judge(event, [...found.values()], settings);
+      for (const candidate of scored) {
+        candidate.evidence = [...candidate.evidence, `Manual search: "${text}"`];
+        searchLog.debug(`${candidate.decision === 'matched' ? 'Matched' : 'Rejected'} ${candidate.title}`, { source: candidate.source, reason: candidate.reason });
+      }
+      store.saveCandidates(request.id, scored);
+      for (const attempt of attempts) {
+        store.recordSearch({
+          requestId: request.id, source: `${attempt.source} (manual)`, queries: attempt.queries, resultCount: attempt.results,
+          matchedCount: scored.filter((c) => c.decision === 'matched' && attempt.found.some((f) => f.identity === c.identity)).length,
+          durationMs: Date.now() - attempt.started, error: attempt.error,
+        });
+      }
+      const identities = new Set(scored.map((c) => c.identity));
+      const candidates = store.listCandidates(request.id).filter((c) => identities.has(c.identity));
+      searchLog.info(`Manual search "${text}": ${found.size} result(s), ${candidates.filter((c) => c.decision === 'matched').length} matched`);
+      return { query: text, candidates, errors: attempts.filter((a) => a.error).map((a) => `${a.source}: ${a.error}`) };
     },
 
     async reconcileJobs() {

@@ -198,6 +198,9 @@ h1, h2, h3 { color: var(--text-strong); font-weight: 400; margin: 0; }
 .card .labels { margin-top: 10px; }
 .indexer-card { display: flex; flex-direction: column; justify-content: flex-start; text-align: left; border: 1px solid transparent; color: var(--text); min-height: 110px; }
 .indexer-card:hover { border-color: var(--accent-dark); }
+.manual-search { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.manual-search input { flex: 1 1 260px; min-width: 0; }
+.manual-search select { flex: 0 1 180px; }
 .add-card { display: grid; place-items: center; font-size: 36px; color: var(--muted); background: transparent; border: 2px dashed var(--border-strong); box-shadow: none; }
 .add-card:hover { color: var(--accent); }
 

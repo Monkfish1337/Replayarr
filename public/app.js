@@ -201,6 +201,7 @@ function eventRows(events, { showPromotion = false } = {}) {
       <td class="actions">
         <button class="icon-button" data-action="auto-search" title="Automatic search" aria-label="Automatic search" ${event.library || ['downloading', 'importing'].includes(event.request?.status) ? 'disabled' : ''}>${icon('search')}</button>
         <button class="icon-button" data-action="interactive-search" title="Interactive search" aria-label="Interactive search" ${event.library ? 'disabled' : ''}>${icon('user')}</button>
+        <button class="icon-button" data-action="manual-search" title="Manual search" aria-label="Manual search" ${event.library ? 'disabled' : ''}>${icon('keyboard')}</button>
       </td>
     </tr>`;
   }).join('');
@@ -443,6 +444,7 @@ const pages = {
           <td class="actions">${r.status === 'failed' ? `<button class="icon-button" data-action="retry" title="Retry" aria-label="Retry">${icon('retry')}</button>` : ''}
             <button class="icon-button" data-action="auto-search" title="Automatic search" aria-label="Automatic search" ${r.status === 'searching' ? 'disabled' : ''}>${icon('search')}</button>
             <button class="icon-button" data-action="interactive-search" title="Interactive search" aria-label="Interactive search">${icon('user')}</button>
+            <button class="icon-button" data-action="manual-search" title="Manual search" aria-label="Manual search">${icon('keyboard')}</button>
             <button class="icon-button danger" data-action="remove-request" title="Remove request" aria-label="Remove request">${icon('trash')}</button></td></tr>`;
       }).join('')}
     </tbody></table></div>`;
@@ -469,17 +471,20 @@ const pages = {
     } else if (tab === 'indexers') {
       indexersCache = settings.indexers;
       body = `<fieldset class="fieldset" style="border:0;padding:0"><legend>Indexers</legend>
-        <div class="cards">${settings.indexers.map((indexer) => `<button type="button" class="card indexer-card" data-action="edit-indexer" data-id="${esc(indexer.id)}">
+        <div class="cards">${[...settings.indexers].sort((a, b) => a.priority - b.priority).map((indexer) => `<button type="button" class="card indexer-card" data-action="edit-indexer" data-id="${esc(indexer.id)}">
             <h3>${esc(indexer.name)}</h3>
             <div class="labels"><span class="label label-default">${esc(INDEXER_TYPES[indexer.type]?.label || indexer.type)}</span>
               <span class="label label-outline">${esc(INDEXER_TYPES[indexer.type]?.protocol || '')}</span>
               ${indexer.enabled ? '<span class="label label-success">Enabled</span>' : '<span class="label label-danger">Disabled</span>'}
-              <span class="label label-outline">${indexer.maxQueries} queries</span></div></button>`).join('')}
+              <span class="label label-outline">Priority ${indexer.priority}</span>
+              <span class="label label-outline">${indexer.maxQueries} queries · ${indexer.searchMinutes} min</span></div></button>`).join('')}
           <button type="button" class="card indexer-card add-card" data-action="add-indexer" aria-label="Add indexer">${icon('plus')}</button></div>
-        <p class="form-help" style="max-width:none">Every enabled indexer is searched with the promotion's search titles, most precise first, up to its query limit. A release found by several indexers is listed once.</p></fieldset>
+        <p class="form-help" style="max-width:none">Indexers are searched in priority order, lowest number first (as in Sonarr): put the fast ones first. Each gets the same queries SSS sent it, most precise first, up to its query limit and time budget. A release found by several indexers is listed once, under the first to report it.</p></fieldset>
         <fieldset class="fieldset" style="border:0;padding:0"><legend>Release Preferences</legend>
         ${field('preferences.protocol', 'Preferred Protocol', settings.preferences.protocol, { options: [['any', 'No preference'], ['usenet', 'Prefer Usenet'], ['torrent', 'Prefer Torrent']] })}
-        ${field('preferences.minSeeders', 'Minimum Seeders', settings.preferences.minSeeders, { type: 'number' })}</fieldset>`;
+        ${field('preferences.minSeeders', 'Minimum Seeders', settings.preferences.minSeeders, { type: 'number' })}
+        ${field('preferences.stopAtFirstMatch', 'Stop at First Match', settings.preferences.stopAtFirstMatch, { options: [['yes', 'Yes: stop once a release matches'], ['no', 'No: search every indexer fully']], help: 'Yes skips an indexer’s remaining queries, and the lower-priority indexers, once a matching release is found and the minimum search time has passed.' })}
+        ${field('preferences.minSearchSeconds', 'Minimum Search Time (seconds)', settings.preferences.minSearchSeconds, { type: 'number', help: 'Keep searching at least this long after a first match, so slower indexers can offer alternatives. 0 stops at the first match.' })}</fieldset>`;
     } else if (tab === 'downloadclients') {
       const mappings = settings.pathMappings.length ? settings.pathMappings : [{ remote: '', local: '' }];
       body = `<fieldset class="fieldset" style="border:0;padding:0"><legend>qBittorrent</legend>
@@ -612,7 +617,7 @@ async function interactiveSearch(eventId, { searchFirst = true } = {}) {
 
 async function searchInModal(requestId) {
   const body = $('#release-body');
-  if (body) body.innerHTML = '<div class="empty-state">Searching Prowlarr…</div>';
+  if (body) body.innerHTML = '<div class="empty-state">Searching indexers, highest priority first. This can take a minute…</div>';
   await run(() => api(`/requests/${requestId}/search`, { method: 'POST' }));
   await renderReleases(requestId);
 }
@@ -630,10 +635,19 @@ async function renderReleases(requestId) {
     return;
   }
   body.innerHTML = `${summary}${locked ? `<div class="alert">${icon('download')}<div>A release for this event is already ${esc(detail.status)}.</div></div>` : ''}
-    <table class="table"><thead><tr><th class="hide-sm">Source</th><th class="hide-sm">Age</th><th>Title</th><th class="hide-sm">Indexer</th><th>Size</th><th class="hide-sm">Peers</th><th>Quality</th><th>Score</th><th></th><th></th></tr></thead><tbody>
-    ${detail.candidates.map((c) => {
+    ${releaseTable(detail.candidates, { requestId: detail.id, chosenId: detail.candidateId, locked })}`;
+}
+
+// Shared by interactive and manual search. A rejected release gets a
+// "grab anyway" button, which asks first and names the reason it was rejected.
+function releaseTable(candidates, { requestId, chosenId = null, locked = false }) {
+  return `<table class="table"><thead><tr><th class="hide-sm">Source</th><th class="hide-sm">Age</th><th>Title</th><th class="hide-sm">Indexer</th><th>Size</th><th class="hide-sm">Peers</th><th>Quality</th><th>Score</th><th></th><th></th></tr></thead><tbody>
+    ${candidates.map((c) => {
       const rejected = c.decision !== 'matched';
-      const chosen = detail.candidateId === c.id;
+      const chosen = chosenId === c.id;
+      const grab = rejected
+        ? `<button class="icon-button danger" data-action="grab-anyway" data-request="${requestId}" data-candidate="${c.id}" data-reason="${esc(c.reason || 'did not match this event')}" title="Grab anyway (rejected: ${esc(c.reason || 'did not match')})" aria-label="Grab anyway" ${locked ? 'disabled' : ''}>${icon('download')}</button>`
+        : `<button class="icon-button" data-action="grab" data-request="${requestId}" data-candidate="${c.id}" title="Download" aria-label="Download" ${locked ? 'disabled' : ''}>${icon('download')}</button>`;
       return `<tr class="${rejected ? 'rejected' : ''}"><td class="hide-sm"><span class="label ${(PROTOCOL_LABELS[c.protocol] || PROTOCOL_LABELS.torrent)[1]}">${(PROTOCOL_LABELS[c.protocol] || PROTOCOL_LABELS.torrent)[0]}</span></td>
         <td class="nowrap hide-sm">${esc(age(c.publishedAt))}</td>
         <td class="title-cell">${esc(c.title)}${!rejected ? `<div class="evidence">${esc(c.evidence.join(' · '))}</div>` : ''}</td>
@@ -642,8 +656,46 @@ async function renderReleases(requestId) {
         <td>${c.quality ? `<span class="label label-default">${esc(c.quality)}</span>` : ''}</td>
         <td class="score">${rejected ? '' : c.score}</td>
         <td class="narrow">${rejected ? `<span class="rejection" tabindex="0" aria-label="Rejected">${icon('warning')}<span class="tip">${esc(c.reason || 'Did not match this event')}</span></span>` : ''}</td>
-        <td class="actions">${chosen ? `<span class="label label-purple">Grabbed</span>` : `<button class="icon-button" data-action="grab" data-request="${detail.id}" data-candidate="${c.id}" title="${rejected ? 'Only a release that matched this event can be grabbed' : 'Download'}" aria-label="Download" ${rejected || locked ? 'disabled' : ''}>${icon('download')}</button>`}</td></tr>`;
+        <td class="actions">${chosen ? `<span class="label label-purple">Grabbed</span>` : grab}</td></tr>`;
     }).join('')}</tbody></table>`;
+}
+
+// Manual search: the operator types the query (Sonarr has no equivalent, SSS
+// did). Results are matched like any search, so the verdicts still show.
+async function manualSearchModal(eventId) {
+  const request = await run(() => ensureRequest(eventId));
+  if (!request) return;
+  const indexers = (await run(() => api('/indexers'))) || [];
+  openModal(`<div class="modal-header"><span>Manual Search – ${esc(request.event?.title || '')}</span><button class="icon-button" data-action="close-modal" aria-label="Close">${icon('x')}</button></div>
+    <div class="modal-body">
+      <form id="manual-search-form" class="manual-search" data-request="${request.id}">
+        <input name="query" value="${esc(request.event?.title || '')}" maxlength="200" required aria-label="Search for" placeholder="Man Utd Sabah 2026">
+        <select name="indexerId" aria-label="Indexer"><option value="">All indexers</option>${indexers.filter((i) => i.enabled).map((i) => `<option value="${esc(i.id)}">${esc(i.name)}</option>`).join('')}</select>
+        <button class="button button-primary" type="submit">${icon('search')} Search</button>
+      </form>
+      <p class="form-help" style="max-width:none">Sends exactly what you type. Every result is still checked against this event; rejected ones can be grabbed anyway.</p>
+      <div id="manual-results"></div>
+    </div>
+    <div class="modal-footer"><button class="button" data-action="close-modal">Close</button></div>`);
+  const field = $('#manual-search-form input[name="query"]');
+  field?.focus();
+  field?.select();
+}
+
+async function runManualSearch(form) {
+  const out = $('#manual-results');
+  const requestId = form.dataset.request;
+  const query = form.elements.query.value;
+  const button = form.querySelector('button[type="submit"]');
+  button.disabled = true;
+  out.innerHTML = '<div class="empty-state">Searching…</div>';
+  const result = await run(() => api(`/requests/${requestId}/manual-search`, { method: 'POST', body: { query, indexerId: form.elements.indexerId.value || null } }));
+  button.disabled = false;
+  if (!result) { out.innerHTML = ''; return; }
+  const matched = result.candidates.filter((c) => c.decision === 'matched').length;
+  const errors = result.errors.length ? `<div class="alert">${icon('warning')}<div>${result.errors.map(esc).join('<br>')}</div></div>` : '';
+  out.innerHTML = `${errors}<p class="muted">"${esc(result.query)}": ${result.candidates.length} result${result.candidates.length === 1 ? '' : 's'}, ${matched} matched this event.</p>
+    ${result.candidates.length ? releaseTable(result.candidates.sort((a, b) => (a.decision === 'matched' ? 0 : 1) - (b.decision === 'matched' ? 0 : 1) || (b.score || 0) - (a.score || 0)), { requestId }) : '<div class="empty-state"><h2>No results</h2><p>Try fewer words: just the two teams, or a nickname.</p></div>'}`;
 }
 
 function manualEventModal() {
@@ -700,14 +752,16 @@ function indexerModal(indexer) {
       + input('downloadFolder', 'Download Folder', indexer.downloadFolder, { placeholder: '/data/downloads/easynews', help: 'Where Replayarr saves Easynews files before importing. Put it on the same drive as the library so imports can be hardlinks.' })
       + input('timeoutMs', 'Search Timeout (ms)', indexer.timeoutMs ?? 20000, { type: 'number' }),
   }[indexer.type];
-  const defaultQueries = { prowlarr: 6, bitmagnet: 12, easynews: 4 }[indexer.type];
+  const defaults = { prowlarr: [30, 60, 5], bitmagnet: [10, 60, 2], easynews: [20, 6, 3] }[indexer.type];
   openModal(`<div class="modal-header"><span>${isNew ? 'Add' : 'Edit'} Indexer – ${esc(type.label)}</span><button class="icon-button" data-action="close-modal" aria-label="Close">${icon('x')}</button></div>
     <form id="indexer-form" class="modal-body" data-id="${esc(indexer.id || '')}" data-type="${esc(indexer.type)}">
       <p class="form-help" style="max-width:none;margin-top:0">${esc(type.about)}</p>
       ${input('name', 'Name', indexer.name || type.label)}
       <div class="form-group"><span></span><label class="form-inline"><input type="checkbox" name="enabled" ${indexer.enabled === false ? '' : 'checked'}> Enable</label></div>
       ${fields}
-      ${input('maxQueries', 'Queries Per Search', indexer.maxQueries ?? defaultQueries, { type: 'number', help: 'How many of the promotion\'s search titles to send, most precise first.' })}
+      ${input('priority', 'Priority', indexer.priority ?? defaults[0], { type: 'number', help: '1 to 50; lower is searched first. Suggested: Bitmagnet 10, Easynews 20, a Usenet Prowlarr 30, a torrent Prowlarr 40.' })}
+      ${input('maxQueries', 'Queries Per Search', indexer.maxQueries ?? defaults[1], { type: 'number', help: 'The most of the promotion’s search titles to send, most precise first. Searching stops early once a release matches.' })}
+      ${input('searchMinutes', 'Time Budget (minutes)', indexer.searchMinutes ?? defaults[2], { type: 'number', help: 'Stop sending queries to this indexer after this long.' })}
     </form>
     <div class="modal-footer">${isNew ? '' : '<button class="button button-danger" data-action="delete-indexer" style="margin-right:auto">Delete</button>'}
       <span class="test-result" data-result="indexer" style="align-self:center"></span>
@@ -1060,10 +1114,17 @@ const actions = {
     render({ quiet: true });
   },
   'interactive-search': (el) => interactiveSearch(el.closest('[data-event]').dataset.event),
+  'manual-search': (el) => manualSearchModal(el.closest('[data-event]').dataset.event),
   'modal-search': (el) => searchInModal(el.dataset.request),
   grab: async (el) => {
     el.disabled = true;
     const ok = await run(() => api(`/requests/${el.dataset.request}/approve`, { method: 'POST', body: { candidateId: Number(el.dataset.candidate) } }), 'Release sent to download client');
+    if (ok) { closeModal(); render({ quiet: true }); } else el.disabled = false;
+  },
+  'grab-anyway': async (el) => {
+    if (!confirm(`Replayarr rejected this release: ${el.dataset.reason}.\n\nDownload it anyway?`)) return;
+    el.disabled = true;
+    const ok = await run(() => api(`/requests/${el.dataset.request}/approve`, { method: 'POST', body: { candidateId: Number(el.dataset.candidate), override: true } }), 'Release sent to download client');
     if (ok) { closeModal(); render({ quiet: true }); } else el.disabled = false;
   },
   retry: async (el) => { await run(() => api(`/requests/${el.closest('[data-request]').dataset.request}/retry`, { method: 'POST' }), 'Retrying'); render({ quiet: true }); },
@@ -1153,6 +1214,7 @@ document.addEventListener('click', (event) => {
 document.addEventListener('submit', async (event) => {
   event.preventDefault();
   const form = event.target;
+  if (form.id === 'manual-search-form') return runManualSearch(form);
   if (form.id === 'manual-form') {
     const data = Object.fromEntries(new FormData(form));
     const created = await run(() => api('/events', { method: 'POST', body: { ...data, aliases: data.aliases } }), 'Event added');

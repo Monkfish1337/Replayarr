@@ -75,7 +75,15 @@ export async function search(config, query) {
   return items.map(normalise).filter(Boolean);
 }
 
+// As SSS's probe: an empty search counts the whole index, so Test shows how
+// much is behind the URL. A reachable but empty (or wrong) Bitmagnet answers
+// every search with nothing and no error, which is otherwise invisible.
 export async function testConnection(config) {
-  await graphql(config, '{ __typename }', {}, 10000);
-  return 'Bitmagnet GraphQL reachable';
+  const data = await graphql(config, `query Count($input: TorrentContentSearchQueryInput!) {
+    torrentContent { search(input: $input) { totalCount } } }`,
+  { input: { queryString: '', limit: 1, totalCount: true, cached: false } }, 10000);
+  const total = Number(data?.torrentContent?.search?.totalCount);
+  if (!Number.isFinite(total)) throw new ServiceError(SERVICE, 'reachable, but this does not look like a Bitmagnet GraphQL API');
+  if (total === 0) throw new ServiceError(SERVICE, 'reachable, but its index is empty, so every search will find nothing. Check the URL points at the Bitmagnet you use.');
+  return `Bitmagnet reachable: ${total.toLocaleString('en-GB')} torrents indexed`;
 }
