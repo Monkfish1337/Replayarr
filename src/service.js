@@ -130,20 +130,15 @@ export function createService(store, overrides = {}) {
     return settings.indexers.find((i) => i.type === 'easynews' && i.id === sourceId) || null;
   }
 
-  // Send queries to one indexer, collecting new releases into `found` (keyed
-  // by info hash or guid, first indexer wins). Returns false when the indexer
-  // is unusable (bad key, unreachable), in which case the rest are skipped.
-  // With `stopAtMatch`, stops once a release matching `event` has been found
-  // (by this indexer, or one before it: `attempt.matched` starts true then)
-  // and `stopAfter` has passed; with `deadline`, stops when its time is up.
-  async function runQueries(indexer, queries, attempt, found, { event = null, deadline = 0, stopAtMatch = false, stopAfter = 0 } = {}) {
+  // Send queries to one indexer, collecting its releases in `attempt.found`
+  // (once each, by info hash or guid). Returns false when the indexer is
+  // unusable (bad key, unreachable), in which case the rest are skipped.
+  // Stops when `closed()` says the search is over; an answer that arrives
+  // after that is dropped, so nothing changes once the results are judged.
+  async function runQueries(indexer, queries, attempt, { closed = () => false } = {}) {
+    const seen = new Set();
     for (const [index, query] of queries.entries()) {
-      if (index && stopAtMatch && attempt.matched && Date.now() >= stopAfter) {
-        searchLog.info(`${indexer.name}: found a match after ${index} of ${queries.length} queries; skipping the rest`);
-        break;
-      }
-      if (index && deadline && Date.now() >= deadline) {
-        searchLog.info(`${indexer.name}: out of time after ${index} of ${queries.length} queries (${indexer.searchMinutes} min budget)`);
+      if (closed()) {
         attempt.partial = true;
         break;
       }
@@ -151,16 +146,19 @@ export function createService(store, overrides = {}) {
       try {
         attempt.queries.push(query);
         const results = await adapters[indexer.type].search(indexer, query);
+        if (closed()) {
+          attempt.partial = true;
+          break;
+        }
         searchLog.debug(`${indexer.name}: "${query}" returned ${results.length} result(s)`);
         for (const result of results) {
           attempt.results += 1;
-          if (found.has(result.identity)) continue;
-          const tagged = { ...result, source: indexer.name, sourceId: indexer.id };
-          found.set(result.identity, tagged);
-          attempt.found.push(tagged);
-          if (event && !attempt.matched && evaluate(tagged.title, event).ok) attempt.matched = true;
+          if (seen.has(result.identity)) continue;
+          seen.add(result.identity);
+          attempt.found.push({ ...result, source: indexer.name, sourceId: indexer.id });
         }
       } catch (error) {
+        if (closed()) break;
         attempt.error ||= error.message;
         searchLog.warn(`${indexer.name}: "${query}" failed: ${error.message}`);
         // A configuration problem, or an indexer that cannot be reached at
@@ -261,33 +259,39 @@ export function createService(store, overrides = {}) {
       }
 
       const indexers = byPriority(settings.indexers.filter(indexerReady));
-      const stopAtFirstMatch = settings.preferences.stopAtFirstMatch !== 'no';
-      // A match only ends the search once it has run this long, so a fast
-      // first answer does not stop the others offering alternatives.
-      const stopAfter = Date.now() + settings.preferences.minSearchSeconds * 1000;
-      const found = new Map();
+      const limitSeconds = settings.preferences.searchSeconds;
       const errors = [];
-      const attempts = [];
       if (!indexers.length) errors.push('No indexer is configured; add one under Settings › Indexers');
-      // Indexers are asked in priority order (fast ones first by default).
-      // Each gets the queries SSS would send it, stopping when its time is
-      // up, or once there is a match and the minimum search time has passed;
-      // then the indexers after it are not asked. The first indexer to report
-      // a release (by info hash or indexer guid) keeps it.
-      searchLog.info(`Searching for ${event.title} (${event.date}) on ${indexers.length} indexer(s)`, { request: request.id, event: event.id, attempt: request.searchCount, order: indexers.map((i) => `${i.name} (${i.priority})`).join(', ') });
-      for (const indexer of indexers) {
-        if (stopAtFirstMatch && attempts.some((a) => a.matched) && Date.now() >= stopAfter) {
-          searchLog.info(`${indexer.name}: skipped, a higher-priority indexer already found a match`);
-          continue;
-        }
-        const queries = queriesFor(event, indexer.type, indexer.maxQueries);
-        const attempt = { source: indexer.name, queries: [], started: Date.now(), results: 0, error: null, found: [], matched: attempts.some((a) => a.matched) };
-        const deadline = attempt.started + indexer.searchMinutes * MINUTE;
-        await runQueries(indexer, queries, attempt, found, { event, deadline, stopAtMatch: stopAtFirstMatch, stopAfter });
-        attempt.matched = attempt.found.some((r) => evaluate(r.title, event).ok);
-        searchLog.info(`${indexer.name}: ${attempt.results} result(s), ${attempt.found.length} new, from ${attempt.queries.length} quer${attempt.queries.length === 1 ? 'y' : 'ies'}`, { ms: Date.now() - attempt.started, error: attempt.error });
+      // Every indexer searches at once, each working through the queries SSS
+      // would send it. The search ends when all of them have finished or the
+      // time limit passes, whichever comes first; answers after that are
+      // dropped. A release reported by several indexers is kept once, under
+      // the highest-priority one.
+      searchLog.info(`Searching for ${event.title} (${event.date}) on ${indexers.length} indexer(s)`, { request: request.id, event: event.id, attempt: request.searchCount, limit: `${limitSeconds}s`, order: indexers.map((i) => `${i.name} (${i.priority})`).join(', ') });
+      let over = false;
+      const closed = () => over;
+      const attempts = indexers.map((indexer) => ({ indexer, source: indexer.name, queries: [], started: Date.now(), results: 0, error: null, found: [], done: false }));
+      const running = attempts.map(async (attempt) => {
+        const queries = queriesFor(event, attempt.indexer.type, attempt.indexer.maxQueries);
+        attempt.planned = queries.length;
+        await runQueries(attempt.indexer, queries, attempt, { closed });
+        attempt.done = true;
+        attempt.ms = Date.now() - attempt.started;
+      });
+      let timer;
+      const timeUp = new Promise((resolve) => { timer = setTimeout(resolve, overrides.searchLimitMs ?? limitSeconds * 1000); });
+      await Promise.race([Promise.all(running), timeUp]);
+      clearTimeout(timer);
+      over = true;
+      const found = new Map();
+      for (const attempt of attempts) {
+        const status = attempt.done ? `from ${attempt.queries.length} quer${attempt.queries.length === 1 ? 'y' : 'ies'}`
+          : `stopped at the ${limitSeconds}s limit after ${attempt.queries.length} of ${attempt.planned} queries`;
+        const mine = attempt.found.filter((r) => !found.has(r.identity));
+        for (const release of mine) found.set(release.identity, release);
+        attempt.found = mine;
+        searchLog.info(`${attempt.source}: ${attempt.results} result(s), ${mine.length} new, ${status}`, { ms: attempt.ms ?? Date.now() - attempt.started, error: attempt.error });
         if (attempt.error) errors.push(attempt.error);
-        attempts.push(attempt);
       }
 
       const scored = judge(event, [...found.values()], settings);
@@ -385,12 +389,14 @@ export function createService(store, overrides = {}) {
       if (!indexers.length) throw new UserError(indexerId ? 'That indexer is disabled or not set up.' : 'No indexer is configured; add one under Settings › Indexers.');
       const event = store.getEvent(request.eventId);
       searchLog.info(`Manual search for ${event.title}: "${text}"`, { indexers: indexers.map((i) => i.name).join(', ') });
+      // One query per indexer, all at once; duplicates kept under the
+      // highest-priority indexer.
+      const attempts = indexers.map((indexer) => ({ source: indexer.name, queries: [], started: Date.now(), results: 0, error: null, found: [] }));
+      await Promise.all(attempts.map((attempt, i) => runQueries(indexers[i], [text], attempt)));
       const found = new Map();
-      const attempts = [];
-      for (const indexer of indexers) {
-        const attempt = { source: indexer.name, queries: [], started: Date.now(), results: 0, error: null, found: [] };
-        await runQueries(indexer, [text], attempt, found);
-        attempts.push(attempt);
+      for (const attempt of attempts) {
+        attempt.found = attempt.found.filter((r) => !found.has(r.identity));
+        for (const release of attempt.found) found.set(release.identity, release);
       }
       const scored = judge(event, [...found.values()], settings);
       for (const candidate of scored) {

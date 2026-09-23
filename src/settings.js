@@ -28,25 +28,22 @@ export const DEFAULTS = {
   // Download clients often run in their own container and report paths as
   // they see them. Each mapping rewrites a remote prefix to the local one.
   pathMappings: [],
-  // stopAtFirstMatch: once a release matches, skip an indexer's remaining
-  // queries and the lower-priority indexers. 'no' searches everything.
-  // minSearchSeconds: a match only stops the search after this long.
-  preferences: { protocol: 'any', minSeeders: 1, stopAtFirstMatch: 'yes', minSearchSeconds: 60, searchPlan: 2 },
+  // searchSeconds: a search ends when every indexer has finished or this
+  // long has passed, whichever comes first.
+  preferences: { protocol: 'any', minSeeders: 1, searchSeconds: 60 },
 };
 
 // Fields each indexer type keeps, with defaults. Every entry also has id,
 // type, name and enabled.
-// Query budgets follow SSS: torrent indexers get the promotion's whole
-// torrent query list (about 60), stopping early once a release matches or
-// searchMinutes runs out; Easynews gets a few distinct spellings.
-// Priority works like Sonarr's: lower is searched first, and once one
-// indexer finds a match the ones after it are not asked. The defaults put the
-// fast ones first: Bitmagnet (self-hosted), Easynews, then Prowlarr (a
-// fan-out to remote trackers).
+// Query lists follow SSS: torrent indexers get the promotion's whole
+// torrent query list (about 60), Easynews a few distinct spellings. All
+// indexers search at once, within the preferences' time limit. Priority
+// works like Sonarr's: lower first. It decides which indexer is credited
+// with a release several report, and the order in the log.
 export const INDEXER_TYPES = {
-  prowlarr: { url: '', apiKey: '', priority: 30, maxQueries: 60, searchMinutes: 5, timeoutMs: 20000 },
-  bitmagnet: { url: '', priority: 10, maxQueries: 60, searchMinutes: 2, limit: 100, timeoutMs: 15000 },
-  easynews: { username: '', password: '', downloadFolder: '', priority: 20, maxQueries: 6, searchMinutes: 3, timeoutMs: 20000 },
+  prowlarr: { url: '', apiKey: '', priority: 30, maxQueries: 60, timeoutMs: 20000 },
+  bitmagnet: { url: '', priority: 10, maxQueries: 60, limit: 100, timeoutMs: 15000 },
+  easynews: { username: '', password: '', downloadFolder: '', priority: 20, maxQueries: 6, timeoutMs: 20000 },
 };
 // Earlier defaults sent only the first few queries, which missed releases
 // SSS found. Indexers saved with them move to the current defaults.
@@ -66,7 +63,7 @@ const SECRETS = [['jellyfin', 'apiKey'], ['qbittorrent', 'apiKey'], ['qbittorren
   ['metadata', 'footballDataApiKey'], ['metadata', 'apiFootballApiKey'], ['metadata', 'tmdbApiKey']];
 export const MASK = '••••••••';
 // Number settings where 0 is a real choice rather than "use the default".
-const ZERO_ALLOWED = new Set(['minSearchSeconds', 'minSeeders']);
+const ZERO_ALLOWED = new Set(['minSeeders']);
 
 export function loadSettings(store) {
   const saved = store.getSetting('config', {});
@@ -82,10 +79,6 @@ export function loadSettings(store) {
   }
   out.indexers = out.indexers.map(upgradeQueryLimit).map(normaliseIndexer).filter(Boolean);
   if (out.library.naming === OLD_DEFAULT_NAMING) out.library.naming = DEFAULTS.library.naming;
-  // The minimum search time first shipped as 30 seconds; installs that saved
-  // it move to the current default once.
-  if (Number(saved.preferences?.searchPlan) !== 2 && Number(out.preferences.minSearchSeconds) === 30) out.preferences.minSearchSeconds = DEFAULTS.preferences.minSearchSeconds;
-  out.preferences.searchPlan = 2;
   return out;
 }
 
@@ -159,8 +152,7 @@ export function saveSettings(store, incoming) {
   if (!['yes', 'no'].includes(next.library.writeMetadata)) next.library.writeMetadata = 'yes';
   if (!['debug', 'info', 'warn', 'error'].includes(next.logging.level)) next.logging.level = 'info';
   if (!['any', 'torrent', 'usenet'].includes(next.preferences.protocol)) next.preferences.protocol = 'any';
-  if (!['yes', 'no'].includes(next.preferences.stopAtFirstMatch)) next.preferences.stopAtFirstMatch = 'yes';
-  next.preferences.minSearchSeconds = Math.min(600, Math.max(0, Math.round(Number(next.preferences.minSearchSeconds) || 0)));
+  next.preferences.searchSeconds = Math.min(600, Math.max(10, Math.round(Number(next.preferences.searchSeconds) || DEFAULTS.preferences.searchSeconds)));
   store.setSetting('config', next);
   return next;
 }

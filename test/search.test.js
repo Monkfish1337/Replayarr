@@ -23,14 +23,15 @@ const LAST_SEASON = 'Manchester.United.v.Sabah.2025.09.11.720p';
 // A Prowlarr that only knows releases named the way scene groups name them:
 // no competition prefix, "v" instead of "vs". It answers a query only when
 // every word appears in the release title, as real indexers do.
-async function fakeProwlarr(t, titles = [RIGHT, LAST_SEASON]) {
+async function fakeProwlarr(t, titles = [RIGHT, LAST_SEASON], { delayMs = 0 } = {}) {
   const releases = titles.map((title, i) => ({
     title, protocol: 'torrent', size: 4e9, seeders: 25, indexer: 'Tracker',
     magnetUrl: `magnet:?xt=urn:btih:${String(i + 1).repeat(40).slice(0, 40)}`, guid: `r${i}`,
   }));
   const queries = [];
   const words = (text) => String(text).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
-  const server = createServer((req, res) => {
+  const server = createServer(async (req, res) => {
+    if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
     const query = new URL(req.url, 'http://x').searchParams.get('query');
     queries.push(query);
     const wanted = words(query);
@@ -42,10 +43,10 @@ async function fakeProwlarr(t, titles = [RIGHT, LAST_SEASON]) {
   return { base: `http://127.0.0.1:${server.address().port}`, queries };
 }
 
-async function setup(t, indexers, preferences = { minSearchSeconds: 0 }) {
+async function setup(t, indexers, { searchLimitMs } = {}) {
   const store = createStore(openDatabase(':memory:'));
-  const service = createService(store, { now: () => new Date('2026-09-11T12:00:00Z'), fetchEvents: async () => [] });
-  saveSettings(store, { indexers, preferences, qbittorrent: { url: 'http://127.0.0.1:9' } });
+  const service = createService(store, { now: () => new Date('2026-09-11T12:00:00Z'), fetchEvents: async () => [], searchLimitMs });
+  saveSettings(store, { indexers, qbittorrent: { url: 'http://127.0.0.1:9' } });
   store.upsertEvent(MAN_UTD_SABAH);
   const request = await service.requestEvent(MAN_UTD_SABAH.id);
   return { store, service, request };
@@ -62,44 +63,38 @@ test('torrent indexers get SSS\'s whole torrent list; Easynews gets distinct spe
   assert.ok(easynews.some((q) => q.startsWith('Man. United')) && easynews.some((q) => q.startsWith('Manchester United')), easynews.join(' | '));
 });
 
-test('the search works down SSS\'s list, stops at the first match, and the matcher keeps the right fixture', async (t) => {
-  const prowlarr = await fakeProwlarr(t);
-  const { store, service, request } = await setup(t, [{ id: 'p', type: 'prowlarr', name: 'Prowlarr', url: prowlarr.base, apiKey: 'k' }]);
-  const result = await service.searchRequest(request.id);
-  assert.equal(result.status, 'review');
-  const hit = prowlarr.queries.at(-1);
-  assert.ok(prowlarr.queries.length < 58, `stopped early after ${prowlarr.queries.length} queries`);
-  assert.ok(prowlarr.queries.slice(0, 9).every((q) => /League|UCL/.test(q)), 'the precise forms still go first');
-  const candidates = store.listCandidates(request.id);
-  assert.deepEqual(candidates.filter((c) => c.decision === 'matched').map((c) => c.title), [RIGHT], `found by "${hit}"`);
-  assert.deepEqual(store.listSearches(request.id)[0].queries, prowlarr.queries, 'the search record shows only the queries sent');
-});
-
-test('indexers are asked in priority order, and slower ones are skipped once there is a match', async (t) => {
+test('every indexer works through its whole list at once, and a release both report is listed under the higher priority', async (t) => {
   const fast = await fakeProwlarr(t);
-  const slow = await fakeProwlarr(t);
+  const slow = await fakeProwlarr(t, undefined, { delayMs: 5 });
   const { store, service, request } = await setup(t, [
     { id: 'tor', type: 'prowlarr', name: 'Torrent Prowlarr', url: slow.base, apiKey: 'k', priority: 40 },
     { id: 'hosted', type: 'prowlarr', name: 'Hosted', url: fast.base, apiKey: 'k', priority: 5 },
   ]);
   assert.deepEqual(byPriority(loadSettings(store).indexers).map((i) => i.id), ['hosted', 'tor']);
-  await service.searchRequest(request.id);
-  assert.ok(fast.queries.length > 0);
-  assert.equal(slow.queries.length, 0, 'the torrent Prowlarr was not needed');
-  assert.deepEqual(store.listSearches(request.id).map((s) => s.source), ['Hosted']);
+  const result = await service.searchRequest(request.id);
+  assert.equal(result.status, 'review');
+  assert.equal(fast.queries.length, 58, 'no stopping at the first match');
+  assert.equal(slow.queries.length, 58, 'the slower indexer is searched at the same time, to the end');
+  const matched = store.listCandidates(request.id).filter((c) => c.decision === 'matched');
+  assert.deepEqual(matched.map((c) => [c.title, c.source]), [[RIGHT, 'Hosted']], 'listed once, under the lower priority number');
+  assert.deepEqual(store.listSearches(request.id).map((s) => s.source).sort(), ['Hosted', 'Torrent Prowlarr']);
 });
 
-test('a match only stops the search once the minimum search time has passed', async (t) => {
+test('the search ends at the time limit, keeping what arrived and ignoring later answers', async (t) => {
   const fast = await fakeProwlarr(t);
-  const slow = await fakeProwlarr(t);
+  const slow = await fakeProwlarr(t, ['Man.Utd.v.Sabah.10.09.2026.720p.HDTV'], { delayMs: 60 });
   const { store, service, request } = await setup(t, [
     { id: 'hosted', type: 'prowlarr', name: 'Hosted', url: fast.base, apiKey: 'k', priority: 5 },
     { id: 'tor', type: 'prowlarr', name: 'Torrent Prowlarr', url: slow.base, apiKey: 'k', priority: 40 },
-  ], { minSearchSeconds: 30 });
+  ], { searchLimitMs: 400 });
+  const started = Date.now();
   await service.searchRequest(request.id);
-  assert.equal(fast.queries.length, 58, 'kept going after its match');
-  assert.equal(slow.queries.length, 58, 'the slower indexer was still asked');
-  assert.equal(store.listCandidates(request.id).filter((c) => c.decision === 'matched').length, 1, 'the same release from both is listed once');
+  assert.ok(Date.now() - started < 1500, 'did not wait for the slow indexer');
+  assert.ok(slow.queries.length < 58, `slow indexer cut off after ${slow.queries.length} queries`);
+  const seen = store.listCandidates(request.id).length;
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(store.listCandidates(request.id).length, seen, 'nothing changes after the search has ended');
+  assert.ok(store.listCandidates(request.id).some((c) => c.title === RIGHT), 'what the fast indexer found is kept');
 });
 
 test('a fresh search clears rejected releases earlier searches kept', async (t) => {
@@ -161,11 +156,9 @@ test('an event stored without its metadata asks for its promotion to be refreshe
   assert.equal(prowlarr.queries.filter((q) => /MUN/.test(q)).length, 0, 'without team codes the MUN-SAB queries cannot be built');
 });
 
-test('the minimum search time defaults to a minute, and a saved 30 from the first release moves to it once', () => {
+test('a search is limited to a minute by default', () => {
   const store = createStore(openDatabase(':memory:'));
-  assert.equal(loadSettings(store).preferences.minSearchSeconds, 60);
-  store.setSetting('config', { preferences: { minSearchSeconds: 30 } });
-  assert.equal(loadSettings(store).preferences.minSearchSeconds, 60);
-  saveSettings(store, { preferences: { minSearchSeconds: 30 } });
-  assert.equal(loadSettings(store).preferences.minSearchSeconds, 30, 'chosen after the upgrade, 30 is kept');
+  assert.equal(loadSettings(store).preferences.searchSeconds, 60);
+  saveSettings(store, { preferences: { searchSeconds: 2 } });
+  assert.equal(loadSettings(store).preferences.searchSeconds, 10, 'at least 10 seconds');
 });

@@ -106,7 +106,6 @@ async function setup() {
   const service = createService(store, { now: () => now, fetchImage, logoDir: join(dir, 'logos') });
   saveSettings(store, {
     prowlarr: { url: fake.base, apiKey: 'prowlarr-key', maxQueries: 2 },
-    preferences: { minSearchSeconds: 0 },
     qbittorrent: { url: fake.base, username: 'admin', password: 'qb-pass' },
     sabnzbd: { url: fake.base, apiKey: 'sab-key' },
     library: { root: library, mode: 'copy', minSizeMb: 1 },
@@ -141,7 +140,7 @@ test('a requested event goes from search to review to download to library', asyn
   await service.tick();
   const reviewed = store.getRequest(request.id);
   assert.equal(reviewed.status, 'review');
-  assert.equal(fake.state.prowlarrQueries.length, 1, 'stops at the first query that finds a match');
+  assert.equal(fake.state.prowlarrQueries.length, 2, 'every query up to the limit, even after a match');
 
   const candidates = store.listCandidates(request.id);
   const matched = candidates.filter((c) => c.decision === 'matched');
@@ -266,7 +265,7 @@ test('every configured indexer is searched, and Easynews results download throug
   t.after(() => { delete process.env.REPLAYARR_EASYNEWS_BASE_URL; return env.cleanup(); });
   const { service, store, fake } = env;
   const easynewsFolder = join(env.downloads, 'easynews');
-  saveSettings(store, { preferences: { stopAtFirstMatch: 'no' }, indexers: [
+  saveSettings(store, { indexers: [
     { id: 'torrents', type: 'prowlarr', name: 'Prowlarr', url: fake.base, apiKey: 'prowlarr-key', maxQueries: 1 },
     { id: 'usenet', type: 'prowlarr', name: 'Prowlarr (Usenet)', url: fake.base, apiKey: 'usenet-key', maxQueries: 1 },
     { id: 'dht', type: 'bitmagnet', name: 'Bitmagnet', url: fake.base + '/graphql', maxQueries: 2 },

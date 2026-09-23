@@ -477,14 +477,13 @@ const pages = {
               <span class="label label-outline">${esc(INDEXER_TYPES[indexer.type]?.protocol || '')}</span>
               ${indexer.enabled ? '<span class="label label-success">Enabled</span>' : '<span class="label label-danger">Disabled</span>'}
               <span class="label label-outline">Priority ${indexer.priority}</span>
-              <span class="label label-outline">${indexer.maxQueries} queries · ${indexer.searchMinutes} min</span></div></button>`).join('')}
+              <span class="label label-outline">${indexer.maxQueries} queries</span></div></button>`).join('')}
           <button type="button" class="card indexer-card add-card" data-action="add-indexer" aria-label="Add indexer">${icon('plus')}</button></div>
-        <p class="form-help" style="max-width:none">Indexers are searched in priority order, lowest number first (as in Sonarr): put the fast ones first. Each gets the same queries SSS sent it, most precise first, up to its query limit and time budget. A release found by several indexers is listed once, under the first to report it.</p></fieldset>
+        <p class="form-help" style="max-width:none">All enabled indexers search at once, each with the same queries SSS sent it, most precise first, up to its query limit. A search ends when every indexer has finished or the search time limit passes, whichever comes first. A release found by several indexers is listed once, under the one with the lowest priority number (as in Sonarr).</p></fieldset>
         <fieldset class="fieldset" style="border:0;padding:0"><legend>Release Preferences</legend>
         ${field('preferences.protocol', 'Preferred Protocol', settings.preferences.protocol, { options: [['any', 'No preference'], ['usenet', 'Prefer Usenet'], ['torrent', 'Prefer Torrent']] })}
         ${field('preferences.minSeeders', 'Minimum Seeders', settings.preferences.minSeeders, { type: 'number' })}
-        ${field('preferences.stopAtFirstMatch', 'Stop at First Match', settings.preferences.stopAtFirstMatch, { options: [['yes', 'Yes: stop once a release matches'], ['no', 'No: search every indexer fully']], help: 'Yes skips an indexer’s remaining queries, and the lower-priority indexers, once a matching release is found and the minimum search time has passed.' })}
-        ${field('preferences.minSearchSeconds', 'Minimum Search Time (seconds)', settings.preferences.minSearchSeconds, { type: 'number', help: 'Keep searching at least this long after a first match, so slower indexers can offer alternatives. 0 stops at the first match.' })}</fieldset>`;
+        ${field('preferences.searchSeconds', 'Search Time Limit (seconds)', settings.preferences.searchSeconds, { type: 'number', help: 'A search ends when every indexer has finished or this long has passed, whichever comes first. Results that arrive later are ignored. 10 to 600.' })}</fieldset>`;
     } else if (tab === 'downloadclients') {
       const mappings = settings.pathMappings.length ? settings.pathMappings : [{ remote: '', local: '' }];
       body = `<fieldset class="fieldset" style="border:0;padding:0"><legend>qBittorrent</legend>
@@ -617,7 +616,7 @@ async function interactiveSearch(eventId, { searchFirst = true } = {}) {
 
 async function searchInModal(requestId) {
   const body = $('#release-body');
-  if (body) body.innerHTML = '<div class="empty-state">Searching indexers, highest priority first. This can take a minute…</div>';
+  if (body) body.innerHTML = '<div class="empty-state">Searching all indexers. This can take up to a minute…</div>';
   await run(() => api(`/requests/${requestId}/search`, { method: 'POST' }));
   await renderReleases(requestId);
 }
@@ -752,16 +751,15 @@ function indexerModal(indexer) {
       + input('downloadFolder', 'Download Folder', indexer.downloadFolder, { placeholder: '/data/downloads/easynews', help: 'Where Replayarr saves Easynews files before importing. Put it on the same drive as the library so imports can be hardlinks.' })
       + input('timeoutMs', 'Search Timeout (ms)', indexer.timeoutMs ?? 20000, { type: 'number' }),
   }[indexer.type];
-  const defaults = { prowlarr: [30, 60, 5], bitmagnet: [10, 60, 2], easynews: [20, 6, 3] }[indexer.type];
+  const defaults = { prowlarr: [30, 60], bitmagnet: [10, 60], easynews: [20, 6] }[indexer.type];
   openModal(`<div class="modal-header"><span>${isNew ? 'Add' : 'Edit'} Indexer – ${esc(type.label)}</span><button class="icon-button" data-action="close-modal" aria-label="Close">${icon('x')}</button></div>
     <form id="indexer-form" class="modal-body" data-id="${esc(indexer.id || '')}" data-type="${esc(indexer.type)}">
       <p class="form-help" style="max-width:none;margin-top:0">${esc(type.about)}</p>
       ${input('name', 'Name', indexer.name || type.label)}
       <div class="form-group"><span></span><label class="form-inline"><input type="checkbox" name="enabled" ${indexer.enabled === false ? '' : 'checked'}> Enable</label></div>
       ${fields}
-      ${input('priority', 'Priority', indexer.priority ?? defaults[0], { type: 'number', help: '1 to 50; lower is searched first. Suggested: Bitmagnet 10, Easynews 20, a Usenet Prowlarr 30, a torrent Prowlarr 40.' })}
-      ${input('maxQueries', 'Queries Per Search', indexer.maxQueries ?? defaults[1], { type: 'number', help: 'The most of the promotion’s search titles to send, most precise first. Searching stops early once a release matches.' })}
-      ${input('searchMinutes', 'Time Budget (minutes)', indexer.searchMinutes ?? defaults[2], { type: 'number', help: 'Stop sending queries to this indexer after this long.' })}
+      ${input('priority', 'Priority', indexer.priority ?? defaults[0], { type: 'number', help: '1 to 50. When several indexers report the same release it is listed under the lowest number.' })}
+      ${input('maxQueries', 'Queries Per Search', indexer.maxQueries ?? defaults[1], { type: 'number', help: 'The most of the promotion’s search titles to send, most precise first.' })}
     </form>
     <div class="modal-footer">${isNew ? '' : '<button class="button button-danger" data-action="delete-indexer" style="margin-right:auto">Delete</button>'}
       <span class="test-result" data-result="indexer" style="align-self:center"></span>

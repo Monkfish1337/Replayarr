@@ -99,8 +99,8 @@ async function serveLogo(response, name) {
   }
 }
 
-// A search that finds nothing can run each indexer to its time budget, which
-// is longer than Node's default five-minute request limit.
+// A search runs for up to its time limit (at most ten minutes), which can be
+// longer than Node's default five-minute request limit.
 createServer({ requestTimeout: 30 * 60 * 1000 }, async (request, response) => {
   response.setHeader('x-content-type-options', 'nosniff');
   response.setHeader('x-frame-options', 'DENY');
