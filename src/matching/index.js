@@ -138,6 +138,19 @@ export function evaluate(title, event) {
   return { ok: !!verdict.ok, stage: 'relevance', reason: verdict.ok ? (verdict.reason || 'matched') : (verdict.reason || 'relevance') };
 }
 
+// Whether a release title shares any real word (four letters or more) with
+// the event's title, aliases or team names. Short codes like "MUN SAB" make
+// Bitmagnet return unrelated torrents; a rejected release that names nothing
+// of the event is noise, while one that does ("wrong-date", a team spelled
+// differently) is worth showing for Grab anyway.
+const fold = (text) => String(text || '').normalize('NFKD').replace(/[̀-ͯ]/g, '').toLowerCase();
+export function mentionsEvent(title, event) {
+  const teams = event.payload?.teamNames || {};
+  const words = new Set([event.title, ...(event.aliases || []), ...(teams.home || []), ...(teams.away || [])]
+    .flatMap((text) => fold(text).match(/[a-z0-9]{4,}/g) || []));
+  return (fold(title).match(/[a-z0-9]{4,}/g) || []).some((word) => words.has(word));
+}
+
 export function releaseDates(title) {
   return promotions.extractReleaseDates(String(title || ''));
 }

@@ -5,7 +5,7 @@ import { openDatabase } from '../src/db.js';
 import { createStore } from '../src/store.js';
 import { byPriority, createService } from '../src/service.js';
 import { loadSettings, saveSettings } from '../src/settings.js';
-import { queriesFor } from '../src/matching/index.js';
+import { mentionsEvent, queriesFor } from '../src/matching/index.js';
 
 // The fixture as UEFA's feed describes it (see metadata refresh).
 const MAN_UTD_SABAH = {
@@ -161,4 +161,15 @@ test('a search is limited to a minute by default', () => {
   assert.equal(loadSettings(store).preferences.searchSeconds, 60);
   saveSettings(store, { preferences: { searchSeconds: 2 } });
   assert.equal(loadSettings(store).preferences.searchSeconds, 10, 'at least 10 seconds');
+});
+
+test('rejected releases that name nothing of the event are not kept; near misses are', async (t) => {
+  // "MUN SAB" on Bitmagnet also returns unrelated torrents.
+  const german = 'Sabah.Man.Utd.2026.09.10.GERMAN.1080p';
+  const bitmagnetLike = await fakeProwlarr(t, [RIGHT, german, '임영웅 전집 MUN SAB', 'Running Man MUN SAB', 'Downloads MUN SAB']);
+  const { store, service, request } = await setup(t, [{ id: 'p', type: 'prowlarr', name: 'Prowlarr', url: bitmagnetLike.base, apiKey: 'k' }]);
+  await service.searchRequest(request.id);
+  const kept = store.listCandidates(request.id).map((c) => [c.title, c.decision]);
+  assert.deepEqual(Object.fromEntries(kept), { [RIGHT]: 'matched', [german]: 'rejected' });
+  assert.equal(mentionsEvent('Sabah.Kota.Kinabalu.vs.Man.United.1080p', MAN_UTD_SABAH), true, 'a differently spelled fixture still counts');
 });

@@ -7,7 +7,7 @@ import * as jellyfinAdapter from './adapters/jellyfin.js';
 import { mkdir, rename as renameFile, stat } from 'node:fs/promises';
 import { dirname, extname } from 'node:path';
 import { episodeNumber, moveSidecars, pruneEmptyFolders, writeMediaFiles } from './mediaFiles.js';
-import { configurePromotions, evaluate, promotionFor, promotions, queriesFor } from './matching/index.js';
+import { configurePromotions, evaluate, mentionsEvent, promotionFor, promotions, queriesFor } from './matching/index.js';
 import { destinationFor, ImportError, importDownload } from './importer.js';
 import { scoreCandidate } from './scoring.js';
 import { indexerReady, loadSettings, mapRemotePath } from './settings.js';
@@ -302,7 +302,11 @@ export function createService(store, overrides = {}) {
         });
       }
       const matched = scored.filter((c) => c.decision === 'matched');
-      const rejected = scored.filter((c) => c.decision === 'rejected').slice(0, MAX_REJECTED_KEPT);
+      // Rejected releases are kept to explain near misses; ones that name
+      // nothing of the event are just noise from broad queries.
+      const allRejected = scored.filter((c) => c.decision === 'rejected');
+      const rejected = allRejected.filter((c) => mentionsEvent(c.title, event)).slice(0, MAX_REJECTED_KEPT);
+      if (allRejected.length > rejected.length) searchLog.info(`${event.title}: not keeping ${allRejected.length - rejected.length} rejected release(s) unrelated to the event`);
       searchLog.info(`${event.title}: ${matched.length} matched, ${scored.length - matched.length} rejected of ${found.size} unique result(s)`);
       store.clearRejected(request.id);
       store.saveCandidates(request.id, [...matched, ...rejected]);
