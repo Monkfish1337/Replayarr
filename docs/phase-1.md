@@ -60,12 +60,9 @@ All routes are under `/api`. Writes must be `application/json`, which a cross-si
 ## Known limits
 
 - One file per event. Multi-part releases (prelims and main card as separate files) import only the largest part.
-- No automatic grab, quality profiles or upgrades.
 - TheSportsDB refreshes are slow (rate limited, walked round by round); keep start dates recent.
 - SQLite cannot open databases on Windows paths longer than 260 characters; keep `REPLAYARR_DB` short.
 
 ## Next
 
-1. Automatic grab above a score threshold per promotion, still logging the evidence.
-2. Quality profiles and upgrade monitoring.
-3. Media-server notifications (Plex/Jellyfin library refresh).
+Done in [Phase 2](phase-2.md): quality profiles, automatic grabs above a score threshold, and upgrades. Jellyfin rescans landed in Phase 1.

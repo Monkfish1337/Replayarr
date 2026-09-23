@@ -68,7 +68,7 @@ async function place(source, target, mode) {
 
 // Import one completed download. Idempotent: re-running after a crash finds
 // the file already in place and reports it rather than failing.
-export async function importDownload({ settings, localPath, event, promotionName, candidate, verifyName, season, episode }) {
+export async function importDownload({ settings, localPath, event, promotionName, candidate, verifyName, season, episode, replacing = null }) {
   const video = await pickVideo(localPath);
   const minBytes = (Number(settings.library.minSizeMb) || 0) * 1024 * 1024;
   if (video.size < minBytes) {
@@ -94,6 +94,15 @@ export async function importDownload({ settings, localPath, event, promotionName
   const existing = await stat(target).catch(() => null);
   if (existing) {
     if (existing.size === video.size) return { path: target, size: video.size, method: 'existing' };
+    // An upgrade whose new name is the old one (the naming pattern has no
+    // {quality}): place it beside the old file, then swap it in.
+    if (replacing && resolve(replacing) === resolve(target)) {
+      const incoming = `${target}.replayarr-upgrade`;
+      await unlink(incoming).catch(() => {});
+      const method = await place(video.path, incoming, settings.library.mode);
+      await rename(incoming, target);
+      return { path: target, size: video.size, method };
+    }
     throw new ImportError(`A different file already exists at ${target}`);
   }
   const method = await place(video.path, target, settings.library.mode);

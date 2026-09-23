@@ -102,7 +102,10 @@ export function createApi(service, { testers, version = '', revision = '', uiBui
       return { ...requestView(store, request), candidates: store.listCandidates(request.id), searches: store.listSearches(request.id) };
     }],
     ['DELETE', /^\/api\/requests\/(\d+)$/, ([, id]) => { service.remove(id); }],
-    ['POST', /^\/api\/requests\/(\d+)\/search$/, async ([, id]) => requestView(store, await service.searchRequest(id))],
+    // `interactive`: list what is found without grabbing (Interactive Search).
+    ['POST', /^\/api\/requests\/(\d+)\/search$/, async ([, id], body) => requestView(store, await service.searchRequest(id, { interactive: body.interactive === true }))],
+    // Wanted › Cutoff Unmet: in the library below the profile's cutoff.
+    ['GET', /^\/api\/wanted\/cutoff$/, () => service.cutoffUnmet().map((r) => requestView(store, r))],
     ['POST', /^\/api\/requests\/(\d+)\/approve$/, async ([, id], body) => requestView(store, await service.approve(id, body.candidateId, { override: body.override === true }))],
     ['POST', /^\/api\/requests\/(\d+)\/manual-search$/, ([, id], body) => service.manualSearch(id, { query: body.query, indexerId: body.indexerId || null })],
     ['GET', /^\/api\/indexers$/, () => loadSettings(store).indexers.map((i) => ({ id: i.id, name: i.name, type: i.type, enabled: i.enabled }))],

@@ -167,6 +167,13 @@ export async function writeMediaFiles({ videoPath, libraryRoot, event, promotion
 }
 
 // Move an event's .nfo and thumbnail along with its video.
+// Delete a replaced video and its .nfo and thumbnail (after an upgrade).
+export async function removeWithSidecars(videoPath) {
+  const base = sidecarBase(videoPath);
+  const files = [videoPath, `${base}.nfo`, ...['jpg', 'png', 'webp', 'gif'].map((ext) => `${base}-thumb.${ext}`)];
+  for (const file of files) await unlink(file).catch((error) => { if (error.code !== 'ENOENT') throw error; });
+}
+
 export async function moveSidecars(fromVideo, toVideo) {
   const from = sidecarBase(fromVideo);
   const to = sidecarBase(toVideo);

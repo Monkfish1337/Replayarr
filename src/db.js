@@ -129,6 +129,8 @@ const MIGRATIONS = [
   // media-server metadata stay stable.
   `ALTER TABLE library ADD COLUMN season INTEGER;
    ALTER TABLE library ADD COLUMN episode INTEGER;`,
+  // Phase 2: the quality profile a promotion uses (null: the first profile).
+  'ALTER TABLE promotion_meta ADD COLUMN profile_id TEXT;',
 ];
 
 export function openDatabase(file) {

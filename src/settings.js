@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { DEFAULT_PROFILE, normaliseProfile } from './profiles.js';
 
 export const DEFAULTS = {
   // Schedule metadata. TheSportsDB's free key is public; the others are
@@ -28,6 +29,8 @@ export const DEFAULTS = {
   // Download clients often run in their own container and report paths as
   // they see them. Each mapping rewrites a remote prefix to the local one.
   pathMappings: [],
+  // Quality profiles (see profiles.js); promotions pick one, else the first.
+  profiles: [DEFAULT_PROFILE],
   // searchSeconds: a search ends when every indexer has finished or this
   // long has passed, whichever comes first.
   preferences: { protocol: 'any', minSeeders: 1, searchSeconds: 60 },
@@ -78,6 +81,7 @@ export function loadSettings(store) {
     out.indexers = [normaliseIndexer({ id: 'prowlarr', type: 'prowlarr', ...saved.prowlarr })];
   }
   out.indexers = out.indexers.map(upgradeQueryLimit).map(normaliseIndexer).filter(Boolean);
+  out.profiles = cleanProfiles(out.profiles);
   if (out.library.naming === OLD_DEFAULT_NAMING) out.library.naming = DEFAULTS.library.naming;
   return out;
 }
@@ -119,6 +123,10 @@ export function saveSettings(store, incoming) {
   const next = {};
   for (const [section, defaults] of Object.entries(DEFAULTS)) {
     const value = incoming?.[section];
+    if (section === 'profiles') {
+      next.profiles = Array.isArray(value) ? cleanProfiles(value) : current.profiles;
+      continue;
+    }
     if (section === 'indexers') {
       next.indexers = Array.isArray(value) ? mergeIndexers(current.indexers, value) : current.indexers;
       continue;
@@ -159,6 +167,13 @@ export function saveSettings(store, incoming) {
 
 // The incoming list is the new list. A masked secret keeps the stored value
 // of the indexer with the same id.
+// Unique ids, and never an empty list: something must decide what to grab.
+function cleanProfiles(list) {
+  const seen = new Set();
+  const profiles = (Array.isArray(list) ? list : []).map(normaliseProfile).filter((p) => p && !seen.has(p.id) && seen.add(p.id));
+  return profiles.length ? profiles : [{ ...DEFAULT_PROFILE, qualities: [...DEFAULT_PROFILE.qualities] }];
+}
+
 function mergeIndexers(current, incoming) {
   return incoming.map((item) => {
     const before = current.find((i) => i.id === item?.id);

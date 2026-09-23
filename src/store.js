@@ -9,10 +9,12 @@ const TRANSITIONS = {
   wanted: ['searching'],
   searching: ['review', 'wanted', 'failed'],
   review: ['downloading', 'wanted'],
-  downloading: ['importing', 'failed', 'wanted'],
+  // An upgrade that fails goes back to ready: the library file is still there.
+  downloading: ['importing', 'failed', 'wanted', 'ready'],
   importing: ['ready', 'failed'],
   failed: ['wanted', 'importing', 'review'],
-  ready: [],
+  // Upgrades: a ready event can take a better release.
+  ready: ['downloading'],
 };
 
 export class TransitionError extends Error {
@@ -153,18 +155,19 @@ export function createStore(db) {
       return Object.fromEntries(q('SELECT * FROM promotion_meta').all().map((row) => [row.promotion_id, {
         followed: !!row.followed, providerId: row.provider_id, startDate: row.start_date, logoUrl: row.logo_url,
         refreshedAt: row.refreshed_at, refreshCount: row.refresh_count, refreshError: row.refresh_error,
+        profileId: row.profile_id,
       }]));
     },
     updatePromotionMeta(promotionId, patch) {
       const current = store.listPromotionMeta()[promotionId] || {};
-      const next = { followed: false, providerId: null, startDate: null, logoUrl: null, refreshedAt: null, refreshCount: null, refreshError: null, ...current, ...patch };
-      q(`INSERT INTO promotion_meta (promotion_id, followed, provider_id, start_date, logo_url, refreshed_at, refresh_count, refresh_error)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      const next = { followed: false, providerId: null, startDate: null, logoUrl: null, refreshedAt: null, refreshCount: null, refreshError: null, profileId: null, ...current, ...patch };
+      q(`INSERT INTO promotion_meta (promotion_id, followed, provider_id, start_date, logo_url, refreshed_at, refresh_count, refresh_error, profile_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (promotion_id) DO UPDATE SET followed = excluded.followed, provider_id = excluded.provider_id,
            start_date = excluded.start_date, logo_url = excluded.logo_url, refreshed_at = excluded.refreshed_at,
-           refresh_count = excluded.refresh_count, refresh_error = excluded.refresh_error`)
+           refresh_count = excluded.refresh_count, refresh_error = excluded.refresh_error, profile_id = excluded.profile_id`)
         .run(promotionId, next.followed ? 1 : 0, next.providerId || null, next.startDate || null, next.logoUrl || null,
-          next.refreshedAt || null, next.refreshCount ?? null, next.refreshError || null);
+          next.refreshedAt || null, next.refreshCount ?? null, next.refreshError || null, next.profileId || null);
       return store.listPromotionMeta()[promotionId];
     },
 
@@ -182,11 +185,23 @@ export function createStore(db) {
     getRequest(id) {
       return requestRow(q('SELECT * FROM requests WHERE id = ?').get(id));
     },
+    requestForEvent(eventId) {
+      return requestRow(q('SELECT * FROM requests WHERE event_id = ?').get(eventId));
+    },
     listRequests({ status } = {}) {
       const rows = status
         ? q('SELECT * FROM requests WHERE status = ? ORDER BY updated_at DESC').all(status)
         : q('SELECT * FROM requests ORDER BY updated_at DESC').all();
       return rows.map(requestRow);
+    },
+    // Imported events still below their profile's cutoff.
+    dueForUpgrade(at = now()) {
+      return q(`SELECT * FROM requests WHERE status = 'ready' AND next_search_at IS NOT NULL AND next_search_at <= ?
+                ORDER BY next_search_at`).all(at).map(requestRow);
+    },
+    // A release whose download failed is not offered again.
+    rejectCandidate(id, reason) {
+      q(`UPDATE candidates SET decision = 'rejected', reason = ? WHERE id = ?`).run(reason, id);
     },
     dueForSearch(at = now()) {
       return q(`SELECT * FROM requests WHERE status = 'wanted' AND (next_search_at IS NULL OR next_search_at <= ?)

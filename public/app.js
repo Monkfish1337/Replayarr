@@ -12,6 +12,7 @@ const today = () => new Date().toISOString().slice(0, 10);
 
 let promotionsCache = [];
 let indexersCache = [];
+let profilesCache = [];
 let providersCache = [];
 
 // Sonarr-style indexer types: what each needs and how it is described.
@@ -135,11 +136,11 @@ const NAV = [
   { key: 'promotions', label: 'Promotions', icon: 'promotions', href: '#/promotions', children: [['Add New', '#/add'], ['Library', '#/library']] },
   { key: 'calendar', label: 'Calendar', icon: 'calendar', href: '#/calendar' },
   { key: 'activity', label: 'Activity', icon: 'activity', href: '#/activity/queue', count: 'queue', children: [['Queue', '#/activity/queue'], ['History', '#/activity/history']] },
-  { key: 'wanted', label: 'Wanted', icon: 'wanted', href: '#/wanted/missing', count: 'review', children: [['Missing', '#/wanted/missing'], ['Needs Review', '#/wanted/review']] },
+  { key: 'wanted', label: 'Wanted', icon: 'wanted', href: '#/wanted/missing', count: 'review', children: [['Missing', '#/wanted/missing'], ['Needs Review', '#/wanted/review'], ['Cutoff Unmet', '#/wanted/cutoff']] },
   { key: 'metadata', label: 'Metadata', icon: 'metadata', href: '#/metadata/promotions', children: [
     ['Promotions', '#/metadata/promotions'], ['Providers', '#/metadata/providers'], ['Matching Rules', '#/metadata/rules'], ['Settings', '#/metadata/settings']] },
   { key: 'settings', label: 'Settings', icon: 'settings', href: '#/settings/mediamanagement', children: [
-    ['Media Management', '#/settings/mediamanagement'], ['Indexers', '#/settings/indexers'], ['Download Clients', '#/settings/downloadclients'],
+    ['Media Management', '#/settings/mediamanagement'], ['Profiles', '#/settings/profiles'], ['Indexers', '#/settings/indexers'], ['Download Clients', '#/settings/downloadclients'],
     ['Connect', '#/settings/connect'], ['General', '#/settings/general']] },
   { key: 'system', label: 'System', icon: 'system', href: '#/system/status', children: [['Status', '#/system/status'], ['Tasks', '#/system/tasks'], ['Events', '#/system/events'], ['Logs', '#/system/logs']] },
 ];
@@ -199,9 +200,9 @@ function eventRows(events, { showPromotion = false } = {}) {
       <td class="nowrap hide-sm">${formatDate(event.date)}${event.time ? ` <span class="muted">${esc(event.time)} UTC</span>` : ''}</td>
       <td class="narrow">${statusLabel(status)}</td>
       <td class="actions">
-        <button class="icon-button" data-action="auto-search" title="Automatic search" aria-label="Automatic search" ${event.library || ['downloading', 'importing'].includes(event.request?.status) ? 'disabled' : ''}>${icon('search')}</button>
-        <button class="icon-button" data-action="interactive-search" title="Interactive search" aria-label="Interactive search" ${event.library ? 'disabled' : ''}>${icon('user')}</button>
-        <button class="icon-button" data-action="manual-search" title="Manual search" aria-label="Manual search" ${event.library ? 'disabled' : ''}>${icon('keyboard')}</button>
+        <button class="icon-button" data-action="auto-search" title="${event.library ? 'Search for an upgrade' : 'Automatic search'}" aria-label="Automatic search" ${['downloading', 'importing'].includes(event.request?.status) ? 'disabled' : ''}>${icon('search')}</button>
+        <button class="icon-button" data-action="interactive-search" title="Interactive search" aria-label="Interactive search">${icon('user')}</button>
+        <button class="icon-button" data-action="manual-search" title="Manual search" aria-label="Manual search">${icon('keyboard')}</button>
       </td>
     </tr>`;
   }).join('');
@@ -329,19 +330,21 @@ const pages = {
         </tbody></table></div>`;
     }
     setToolbar(toolbarButton('sync-events', 'refresh', 'Refresh Followed'), toolbarButton('go-add', 'plus', 'Add Promotion'));
-    const [list, providers] = await Promise.all([api('/promotions'), api('/metadata/providers')]);
+    const [list, providers, { settings: current }] = await Promise.all([api('/promotions'), api('/metadata/providers'), api('/settings')]);
     promotionsCache = list;
     providersCache = providers;
+    const profiles = current.profiles;
     const banner = await refreshBanner();
     const sorted = list.slice().sort((a, b) => (b.followed - a.followed) || a.name.localeCompare(b.name));
     return `<h1 class="page-title">Promotions</h1>${banner}
-      <div class="table-panel"><table class="table"><thead><tr><th>Promotion</th><th>Follow</th><th>Provider</th><th class="hide-sm">Start Date</th><th class="hide-sm">Events</th><th>Last Refresh</th><th></th></tr></thead><tbody>
+      <div class="table-panel"><table class="table"><thead><tr><th>Promotion</th><th>Follow</th><th>Provider</th><th class="hide-sm">Profile</th><th class="hide-sm">Start Date</th><th class="hide-sm">Events</th><th>Last Refresh</th><th></th></tr></thead><tbody>
       ${sorted.map((p) => `<tr data-id="${esc(p.id)}">
         <td><div class="promo-cell"><button class="logo-thumb ${logoOf(p) ? '' : 'empty'}" data-action="logo-picker" data-id="${esc(p.id)}" title="Choose logo" aria-label="Choose logo for ${esc(p.name)}" ${logoOf(p) ? `style="background-image:url('${esc(logoOf(p))}')"` : ''}>${logoOf(p) ? '' : icon('image')}</button>
           <div><a href="#/promotion/${esc(p.id)}">${esc(p.name)}</a><div class="evidence">${esc(p.id)}${p.custom ? ' · custom' : ''}</div></div></div></td>
         <td><label class="switch" title="${p.followed ? 'Following' : 'Not followed'}"><input type="checkbox" data-change="follow" ${p.followed ? 'checked' : ''} aria-label="Follow ${esc(p.name)}"><span></span></label></td>
         <td><select class="inline-input" data-change="provider" aria-label="Provider for ${esc(p.name)}">${providers.map((pr) => `<option value="${esc(pr.id)}" ${(p.providerId ? p.providerId === pr.id : pr.usedBy.includes(p.name)) ? 'selected' : ''}>${esc(pr.name)}</option>`).join('')}
           ${!p.providerId && !providers.some((pr) => pr.usedBy.includes(p.name)) ? `<option value="" selected>${esc(p.providerName)}</option>` : ''}</select></td>
+        <td class="hide-sm"><select class="inline-input" data-change="profile" aria-label="Quality profile for ${esc(p.name)}">${profiles.map((pr, i) => `<option value="${esc(pr.id)}" ${(p.profileId ? p.profileId === pr.id : i === 0) ? 'selected' : ''}>${esc(pr.name)}</option>`).join('')}</select></td>
         <td class="hide-sm"><input class="inline-input" type="date" data-change="start" value="${esc(p.startDate || '')}" aria-label="Start date for ${esc(p.name)}"></td>
         <td class="hide-sm">${p.stats.events}</td>
         <td class="nowrap">${p.refreshState === 'queued' ? '<span class="label label-default">Queued</span>' : p.refreshing ? '<span class="label label-info">Refreshing…</span>'
@@ -419,12 +422,27 @@ const pages = {
 
   async wanted([tab = 'missing']) {
     promotionsCache = await api('/promotions');
+    if (tab === 'cutoff') {
+      setToolbar(toolbarButton('reload', 'refresh', 'Refresh'));
+      const below = await api('/wanted/cutoff');
+      if (!below.length) return `<div class="empty-state"><h2>Nothing below cutoff</h2><p>Every event in the library meets its quality profile’s cutoff, or its profile does not upgrade.</p></div>`;
+      return `<p class="muted">In the library below their profile’s cutoff. Replayarr looks for a better release every 6 hours until a week after the event.</p>
+        <div class="table-panel"><table class="table"><thead><tr><th>Promotion</th><th>Event</th><th class="hide-sm">Date</th><th>Quality</th><th>Cutoff</th><th class="hide-sm">Next Search</th><th></th></tr></thead><tbody>
+        ${below.map((r) => `<tr data-event="${esc(r.eventId)}" data-request="${r.id}"><td class="nowrap">${esc(promotionOf(r.event)?.name || '')}</td>
+          <td class="title-cell">${esc(r.event?.title)}${r.error ? `<div class="evidence">${esc(r.error)}</div>` : ''}</td><td class="nowrap hide-sm">${formatDate(r.event?.date)}</td>
+          <td><span class="label label-default">${esc(r.library?.quality || 'Unknown')}</span></td>
+          <td><span class="label label-outline">${esc(r.profile.cutoff)}</span> <span class="muted">${esc(r.profile.name)}</span></td>
+          <td class="nowrap hide-sm muted">${r.nextSearchAt ? relative(r.nextSearchAt) : 'Stopped'}</td>
+          <td class="actions"><button class="icon-button" data-action="auto-search" title="Search for an upgrade" aria-label="Search for an upgrade">${icon('search')}</button>
+            <button class="icon-button" data-action="interactive-search" title="Interactive search" aria-label="Interactive search">${icon('user')}</button></td></tr>`).join('')}
+        </tbody></table></div>`;
+    }
     const requests = await api('/requests');
     if (tab === 'review') {
       setToolbar(toolbarButton('reload', 'refresh', 'Refresh'));
       const review = requests.filter((r) => r.status === 'review');
       if (!review.length) return `<div class="empty-state"><h2>Nothing to review</h2><p>Events with matching releases wait here until you pick one.</p></div>`;
-      return `<div class="alert">${icon('warning')}<div>Replayarr does not grab automatically in Phase 1. Open an event to compare the matching releases and choose one.</div></div>
+      return `<div class="alert">${icon('warning')}<div>These have matching releases that were not grabbed automatically: their quality profile has auto-grab off, or no release reached its minimum score. Open an event to compare the releases and choose one.</div></div>
         <div class="table-panel"><table class="table"><thead><tr><th>Promotion</th><th>Event</th><th class="hide-sm">Date</th><th>Matches</th><th></th></tr></thead><tbody>
         ${review.map((r) => `<tr data-event="${esc(r.eventId)}" data-request="${r.id}"><td class="nowrap">${esc(promotionOf(r.event)?.name || '')}</td><td class="title-cell">${esc(r.event?.title)}</td>
           <td class="nowrap hide-sm">${formatDate(r.event?.date)}</td><td><span class="label label-warning">${r.matchedCount}</span></td>
@@ -468,6 +486,17 @@ const pages = {
         ${field('library.naming', 'Event Format', settings.library.naming, { help: 'Tokens: {promotion} {title} {date} {year} {season} {episode} {quality} {release}. Use / for folders. Keep S{season}E{episode} in the name so Jellyfin can number events; {episode} is the date (MMDD) plus the order that day. After changing it, use Library › Rename Files.' })}
         ${field('library.writeMetadata', 'Media Server Metadata', settings.library.writeMetadata, { options: [['yes', 'Write .nfo files and artwork (Jellyfin, Kodi)'], ['no', 'Do not write']], help: 'Saves each event’s details and TheSportsDB artwork next to the file, plus the promotion’s poster (your chosen logo). Set the Jellyfin library to use NFO and turn off its online metadata downloaders.' })}
         <div class="form-group"><span class="form-label">Example</span><div class="form-input"><code id="naming-example"></code></div></div></fieldset>`;
+    } else if (tab === 'profiles') {
+      profilesCache = settings.profiles;
+      setToolbar();
+      body = `<fieldset class="fieldset" style="border:0;padding:0"><legend>Quality Profiles</legend>
+        <div class="cards">${settings.profiles.map((p, i) => `<button type="button" class="card indexer-card" data-action="edit-profile" data-id="${esc(p.id)}">
+            <h3>${esc(p.name)}${i === 0 ? ' <span class="muted">(default)</span>' : ''}</h3>
+            <div class="labels">${p.qualities.map((q) => `<span class="label ${q === p.cutoff ? 'label-success' : 'label-default'}">${esc(q === 'unknown' ? 'Unknown' : q)}</span>`).join('')}</div>
+            <div class="labels"><span class="label label-outline">${p.autoGrab === 'yes' ? `Auto-grab at score ${p.minScore}+` : 'Manual review'}</span>
+              <span class="label label-outline">${p.upgrades === 'yes' ? `Upgrade to ${esc(p.cutoff)}` : 'No upgrades'}</span></div></button>`).join('')}
+          <button type="button" class="card indexer-card add-card" data-action="add-profile" aria-label="Add profile">${icon('plus')}</button></div>
+        <p class="form-help" style="max-width:none">Each promotion uses a profile (Metadata › Promotions), or the first one. A profile decides which qualities are accepted, whether an automatic search grabs the best match on its own (when its score reaches the minimum), and whether an event in the library below the cutoff keeps being searched for something better. Interactive search never grabs.</p></fieldset>`;
     } else if (tab === 'indexers') {
       indexersCache = settings.indexers;
       body = `<fieldset class="fieldset" style="border:0;padding:0"><legend>Indexers</legend>
@@ -617,7 +646,7 @@ async function interactiveSearch(eventId, { searchFirst = true } = {}) {
 async function searchInModal(requestId) {
   const body = $('#release-body');
   if (body) body.innerHTML = '<div class="empty-state">Searching all indexers. This can take up to a minute…</div>';
-  await run(() => api(`/requests/${requestId}/search`, { method: 'POST' }));
+  await run(() => api(`/requests/${requestId}/search`, { method: 'POST', body: { interactive: true } }));
   await renderReleases(requestId);
 }
 
@@ -766,6 +795,35 @@ function indexerModal(indexer) {
       <button class="button" data-action="test-indexer">${icon('check')} Test</button>
       <button class="button" data-action="close-modal">Cancel</button>
       <button class="button button-primary" type="submit" form="indexer-form">Save</button></div>`, { small: true });
+}
+
+const QUALITY_ORDER = ['2160p', '1080p', '720p', '576p', '480p', 'unknown'];
+
+function profileModal(profile) {
+  const isNew = !profile;
+  const p = profile || { name: '', qualities: ['1080p', '720p', 'unknown'], cutoff: '1080p', upgrades: 'yes', autoGrab: 'yes', minScore: 60 };
+  const label = (q) => (q === 'unknown' ? 'Unknown (not stated)' : q);
+  const select = (name, text, value, options, help = '') => `<div class="form-group"><label class="form-label" for="pf-${name}">${text}</label><div class="form-input">
+    <select id="pf-${name}" name="${name}">${options.map(([v, l]) => `<option value="${esc(v)}" ${String(v) === String(value) ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>${help ? `<div class="form-help">${help}</div>` : ''}</div></div>`;
+  openModal(`<div class="modal-header"><span>${isNew ? 'Add' : 'Edit'} Quality Profile</span><button class="icon-button" data-action="close-modal" aria-label="Close">${icon('x')}</button></div>
+    <form id="profile-form" class="modal-body" data-id="${esc(p.id || '')}">
+      <div class="form-group"><label class="form-label" for="pf-name">Name</label><div class="form-input"><input id="pf-name" name="name" value="${esc(p.name)}" required placeholder="HD-1080p"></div></div>
+      <div class="form-group"><span class="form-label">Qualities</span><div class="form-input">
+        ${QUALITY_ORDER.map((q) => `<label class="form-inline"><input type="checkbox" name="qualities" value="${q}" ${p.qualities.includes(q) ? 'checked' : ''}> ${esc(label(q))}</label>`).join('')}
+        <div class="form-help">Releases in other qualities are rejected with the reason.</div></div></div>
+      ${select('cutoff', 'Upgrade Until', p.cutoff, QUALITY_ORDER.map((q) => [q, label(q)]), 'Once the library copy is this good, stop looking for better.')}
+      ${select('upgrades', 'Upgrades', p.upgrades, [['yes', 'Look for better releases up to the cutoff'], ['no', 'Keep the first release']])}
+      ${select('autoGrab', 'Automatic Grab', p.autoGrab, [['yes', 'Grab the best match automatically'], ['no', 'Wait for me to choose (Wanted › Needs Review)']])}
+      <div class="form-group"><label class="form-label" for="pf-minScore">Minimum Score</label><div class="form-input"><input id="pf-minScore" name="minScore" type="number" min="1" max="100" value="${esc(p.minScore)}"><div class="form-help">An automatic grab needs at least this score (shown in Interactive Search). Lower matches wait for review.</div></div></div>
+    </form>
+    <div class="modal-footer">${isNew || profilesCache.length < 2 ? '' : '<button class="button button-danger" data-action="delete-profile" style="margin-right:auto">Delete</button>'}
+      <button class="button" data-action="close-modal">Cancel</button>
+      <button class="button button-primary" type="submit" form="profile-form">Save</button></div>`, { small: true });
+}
+
+async function saveProfiles(profiles, done) {
+  const saved = await run(() => api('/settings', { method: 'PUT', body: { profiles } }), done);
+  if (saved) { closeModal(); render({ quiet: true }); }
 }
 
 function indexerTypeModal() {
@@ -1107,7 +1165,13 @@ const actions = {
     const request = await run(() => ensureRequest(eventId));
     if (request) {
       const result = await run(() => api(`/requests/${request.id}/search`, { method: 'POST' }));
-      if (result) message(result.status === 'review' ? `${result.matchedCount} matching release${result.matchedCount === 1 ? '' : 's'} found` : (result.error || 'No matching release yet'), result.status === 'review' ? 'success' : 'info');
+      if (result) {
+        const text = result.status === 'downloading' ? `Grabbed ${result.candidate?.title || 'a release'}`
+          : result.status === 'review' ? `${result.matchedCount} matching release${result.matchedCount === 1 ? '' : 's'} found; none grabbed automatically`
+          : result.status === 'ready' ? (result.error || 'Nothing better than the library copy')
+          : (result.error || 'No matching release yet');
+        message(text, ['downloading', 'review'].includes(result.status) ? 'success' : 'info');
+      }
     }
     render({ quiet: true });
   },
@@ -1164,6 +1228,13 @@ const actions = {
   'add-indexer': () => indexerTypeModal(),
   'new-indexer': (el) => indexerModal({ type: el.dataset.type }),
   'edit-indexer': (el) => indexerModal(indexersCache.find((i) => i.id === el.dataset.id)),
+  'edit-profile': (el) => profileModal(profilesCache.find((p) => p.id === el.dataset.id)),
+  'add-profile': () => profileModal(null),
+  'delete-profile': () => {
+    const id = $('#profile-form').dataset.id;
+    if (!confirm('Delete this profile? Promotions using it move to the default profile.')) return;
+    saveProfiles(profilesCache.filter((p) => p.id !== id), 'Profile deleted');
+  },
   'test-indexer': async () => {
     const out = $('[data-result="indexer"]');
     out.className = 'test-result';
@@ -1213,6 +1284,16 @@ document.addEventListener('submit', async (event) => {
   event.preventDefault();
   const form = event.target;
   if (form.id === 'manual-search-form') return runManualSearch(form);
+  if (form.id === 'profile-form') {
+    const qualities = [...form.querySelectorAll('input[name="qualities"]:checked')].map((el) => el.value);
+    if (!qualities.length) { message('Choose at least one quality.', 'error'); return; }
+    const edited = {
+      id: form.dataset.id || undefined, name: form.elements.name.value, qualities, cutoff: form.elements.cutoff.value,
+      upgrades: form.elements.upgrades.value, autoGrab: form.elements.autoGrab.value, minScore: Number(form.elements.minScore.value),
+    };
+    const profiles = edited.id ? profilesCache.map((p) => (p.id === edited.id ? edited : p)) : [...profilesCache, edited];
+    return saveProfiles(profiles, 'Profile saved');
+  }
   if (form.id === 'manual-form') {
     const data = Object.fromEntries(new FormData(form));
     const created = await run(() => api('/events', { method: 'POST', body: { ...data, aliases: data.aliases } }), 'Event added');
@@ -1315,10 +1396,11 @@ document.addEventListener('change', async (event) => {
   const kind = el.dataset.change;
   if (!kind) return;
   const id = el.closest('[data-id]')?.dataset.id;
-  const body = kind === 'follow' ? { followed: el.checked } : kind === 'provider' ? { providerId: el.value || null } : { startDate: el.value || null };
+  const body = kind === 'follow' ? { followed: el.checked } : kind === 'provider' ? { providerId: el.value || null }
+    : kind === 'profile' ? { profileId: el.value || null } : { startDate: el.value || null };
   if (kind === 'follow' && !el.checked && !confirm('Stop following this promotion? Its fetched events stay until the next refresh cleans them up; requested ones are kept.')) { el.checked = true; return; }
   const ok = await run(() => api(`/metadata/promotions/${encodeURIComponent(id)}`, { method: 'PUT', body }),
-    kind === 'follow' ? (el.checked ? 'Following; fetching its schedule' : 'No longer following') : 'Saved; refreshing with the new setting');
+    kind === 'follow' ? (el.checked ? 'Following; fetching its schedule' : 'No longer following') : kind === 'profile' ? 'Quality profile saved' : 'Saved; refreshing with the new setting');
   if (ok) render({ quiet: true });
 });
 

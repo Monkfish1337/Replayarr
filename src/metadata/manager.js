@@ -154,7 +154,7 @@ export function createMetadata(store, { settings, logoDir, clock = () => new Dat
         const resolved = resolve(p, m);
         return {
           id: p.id, name: p.name, idPrefix: p.idPrefix, custom: !!p.isCustom, overlay: !!p.matchingOverride,
-          followed: !!m.followed, startDate: m.startDate || null,
+          followed: !!m.followed, startDate: m.startDate || null, profileId: m.profileId || null,
           logo: m.logoUrl || '', defaultLogo: p.defaults?.logo || p.defaults?.poster || '', customLogo: !!m.logoUrl,
           posterShape: p.posterShape || 'landscape',
           sourceType: resolved.source.type, providerId: resolved.providerId, providerName: resolved.providerName,
@@ -193,6 +193,11 @@ export function createMetadata(store, { settings, logoDir, clock = () => new Dat
         const url = String(patch.logoUrl || '').trim();
         if (url && !/^https:\/\/\S+$/i.test(url) && !/^\/logos\/[a-z0-9-]+\.(?:png|jpg|webp|svg|gif)$/.test(url)) throw new MetadataError('Logo must be an https:// image URL.');
         next.logoUrl = url || null;
+      }
+      if ('profileId' in patch) {
+        const id = patch.profileId || null;
+        if (id && !settings().profiles.some((p) => p.id === id)) throw new MetadataError('Unknown quality profile.');
+        next.profileId = id;
       }
       const before = store.listPromotionMeta()[promotion.id] || {};
       store.updatePromotionMeta(promotion.id, next);

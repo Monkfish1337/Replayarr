@@ -106,6 +106,8 @@ async function setup() {
   const service = createService(store, { now: () => now, fetchImage, logoDir: join(dir, 'logos') });
   saveSettings(store, {
     prowlarr: { url: fake.base, apiKey: 'prowlarr-key', maxQueries: 2 },
+    // These tests walk the manual review flow; auto-grab is tested in phase2.test.js.
+    profiles: [{ id: 'default', name: 'Manual', autoGrab: 'no' }],
     qbittorrent: { url: fake.base, username: 'admin', password: 'qb-pass' },
     sabnzbd: { url: fake.base, apiKey: 'sab-key' },
     library: { root: library, mode: 'copy', minSizeMb: 1 },
@@ -176,7 +178,8 @@ test('a requested event goes from search to review to download to library', asyn
   assert.equal(item.path, join(env.library, 'Premier League', 'Season 2026', 'Premier League - S2026E092101 - Arsenal vs Manchester City [1080p].mkv'));
   assert.equal((await stat(item.path)).size, 2 * 1024 * 1024, 'the main file is imported, not the larger sample');
   assert.deepEqual(await readFile(item.path), Buffer.alloc(2 * 1024 * 1024, 1));
-  await assert.rejects(service.requestEvent('epl:101'), /already in your library/);
+  const owned = await service.requestEvent('epl:101');
+  assert.equal(owned.status, 'ready', 'an event in the library keeps its one request (used for upgrade searches)');
 });
 
 test('usenet approvals go to SABnzbd and a failed job can pick another release', async (t) => {
