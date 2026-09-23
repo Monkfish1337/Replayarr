@@ -140,7 +140,7 @@ test('a requested event goes from search to review to download to library', asyn
   await service.tick();
   const reviewed = store.getRequest(request.id);
   assert.equal(reviewed.status, 'review');
-  assert.equal(fake.state.prowlarrQueries.length, 2, 'search is bounded by maxQueries');
+  assert.equal(fake.state.prowlarrQueries.length, 1, 'stops at the first query that finds a match');
 
   const candidates = store.listCandidates(request.id);
   const matched = candidates.filter((c) => c.decision === 'matched');
@@ -265,7 +265,7 @@ test('every configured indexer is searched, and Easynews results download throug
   t.after(() => { delete process.env.REPLAYARR_EASYNEWS_BASE_URL; return env.cleanup(); });
   const { service, store, fake } = env;
   const easynewsFolder = join(env.downloads, 'easynews');
-  saveSettings(store, { indexers: [
+  saveSettings(store, { preferences: { stopAtFirstMatch: 'no' }, indexers: [
     { id: 'torrents', type: 'prowlarr', name: 'Prowlarr', url: fake.base, apiKey: 'prowlarr-key', maxQueries: 1 },
     { id: 'usenet', type: 'prowlarr', name: 'Prowlarr (Usenet)', url: fake.base, apiKey: 'usenet-key', maxQueries: 1 },
     { id: 'dht', type: 'bitmagnet', name: 'Bitmagnet', url: fake.base + '/graphql', maxQueries: 2 },
@@ -281,7 +281,11 @@ test('every configured indexer is searched, and Easynews results download throug
   const candidates = store.listCandidates(request.id);
   const bySource = (source) => candidates.filter((c) => c.source === source).map((c) => c.title);
   assert.ok(bySource('Bitmagnet').includes('EPL.2026.09.21.Arsenal.vs.Man.City.2160p.WEB.h265'));
-  assert.ok(!bySource('Bitmagnet').some((title) => title.includes('1080p')), 'a hash Prowlarr already reported is not duplicated');
+  // Bitmagnet has the highest default priority, so it is asked first and keeps
+  // the hash both it and Prowlarr report.
+  const shared = candidates.find((c) => c.source === 'Bitmagnet' && c.title.includes('1080p'));
+  assert.ok(shared, 'Bitmagnet reported the shared release');
+  assert.equal(candidates.filter((c) => c.infoHash === shared.infoHash).length, 1, 'a hash reported twice is kept once');
   assert.equal(candidates.find((c) => c.source === 'Bitmagnet').publishedAt, null, "Bitmagnet's 1999 placeholder is not a date");
   const easy = candidates.find((c) => c.protocol === 'easynews');
   assert.equal(easy.decision, 'matched');

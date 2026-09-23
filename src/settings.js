@@ -28,16 +28,33 @@ export const DEFAULTS = {
   // Download clients often run in their own container and report paths as
   // they see them. Each mapping rewrites a remote prefix to the local one.
   pathMappings: [],
-  preferences: { protocol: 'any', minSeeders: 1 },
+  // stopAtFirstMatch: once a release matches, skip an indexer's remaining
+  // queries and the lower-priority indexers. 'no' searches everything.
+  preferences: { protocol: 'any', minSeeders: 1, stopAtFirstMatch: 'yes' },
 };
 
 // Fields each indexer type keeps, with defaults. Every entry also has id,
 // type, name and enabled.
+// Query budgets follow SSS: torrent indexers get the promotion's whole
+// torrent query list (about 60), stopping early once a release matches or
+// searchMinutes runs out; Easynews gets a few distinct spellings.
+// Priority works like Sonarr's: lower is searched first, and once one
+// indexer finds a match the ones after it are not asked. The defaults put the
+// fast ones first: Bitmagnet (self-hosted), Easynews, then Prowlarr (a
+// fan-out to remote trackers).
 export const INDEXER_TYPES = {
-  prowlarr: { url: '', apiKey: '', maxQueries: 6, timeoutMs: 20000 },
-  bitmagnet: { url: '', maxQueries: 12, limit: 100, timeoutMs: 15000 },
-  easynews: { username: '', password: '', downloadFolder: '', maxQueries: 4, timeoutMs: 20000 },
+  prowlarr: { url: '', apiKey: '', priority: 30, maxQueries: 60, searchMinutes: 5, timeoutMs: 20000 },
+  bitmagnet: { url: '', priority: 10, maxQueries: 60, searchMinutes: 2, limit: 100, timeoutMs: 15000 },
+  easynews: { username: '', password: '', downloadFolder: '', priority: 20, maxQueries: 6, searchMinutes: 3, timeoutMs: 20000 },
 };
+// Earlier defaults sent only the first few queries, which missed releases
+// SSS found. Indexers saved with them move to the current defaults.
+const OLD_QUERY_DEFAULTS = { prowlarr: 6, bitmagnet: 12, easynews: 4 };
+const QUERY_PLAN = 2;
+function upgradeQueryLimit(item) {
+  if (!item || Number(item.queryPlan) === QUERY_PLAN || Number(item.maxQueries) !== OLD_QUERY_DEFAULTS[item.type]) return item;
+  return { ...item, maxQueries: INDEXER_TYPES[item.type].maxQueries };
+}
 const INDEXER_NAMES = { prowlarr: 'Prowlarr', bitmagnet: 'Bitmagnet', easynews: 'Easynews' };
 const INDEXER_SECRETS = ['apiKey', 'password'];
 
@@ -60,7 +77,7 @@ export function loadSettings(store) {
   if (!Array.isArray(saved.indexers) && saved.prowlarr?.url) {
     out.indexers = [normaliseIndexer({ id: 'prowlarr', type: 'prowlarr', ...saved.prowlarr })];
   }
-  out.indexers = out.indexers.map(normaliseIndexer).filter(Boolean);
+  out.indexers = out.indexers.map(upgradeQueryLimit).map(normaliseIndexer).filter(Boolean);
   if (out.library.naming === OLD_DEFAULT_NAMING) out.library.naming = DEFAULTS.library.naming;
   return out;
 }
@@ -80,6 +97,9 @@ export function normaliseIndexer(item) {
       ? (Number(value) > 0 ? Number(value) : fallback)
       : String(value ?? fallback).trim();
   }
+  entry.queryPlan = QUERY_PLAN;
+  entry.priority = Math.min(50, Math.round(entry.priority));
+  entry.maxQueries = Math.min(100, Math.round(entry.maxQueries));
   return entry;
 }
 
@@ -129,6 +149,7 @@ export function saveSettings(store, incoming) {
   if (!['yes', 'no'].includes(next.library.writeMetadata)) next.library.writeMetadata = 'yes';
   if (!['debug', 'info', 'warn', 'error'].includes(next.logging.level)) next.logging.level = 'info';
   if (!['any', 'torrent', 'usenet'].includes(next.preferences.protocol)) next.preferences.protocol = 'any';
+  if (!['yes', 'no'].includes(next.preferences.stopAtFirstMatch)) next.preferences.stopAtFirstMatch = 'yes';
   store.setSetting('config', next);
   return next;
 }
