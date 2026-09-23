@@ -16,6 +16,9 @@ function fixtures() {
       { id: 'epl:1', name: 'Arsenal vs Manchester City', date: '2026-09-21', time: '15:30:00', aliases: ['Arsenal vs Manchester City'], teamNames: { home: ['Arsenal', 'ARS'], away: ['Manchester City', 'MCI'] } },
       { id: 'epl:2', name: 'Liverpool vs Chelsea', date: '2026-09-27', time: '12:30:00', aliases: [] },
     ],
+    ufc: [
+      { id: 'ufc:331', name: 'UFC 331: Van vs Pantoja 2', date: '2026-09-19', time: '22:00:00', aliases: [] },
+    ],
   };
   async function fetchEvents(promotion) {
     calls.push({ id: promotion.id, source: promotion.source, start: promotion.metadataStartDate });
@@ -107,4 +110,27 @@ test('logos can be chosen by URL or uploaded, and nothing else is accepted', asy
 
   metadata.update('nfl', { logoUrl: '' });
   assert.equal(metadata.list().find((p) => p.id === 'nfl').logo, '');
+});
+
+test('each UFC event gets its own prelims event, which takes only prelims releases', async (t) => {
+  const { store, service, metadata } = await setup(t);
+  metadata.update('ufc', { followed: true });
+  await metadata.waitForIdle();
+  const main = store.getEvent('ufc:331');
+  const prelims = store.getEvent('ufc:331-prelims');
+  assert.equal(prelims.title, 'UFC 331: Van vs Pantoja 2 (Prelims)');
+  assert.equal(prelims.date, main.date);
+  assert.equal(metadata.list().find((p) => p.id === 'ufc').refreshCount, 1, 'counted as one event from the source');
+
+  assert.equal(evaluate('UFC.331.Van.vs.Pantoja.2.PPV.1080p.WEB.h264', main).ok, true);
+  assert.equal(evaluate('UFC.331.Prelims.1080p.WEB.h264', main).reason, 'prelims-release', 'the main event no longer takes the prelims');
+  assert.equal(evaluate('UFC.331.Prelims.1080p.WEB.h264', prelims).ok, true);
+  assert.equal(evaluate('UFC.331.Early.Prelims.720p.WEB', prelims).ok, true);
+  assert.equal(evaluate('UFC.331.Van.vs.Pantoja.2.PPV.1080p.WEB.h264', prelims).reason, 'not-prelims');
+  assert.equal(evaluate('UFC.330.Prelims.1080p.WEB.h264', prelims).ok, false, 'another event’s prelims');
+
+  const request = await service.requestEvent(prelims.id);
+  assert.equal(request.eventId, 'ufc:331-prelims', 'prelims are requested on their own');
+  assert.equal(store.getRequest(request.id).status, 'wanted');
+  assert.equal(store.listRequests().length, 1, 'requesting the prelims does not request the main card');
 });

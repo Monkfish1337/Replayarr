@@ -70,6 +70,8 @@ State lives in SQLite. Request status changes only through an explicit transitio
 
 `src/matching/` is ported from SSS (`lib/promotions.js`, `promotion-aliases.js`, `team-identities.js`, `team-alias-presets.js`, `sources/release-filter.js` at SSS `0706d4d`), with SSS's matcher tests in `test/matching/`. That covers every built-in SSS promotion: UFC, ONE, WWE and AEW shows, F1, MotoGP, boxing, Match of the Day, UCL, MLB, NFL, NBA and the Premier League. It also brings the team alias presets and SSS's rules against false positives.
 
+**UFC prelims.** Each UFC event also gets a separate *(Prelims)* event, which you request, search and import on its own. It takes only releases named as prelims or early prelims (SSS's release-part classifier), and the main event no longer takes them.
+
 Under **Metadata › Matching Rules** you can add learned aliases to a built-in promotion or create a custom one. **Suggest From Examples** runs SSS's alias learner on real release names you paste in.
 
 When SSS's matching improves, port the change into `src/matching/` and its tests. Don't make Replayarr depend on SSS's code at runtime.

@@ -1,6 +1,7 @@
 import promotions from './promotions.cjs';
 import releaseFilter from './release-filter.cjs';
 import promotionAliases from './promotion-aliases.cjs';
+import releaseParts from './release-parts.cjs';
 
 export { promotions, promotionAliases };
 
@@ -29,12 +30,49 @@ export function promotionFor(event) {
 // translates at this one boundary.
 // Events fetched by Replayarr keep the full normalised record (team names,
 // week, season, round...) in `payload`, which the matchers use.
+// A prelims event is matched as its main event (the matchers know "UFC 331",
+// not "UFC 331 (Prelims)"); the part is checked separately in evaluate().
 export function matcherEvent(event) {
   return {
     ...(event.payload || {}),
-    id: event.id, name: event.title, date: event.date, time: event.payload?.time || event.time,
+    id: event.id, name: event.payload?.mainTitle || event.title, date: event.date, time: event.payload?.time || event.time,
     aliases: event.aliases || [], searchAliases: event.aliases || [],
   };
+}
+
+// --- Event parts (prelims) ----------------------------------------------
+// Promotions whose cards are released in parts. Each of their events gets a
+// companion prelims event that is requested, searched and imported on its
+// own; the main event no longer takes a prelims release.
+const PRELIM_PROMOTIONS = new Set(['ufc']);
+
+export function hasPrelims(promotionId) {
+  return PRELIM_PROMOTIONS.has(promotionId);
+}
+
+export function isPrelims(event) {
+  return event?.payload?.part === 'prelims';
+}
+
+// The prelims companion of a fetched event (the record metadata refresh
+// stores). Same date and time: sorted by id it comes straight after its main
+// event, so episode numbers of events already imported do not change.
+export function prelimsEvent(event) {
+  return {
+    ...event,
+    id: `${event.id}-prelims`,
+    title: `${event.title} (Prelims)`,
+    aliases: [],
+    payload: { ...(event.payload || {}), part: 'prelims', mainTitle: event.title, name: `${event.title} (Prelims)` },
+  };
+}
+
+// Release names spell the part out: "UFC.331.Prelims", "Early.Prelims".
+function partCheck(title, event) {
+  const part = releaseParts.classifyReleasePart(title);
+  const prelimsRelease = part === 'prelims' || part === 'early-prelims';
+  if (isPrelims(event)) return prelimsRelease ? null : 'not-prelims';
+  return prelimsRelease ? 'prelims-release' : null;
 }
 
 const unique = (titles) => Array.from(new Set(titles.map((t) => String(t || '').trim()).filter(Boolean)));
@@ -56,10 +94,17 @@ export function queriesFor(event, indexerType, limit) {
   const matcher = matcherEvent(event);
   if (!promotion) return unique([event.title, ...(event.aliases || [])]).slice(0, Math.max(1, limit));
   const titles = unique([].concat(promotion.searchTitles(matcher) || [], event.aliases || []));
-  if (indexerType === 'easynews') return selectProviderQueries(titles, matcher, limit || promotion.uuMaxQueries || 6, promotion);
+  if (indexerType === 'easynews') {
+    const cap = limit || promotion.uuMaxQueries || 6;
+    const picks = selectProviderQueries(titles, matcher, cap, promotion);
+    return isPrelims(event) ? unique([...picks.slice(0, 3).map((q) => `${q} Prelims`), ...picks]).slice(0, cap) : picks;
+  }
   const torrent = typeof promotion.torrentSearchTitles === 'function'
     ? unique([].concat(promotion.torrentSearchTitles(matcher) || [], event.aliases || [])) : titles;
-  return torrent.slice(0, Math.max(1, limit || torrent.length));
+  // Prelims: the main event's queries with "Prelims" first, then as they are
+  // (indexers return every part for "UFC 331"; the matcher picks the prelims).
+  const list = isPrelims(event) ? unique([...torrent.slice(0, 6).map((q) => `${q} Prelims`), ...torrent]) : torrent;
+  return list.slice(0, Math.max(1, limit || list.length));
 }
 
 // Ported from SSS lib/streams.js selectProviderQueries: score for an exact
@@ -133,9 +178,14 @@ export function evaluate(title, event) {
     const wrongYear = eventYear && titleYears.length > 0 && !titleYears.includes(eventYear);
     const alias = (event.aliases || []).find((value) => String(value).trim().length >= 4
       && String(title).toLowerCase().includes(String(value).trim().toLowerCase()));
-    if (alias && !wrongYear) return { ok: true, stage: 'relevance', reason: 'event alias: ' + alias };
+    if (alias && !wrongYear) verdict = { ok: true, reason: 'event alias: ' + alias };
   }
-  return { ok: !!verdict.ok, stage: 'relevance', reason: verdict.ok ? (verdict.reason || 'matched') : (verdict.reason || 'relevance') };
+  if (!verdict.ok) return { ok: false, stage: 'relevance', reason: verdict.reason || 'relevance' };
+  if (hasPrelims(promotion.id)) {
+    const wrongPart = partCheck(title, event);
+    if (wrongPart) return { ok: false, stage: 'part', reason: wrongPart };
+  }
+  return { ok: true, stage: 'relevance', reason: verdict.reason || 'matched' };
 }
 
 // Whether a release title shares any real word (four letters or more) with

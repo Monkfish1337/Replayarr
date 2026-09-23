@@ -1,6 +1,6 @@
 import { mkdir, readdir, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { promotions } from '../matching/index.js';
+import { hasPrelims, prelimsEvent, promotions } from '../matching/index.js';
 import metadataConfig from './config.cjs';
 import refresh from './refresh.cjs';
 import preview from './preview.cjs';
@@ -93,8 +93,9 @@ export function createMetadata(store, { settings, logoDir, clock = () => new Dat
       // The ported SSS sources narrate each request and page; keep that at debug.
       const events = await fetchEvents(view, { log: (line) => log.debug(`${promotion.name}: ${String(line).trim()}`) });
       log.info(`${promotion.name}: ${events.length} event(s)`, { seconds: Math.round((Date.now() - started) / 1000) });
+      const keep = [];
       for (const event of events) {
-        store.upsertEvent({
+        const record = {
           id: event.id,
           promotionId: promotion.id,
           title: event.name,
@@ -104,9 +105,14 @@ export function createMetadata(store, { settings, logoDir, clock = () => new Dat
           source: 'metadata',
           sourceRevision: resolve(promotion, meta).source.type,
           payload: event,
-        });
+        };
+        // Cards released in parts (UFC) also get a prelims event.
+        for (const each of hasPrelims(promotion.id) ? [record, prelimsEvent(record)] : [record]) {
+          store.upsertEvent(each);
+          keep.push(each.id);
+        }
       }
-      const removed = store.pruneEvents(promotion.id, events.map((e) => e.id));
+      const removed = store.pruneEvents(promotion.id, keep);
       store.updatePromotionMeta(promotion.id, { refreshedAt: clock().toISOString(), refreshCount: events.length, refreshError: null });
       store.log('metadata', `${promotion.name}: ${events.length} events from ${resolve(promotion, meta).providerName}${removed ? `, ${removed} removed` : ''}`);
       return { promotionId, ok: true, count: events.length, removed, seconds: Math.round((Date.now() - started) / 1000) };
