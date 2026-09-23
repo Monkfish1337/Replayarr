@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { timingSafeEqual } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { dirname, extname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDatabase } from './src/db.js';
@@ -34,8 +34,15 @@ const store = createStore(openDatabase(dataFile));
 const logoDir = resolve(dirname(dataFile), 'logos');
 const service = createService(store, { logoDir });
 const { version } = JSON.parse(await readFile(resolve(root, 'package.json'), 'utf8'));
+// Changes whenever the served UI changes, so an open tab can tell it is stale.
+const uiBuild = createHash('sha256')
+  .update(await readFile(resolve(publicDir, 'app.js'))).update(await readFile(resolve(publicDir, 'styles.css'))).update(await readFile(resolve(publicDir, 'index.html')))
+  .digest('hex').slice(0, 12);
+const revision = (process.env.REPLAYARR_REVISION || '').slice(0, 7);
 const api = createApi(service, {
   version,
+  revision,
+  uiBuild,
   databasePath: dataFile,
   testers: {
     prowlarr: prowlarr.testConnection,

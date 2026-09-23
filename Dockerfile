@@ -18,6 +18,10 @@ VOLUME ["/config"]
 
 USER node
 
+# The commit the image was built from, shown under System › Status.
+ARG REVISION=""
+ENV REPLAYARR_REVISION=$REVISION
+
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     PORT=4173 \

@@ -26,6 +26,23 @@ let pollTimer = null;
 let renderToken = 0;
 
 // --- API ----------------------------------------------------------------
+// The UI build this tab loaded. The server sends its current build on every
+// API response; a difference means Replayarr was updated since the page
+// loaded, and the tab should be reloaded to get the new interface.
+let loadedBuild = null;
+function checkBuild(response) {
+  const build = response.headers.get('x-replayarr-ui');
+  if (!build) return;
+  if (loadedBuild === null) { loadedBuild = build; return; }
+  if (build !== loadedBuild && !$('#update-banner')) {
+    const banner = document.createElement('div');
+    banner.id = 'update-banner';
+    banner.className = 'update-banner';
+    banner.innerHTML = 'Replayarr has been updated. <button class="button button-primary" type="button" onclick="location.reload()">Reload</button>';
+    document.body.append(banner);
+  }
+}
+
 async function api(path, { method = 'GET', body } = {}) {
   // The server only accepts JSON on writes (its CSRF guard), so every
   // POST/PUT carries a JSON body even when there is nothing to send.
@@ -35,6 +52,7 @@ async function api(path, { method = 'GET', body } = {}) {
     headers: writes ? { 'content-type': 'application/json' } : {},
     body: writes ? JSON.stringify(body ?? {}) : undefined,
   });
+  checkBuild(response);
   if (response.status === 204) return null;
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
@@ -469,7 +487,7 @@ const pages = {
         ${field('qbittorrent.username', 'Username', settings.qbittorrent.username, { help: 'Only needed without an API key.' })}
         ${field('qbittorrent.password', 'Password', settings.qbittorrent.password, { type: 'password' })}
         ${field('qbittorrent.category', 'Category', settings.qbittorrent.category)}
-        ${field('qbittorrent.savePath', 'Save Path', settings.qbittorrent.savePath, { placeholder: '/downloads/replays', help: 'Where qBittorrent saves Replayarr's torrents, as a path inside qBittorrent. Blank uses the category's save path. Add a Remote Path Mapping below if Replayarr sees that folder under a different path.' })}
+        ${field('qbittorrent.savePath', 'Save Path', settings.qbittorrent.savePath, { placeholder: '/downloads/replays', help: 'Where qBittorrent saves Replayarr torrents, as a path inside qBittorrent. Blank uses the category save path. Add a Remote Path Mapping below if Replayarr sees that folder under a different path.' })}
         ${test('qbittorrent')}</fieldset>
         <fieldset class="fieldset" style="border:0;padding:0"><legend>SABnzbd</legend>
         ${field('sabnzbd.url', 'URL', settings.sabnzbd.url, { placeholder: 'http://sabnzbd:8080' })}
@@ -535,7 +553,7 @@ const pages = {
     return `<fieldset class="fieldset" style="border:0;padding:0"><legend>Health</legend>
       ${health.length ? health.map((h) => `<div class="alert alert-${h.type}">${icon('warning')}<div>${esc(h.message)} ${h.link ? `<a href="#/${esc(h.link)}">Fix</a>` : ''}</div></div>`).join('') : `<div class="alert alert-success">${icon('check')}<div>No issues with your configuration.</div></div>`}</fieldset>
       <fieldset class="fieldset" style="border:0;padding:0"><legend>About</legend><table class="table info-table"><tbody>
-        <tr><td>Version</td><td>${esc(status.version)}</td></tr><tr><td>Node.js</td><td>${esc(status.node)} (${esc(status.platform)})</td></tr>
+        <tr><td>Version</td><td>${esc(status.version)}${status.revision ? ` (build <a href="https://github.com/Monkfish1337/Replayarr/commit/${esc(status.revision)}" target="_blank" rel="noopener">${esc(status.revision)}</a>)` : ''}</td></tr><tr><td>Node.js</td><td>${esc(status.node)} (${esc(status.platform)})</td></tr>
         <tr><td>Database</td><td class="title-cell">${esc(status.database)}</td></tr><tr><td>Promotions</td><td>${status.promotions}</td></tr>
         <tr><td>Started</td><td>${formatDateTime(status.startedAt)}</td></tr>
         <tr><td>Matching</td><td>Ported from SeriousSportSync</td></tr></tbody></table></fieldset>`;

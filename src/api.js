@@ -26,8 +26,9 @@ async function readJson(request, maxBody = MAX_BODY) {
   catch { throw new UserError('The request body is not valid JSON.'); }
 }
 
+let uiBuildHeader = '';
 function send(response, status, payload) {
-  response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+  response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-replayarr-ui': uiBuildHeader });
   response.end(payload === undefined ? '' : JSON.stringify(payload));
 }
 
@@ -46,7 +47,8 @@ function requestView(store, request) {
   };
 }
 
-export function createApi(service, { testers, version = '', databasePath = '' }) {
+export function createApi(service, { testers, version = '', revision = '', uiBuild = '', databasePath = '' }) {
+  uiBuildHeader = uiBuild;
   const { store } = service;
   const startedAt = new Date().toISOString();
   const routes = [
@@ -74,7 +76,7 @@ export function createApi(service, { testers, version = '', databasePath = '' })
     }))],
     ['GET', /^\/api\/health$/, () => service.health()],
     ['GET', /^\/api\/system\/status$/, () => ({
-      version, node: process.version, platform: process.platform, database: databasePath,
+      version, revision, uiBuild, node: process.version, platform: process.platform, database: databasePath,
       startedAt, promotions: listPromotions().length,
     })],
     ['GET', /^\/api\/system\/tasks$/, () => service.tasks()],
