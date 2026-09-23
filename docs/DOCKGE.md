@@ -28,7 +28,7 @@ On the shared network, use container names:
 
 | Setting | Example |
 | --- | --- |
-| Metadata Source › Install URL | Your SSS addon URL from the SSS account page. `http://serioussportsync:7000/u/…/manifest.json` if SSS is on the same network |
+| Metadata › Promotions | Follow the promotions you want; the Premier League needs a free football-data.org key and Match of the Day a free TMDB key (Metadata › Settings) |
 | Indexers › Prowlarr | `http://prowlarr:9696`; add a second Prowlarr entry for a separate Usenet instance, e.g. `http://prowlarr-usenet:9797` |
 | Indexers › Bitmagnet | `http://gluetun:3333` when Bitmagnet shares Gluetun's network, otherwise `http://bitmagnet:3333` |
 | Indexers › Easynews | Your Easynews username and password, and a download folder such as `/data/downloads/easynews` |

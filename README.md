@@ -4,7 +4,7 @@
 
 Replayarr is a self-hosted manager for sports event recordings, in the style of Sonarr. You request an event, Replayarr searches your indexers, you pick a release, and it tracks the download through to a named file in your media library.
 
-It is a separate project from [SeriousSportSync](https://github.com/Monkfish1337/Serioussportsync). SSS is a sports calendar and streaming add-on; Replayarr keeps a durable local library. Replayarr reads SSS's calendar but never writes to it, and its release matching is ported from SSS (see [Matching](#matching)).
+It is a standalone companion to [SeriousSportSync](https://github.com/Monkfish1337/Serioussportsync): SSS is a sports calendar and streaming add-on, Replayarr keeps a durable local library. Replayarr does not need SSS running; its schedule sources and release matching are ported from SSS (see [Metadata](#metadata) and [Matching](#matching)).
 
 > **Phase 1.** The manual loop works end to end: request → search → review → download → import. Automatic grabbing, quality upgrades and media-server notifications come later.
 
@@ -26,7 +26,8 @@ Open [http://localhost:4173](http://localhost:4173), then go to **Settings** and
 
 | Settings page | What to enter |
 | --- | --- |
-| Metadata Source | Your SSS addon install URL (ends in `/manifest.json`, from your SSS account page) |
+| Metadata › Promotions | Follow the promotions you want (or use **Add New**); set a provider, start date or logo per promotion |
+| Metadata › Settings | football-data.org / TMDB / API-Football keys, if a followed promotion needs one |
 | Indexers | Any mix of Prowlarr instances, Bitmagnet and Easynews |
 | Download Clients | qBittorrent and/or SABnzbd, plus remote path mappings if they run in other containers |
 | Media Management | The library folder Plex, Jellyfin or Emby scans, and the naming pattern |
@@ -56,7 +57,7 @@ The UI follows Sonarr: **Promotions** stand in for series, **events** for episod
 Event ─▶ Request (wanted) ─▶ Search ─▶ Candidates ─▶ Review ─▶ Download job ─▶ Import ─▶ Library
 ```
 
-- **Events** come from SSS's existing addon catalog (read-only) or are added by hand. Requesting one fetches its aliases and start time from SSS.
+- **Events** come from the schedules of the promotions you follow (see [Metadata](#metadata)), or are added by hand.
 - **Searching** waits until 3 hours after the event starts, then sends the promotion's search titles to every enabled indexer, most precise first, up to each indexer's *Queries Per Search*. Indexers can be any number of Prowlarr instances, Bitmagnet (GraphQL, ordered by seeders) and Easynews. A release reported by several indexers is listed once. When nothing matches it backs off: 30 minutes, 2, 6 and 12 hours, then daily.
 - **Candidates** pass SSS's release filter and the promotion's matcher. Rejected releases stay visible in Interactive Search with the reason, such as `wrong-date` or `sports-noise`, but cannot be grabbed. Matches are scored from quality, source, seeders and protocol, and each score shows how it was reached.
 - **Review** is manual in Phase 1: choose a release from Interactive Search. A torrent goes to qBittorrent and an NZB to SABnzbd. An Easynews result is a single file over HTTPS, so Replayarr's built-in downloader fetches it into that indexer's download folder (two at a time, resuming after a restart); Easynews credentials only ever go to easynews.com.
@@ -68,15 +69,25 @@ State lives in SQLite. Request status changes only through an explicit transitio
 
 `src/matching/` is ported from SSS (`lib/promotions.js`, `promotion-aliases.js`, `team-identities.js`, `team-alias-presets.js`, `sources/release-filter.js` at SSS `0706d4d`), with SSS's matcher tests in `test/matching/`. That covers every built-in SSS promotion: UFC, ONE, WWE and AEW shows, F1, MotoGP, boxing, Match of the Day, UCL, MLB, NFL, NBA and the Premier League. It also brings the team alias presets and SSS's rules against false positives.
 
-Under **Settings › Promotions** you can add learned aliases to a built-in promotion or create a custom one. **Suggest From Examples** runs SSS's alias learner on real release names you paste in.
+Under **Metadata › Matching Rules** you can add learned aliases to a built-in promotion or create a custom one. **Suggest From Examples** runs SSS's alias learner on real release names you paste in.
 
 When SSS's matching improves, port the change into `src/matching/` and its tests. Don't make Replayarr depend on SSS's code at runtime.
+
+## Metadata
+
+Replayarr fetches schedules itself, like Sonarr fetches series. **Follow** a promotion (Promotions › Add New, or Metadata › Promotions) and its events are fetched in the background and refreshed every *Refresh Every* hours. Only followed promotions are fetched.
+
+The sources are ported from SSS (`src/metadata/`, SSS `0706d4d`): TheSportsDB (UFC, WWE and its weekly shows, AEW shows, F1, boxing, MotoGP), ESPN (NFL, NBA), MLB's and UEFA's official schedules, the official ONE and AEW schedules, football-data.org (Premier League; free key), TMDB (Match of the Day; free key), API-Football, and custom JSON/API feeds. Events keep SSS's full normalised record (team names, week, season, round), which is what the matchers read.
+
+- **Providers** (Metadata › Providers) list where schedules come from, with **Test & Preview** for each. Add your own, such as another TheSportsDB league, an ESPN league like `nhl`, a football-data team, or any public JSON schedule, then pick it for a promotion.
+- **Start date** limits how far back a promotion is fetched. Without one, a refresh reaches back *Import Past Days* (30). TheSportsDB is rate limited and walks a season round by round, so a TheSportsDB promotion takes a few minutes to refresh; the page shows progress.
+- **Logos**: click a promotion's logo to pick another. Candidates come from TheSportsDB's league artwork, ESPN league logos, Wikipedia and Wikimedia Commons (images that fail to load are hidden), or use any https image URL or upload one (stored beside the database, 2 MB max).
 
 ## Architecture boundaries
 
 | Concern | Owner |
 | --- | --- |
-| Calendar and event identity | SSS (read through its public addon endpoints) |
+| Calendar and event identity | Replayarr, with schedule sources ported from SSS |
 | Release matching rules | Ported from SSS into Replayarr |
 | Wanted events, download decisions and job history | Replayarr |
 | Actual transfer | qBittorrent / SABnzbd |

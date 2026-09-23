@@ -1,0 +1,283 @@
+// Ported from SeriousSportSync (Monkfish1337/Serioussportsync @ 0706d4d), lib/sources/espn.js.
+'use strict';
+
+// ESPN scoreboard adapter, used for leagues with no usable free feed of their
+// own.
+//
+// Why not TheSportsDB: SSS's shared TSDB key caps `eventsseason.php` at about
+// fifteen results, so an NFL promotion built on it returns fifteen of a
+// 272-game season. The same measurement is what led MLB to its own adapter.
+// ESPN's public scoreboard returns monthly slates without a key or account.
+// Month queries keep NBA and MLB below the endpoint's 1000-game response cap.
+//
+// The endpoint is undocumented and carries no compatibility promise, which is
+// the trade being made deliberately: it is the same bet already taken on
+// statsapi.mlb.com for MLB. Everything here fails soft — a shape change drops
+// records rather than throwing, so a broken upstream degrades the catalog
+// instead of failing the whole refresh.
+
+const fetch = require('../fetch.cjs');
+const httpAgent = require('../http-agent.cjs');
+const boundedBody = require('../bounded-body.cjs');
+
+const BASE = 'https://site.api.espn.com/apis/site/v2/sports';
+
+// Path segments ESPN uses, keyed by the identifier a promotion declares.
+// Each verified against the live endpoint before being listed: a wrong path
+// answers 200 with an empty or stale event list rather than an error, so an
+// unverified guess looks like a working league that never returns a fixture.
+// CFL is deliberately absent — ESPN still serves that path, but its newest
+// fixture is from 2022.
+const LEAGUES = Object.freeze({
+  nfl: { path: 'football/nfl', label: 'NFL', country: 'United States' },
+  nba: { path: 'basketball/nba', label: 'NBA', country: 'United States' },
+  wnba: { path: 'basketball/wnba', label: 'WNBA', country: 'United States' },
+  ncaaf: { path: 'football/college-football', label: 'NCAA Football', country: 'United States' },
+  nhl: { path: 'hockey/nhl', label: 'NHL', country: 'United States' },
+  mlb: { path: 'baseball/mlb', label: 'MLB', country: 'United States' },
+});
+
+const MAX_GAMES = 5000;
+// Monthly MLB scoreboards can approach 8 MB. Keep a bounded response with
+// headroom, rather than using year queries that exceed the 1000-game limit.
+const MAX_BYTES = 16 * 1024 * 1024;
+
+// ESPN dates are ISO with a Z offset, e.g. 2026-09-11T00:35Z. The calendar day
+// is taken in UTC deliberately: every other source in SSS keys events by their
+// UTC date, and matching compares dates with a one-day tolerance either way,
+// which absorbs the evening-kickoff-crosses-midnight case.
+function splitTimestamp(value) {
+  const iso = String(value || '');
+  const match = iso.match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/);
+  if (!match) return { date: '', time: null };
+  return { date: match[1], time: match[2] + ':00' };
+}
+
+function teamOf(competitors, side) {
+  const entry = (competitors || []).find((c) => c && c.homeAway === side);
+  return (entry && entry.team) || null;
+}
+
+// American football releases are keyed by week, not by date:
+//
+//   NFL.2025-2026.W04.Packers-Cowboys.1080p.ACC.2CH.MKV-CG
+//
+// There is no date anywhere in that name, so a date-keyed query cannot reach
+// it and this whole catalogue was invisible. rutracker numbers its weeks too,
+// which makes this a second route in there as well.
+//
+// ESPN carries the number on each event: `week: {number: 2}` alongside
+// `season: {year: 2026, type: 2, slug: "regular-season"}`. Season type 2 is the
+// regular season — the only one scene weeks number this way. Preseason (1) and
+// postseason (3) weeks restart from 1, so a "W04" taken from them would point
+// at the wrong fixture, and they are left unnumbered rather than guessed at.
+function weekOf(event) {
+  const season = event && event.season;
+  const type = season && season.type;
+  if (type != null && Number(type) !== 2) return null;
+  const number = event && event.week && event.week.number;
+  const parsed = Number(number);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 30) return null;
+  return parsed;
+}
+
+function seasonPhaseOf(event) {
+  const type = Number(event && event.season && event.season.type);
+  return ({1: 'preseason', 2: 'regular', 3: 'postseason'})[type] || null;
+}
+
+// The scene writes the NFL season as a span — "2025-2026" — while ESPN reports
+// the single year the season started in. A September 2026 game is season 2026,
+// which the release names 2026-2027.
+function seasonSpanOf(event) {
+  const year = Number(event && event.season && event.season.year);
+  if (!Number.isInteger(year) || year < 1950 || year > 2200) return null;
+  return year + '-' + (year + 1);
+}
+
+// One scoreboard event to the raw record shape scripts/refresh.js expects,
+// matching lib/sources/mlb.js so both flow through transform.fromWiki.
+function toRaw(event, league) {
+  if (!event || !event.id) return null;
+  const competition = (event.competitions || [])[0];
+  const competitors = (competition && competition.competitors) || [];
+  const home = teamOf(competitors, 'home');
+  const away = teamOf(competitors, 'away');
+  if (!home || !away) return null;
+  const homeName = String(home.displayName || '').trim();
+  const awayName = String(away.displayName || '').trim();
+  if (!homeName || !awayName) return null;
+
+  const { date, time } = splitTimestamp(event.date);
+  if (!date) return null;
+
+  const venue = competition && competition.venue;
+  const address = (venue && venue.address) || {};
+  const status = event.status && event.status.type && event.status.type.name;
+  const meta = LEAGUES[league] || {};
+
+  return {
+    sourceId: String(event.id),
+    // "Away at Home", which is the convention MLB already produces and the
+    // promotion matchers already split on.
+    name: awayName + ' at ' + homeName,
+    date,
+    time,
+    timestamp: String(event.date || '') || null,
+    venue: (venue && venue.fullName) || null,
+    city: address.city || null,
+    country: address.country || meta.country || null,
+    // Team logos are the only artwork ESPN offers and are stable CDN URLs.
+    poster: away.logo || home.logo || null,
+    thumb: home.logo || away.logo || null,
+    fanart: null,
+    banner: null,
+    description: [meta.label, venue && venue.fullName].filter(Boolean).join(' · '),
+    // Retained so a future migration can re-key events without refetching.
+    teamNames: {
+      home: [homeName, home.location, home.name, home.abbreviation]
+        .map((v) => String(v || '').trim()).filter(Boolean)
+        .filter((v, i, all) => all.indexOf(v) === i),
+      away: [awayName, away.location, away.name, away.abbreviation]
+        .map((v) => String(v || '').trim()).filter(Boolean)
+        .filter((v, i, all) => all.indexOf(v) === i),
+    },
+    // Week-numbered release names carry no date at all, so these travel with
+    // the event rather than being derived from one later. Null for a league or
+    // a season phase that does not number its weeks.
+    week: weekOf(event),
+    seasonSpan: seasonSpanOf(event),
+    seasonPhase: seasonPhaseOf(event),
+    source: {
+      type: 'espn', league, eventId: String(event.id),
+      homeTeamId: home.id == null ? null : String(home.id),
+      awayTeamId: away.id == null ? null : String(away.id),
+      status: status || null,
+    },
+  };
+}
+
+function parseScoreboard(json, league) {
+  const out = [];
+  for (const event of ((json && json.events) || [])) {
+    const raw = toRaw(event, league);
+    if (raw) out.push(raw);
+    if (out.length >= MAX_GAMES) break;
+  }
+  return out;
+}
+
+// Every team in a league, for the team picker. A separate endpoint from the
+// scoreboard, and cheap: one call returns the full roster of clubs with logos.
+async function fetchTeams(opts) {
+  const options = opts || {};
+  const log = options.log || (() => {});
+  const league = String(options.league || '').trim().toLowerCase();
+  const meta = LEAGUES[league];
+  if (!meta) throw new Error('espn: unsupported league "' + league + '"');
+  const url = BASE + '/' + meta.path + '/teams?limit=500';
+  const response = await fetch(url, httpAgent.fetchOpts({
+    headers: { Accept: 'application/json', 'User-Agent': 'SeriousSportSync/0.89' },
+    timeout: 20000,
+  }, url));
+  if (!response.ok) throw new Error('espn HTTP ' + response.status + ' for ' + meta.label + ' teams');
+  const body = await boundedBody.readBuffer(response, MAX_BYTES, 'ESPN teams');
+  let json;
+  try { json = JSON.parse(body.toString('utf8')); }
+  catch (error) { throw new Error('espn returned unparsable JSON for ' + meta.label + ' teams'); }
+  const leagues = (((json && json.sports) || [])[0] || {}).leagues || [];
+  const entries = (leagues[0] || {}).teams || [];
+  const out = [];
+  for (const entry of entries) {
+    const team = entry && entry.team;
+    if (!team || team.id == null) continue;
+    const name = String(team.displayName || team.name || '').trim();
+    if (!name) continue;
+    out.push({
+      id: String(team.id),
+      name,
+      fullName: name,
+      abbreviation: String(team.abbreviation || '').trim(),
+      crest: String((Array.isArray(team.logos) && team.logos[0] && team.logos[0].href) || ''),
+      // Kept so a per-team promotion can recognise the fixture by any form.
+      names: [name, team.location, team.name, team.abbreviation]
+        .map((value) => String(value || '').trim()).filter(Boolean)
+        .filter((value, index, all) => all.indexOf(value) === index),
+    });
+  }
+  log('   espn: ' + out.length + ' ' + meta.label + ' team(s)');
+  return out.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// ESPN no longer accepts YYYYMMDD-YYYYMMDD ranges. A YYYYMM query returns a
+// complete calendar month without truncating NBA/MLB at the 1000-game cap.
+// Include adjacent local-calendar days: an evening game can have a UTC date
+// on the first of the next month, and SSS filters by that UTC date.
+function monthKeys(dateFrom, dateTo) {
+  const start = Date.parse(dateFrom + 'T00:00:00Z');
+  const end = Date.parse(dateTo + 'T00:00:00Z');
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return [];
+  const first = new Date(start - 86400000);
+  const last = new Date(end + 86400000);
+  let year = first.getUTCFullYear();
+  let month = first.getUTCMonth();
+  const out = [];
+  while (year < last.getUTCFullYear() || (year === last.getUTCFullYear() && month <= last.getUTCMonth())) {
+    out.push(String(year) + String(month + 1).padStart(2, '0'));
+    month++;
+    if (month === 12) { month = 0; year++; }
+  }
+  return out;
+}
+
+async function fetchMonth(meta, league, month, request) {
+  const url = BASE + '/' + meta.path + '/scoreboard?limit=1000&dates='
+    + month;
+  const response = await (request || fetch)(url, httpAgent.fetchOpts({
+    headers: { Accept: 'application/json', 'User-Agent': 'SeriousSportSync/0.85' },
+    timeout: 25000,
+  }, url));
+  if (!response.ok) throw new Error('espn HTTP ' + response.status + ' for ' + meta.label);
+  const body = await boundedBody.readBuffer(response, MAX_BYTES, 'ESPN scoreboard');
+  let json;
+  try { json = JSON.parse(body.toString('utf8')); }
+  catch (error) { throw new Error('espn returned unparsable JSON for ' + meta.label); }
+  return parseScoreboard(json, league);
+}
+
+async function fetchAll(opts) {
+  const options = opts || {};
+  const log = options.log || (() => {});
+  const league = String(options.league || '').trim().toLowerCase();
+  const meta = LEAGUES[league];
+  if (!meta) throw new Error('espn: unsupported league "' + league + '"');
+  const dateFrom = String(options.dateFrom || '').trim();
+  const dateTo = String(options.dateTo || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateFrom) || !/^\d{4}-\d{2}-\d{2}$/.test(dateTo)) {
+    throw new Error('espn: dateFrom and dateTo must be YYYY-MM-DD');
+  }
+
+  const months = monthKeys(dateFrom, dateTo);
+  log('-> espn: ' + meta.label + ' scoreboard ' + dateFrom + ' to ' + dateTo
+    + ' (' + months.length + ' month(s))');
+  // De-duplicated by fixture id: a game rescheduled across a window boundary
+  // can legitimately appear in two responses.
+  const byId = new Map();
+  for (const month of months) {
+    const chunk = await fetchMonth(meta, league, month, options.fetch);
+    for (const raw of chunk) {
+      if (raw.date < dateFrom || raw.date > dateTo) continue;
+      if (!byId.has(raw.sourceId)) byId.set(raw.sourceId, raw);
+      if (byId.size >= MAX_GAMES) break;
+    }
+    if (byId.size >= MAX_GAMES) break;
+  }
+  const raw = Array.from(byId.values());
+  log('   espn: ' + raw.length + ' ' + meta.label + ' fixture(s)');
+  return raw;
+}
+
+module.exports = {
+  fetchAll, fetchTeams, toRaw, parseScoreboard, monthKeys, weekOf, seasonSpanOf, seasonPhaseOf,
+  LEAGUES, BASE,
+};

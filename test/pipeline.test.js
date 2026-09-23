@@ -10,7 +10,7 @@ import { createService } from '../src/service.js';
 import { saveSettings } from '../src/settings.js';
 import * as qbittorrent from '../src/adapters/qbittorrent.js';
 
-// Stand-ins for SSS, Prowlarr, qBittorrent and SABnzbd that speak just enough
+// Stand-ins for Prowlarr, Bitmagnet, Easynews, qBittorrent and SABnzbd that speak just enough
 // of each real API for the pipeline to run against them over HTTP.
 async function fakeServices(downloadDir) {
   const state = { torrents: [], sab: { queue: [], history: [] }, prowlarrQueries: [], logins: 0, prowlarrKeys: [], bitmagnetQueries: 0, easynewsQueries: 0, easynewsRanges: [] };
@@ -21,18 +21,6 @@ async function fakeServices(downloadDir) {
     let body = '';
     for await (const chunk of req) body += chunk;
     const json = (value) => res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(value));
-    // SSS addon
-    if (url.pathname === '/u/1/tok/manifest.json') return json({ name: 'SSS', catalogs: [{ type: 'movie', id: 'epl-recent', name: 'Premier League Recent' }] });
-    if (url.pathname === '/u/1/tok/catalog/movie/epl-recent.json') {
-      return json({ metas: [
-        { id: 'epl:101', name: 'Arsenal vs Manchester City', releaseInfo: '2026-09-21' },
-        { id: 'epl:099', name: 'Chelsea vs Everton', releaseInfo: '2025-01-01' },
-      ] });
-    }
-    if (url.pathname.startsWith('/u/1/tok/catalog/')) return json({ metas: [] });
-    if (url.pathname === '/u/1/tok/meta/movie/epl%3A101.json') {
-      return json({ meta: { id: 'epl:101', name: 'Arsenal vs Manchester City', released: '2026-09-21T15:30:00.000Z', searchHints: [] } });
-    }
     // Prowlarr
     if (url.pathname === '/api/v1/search') {
       assert.ok(['prowlarr-key', 'usenet-key'].includes(req.headers['x-api-key']));
@@ -115,12 +103,16 @@ async function setup() {
   const store = createStore(openDatabase(':memory:'));
   const service = createService(store, { now: () => now });
   saveSettings(store, {
-    sss: { manifestUrl: `${fake.base}/u/1/tok/manifest.json` },
     prowlarr: { url: fake.base, apiKey: 'prowlarr-key', maxQueries: 2 },
     qbittorrent: { url: fake.base, username: 'admin', password: 'qb-pass' },
     sabnzbd: { url: fake.base, apiKey: 'sab-key' },
     library: { root: library, mode: 'copy', minSizeMb: 1 },
     pathMappings: [{ remote: '/downloads', local: downloads }],
+  });
+  store.upsertEvent({
+    id: 'epl:101', promotionId: 'epl', title: 'Arsenal vs Manchester City', date: '2026-09-21', time: '15:30',
+    aliases: [], source: 'metadata', sourceRevision: 'football-data',
+    payload: { id: 'epl:101', name: 'Arsenal vs Manchester City', date: '2026-09-21', time: '15:30:00', teamNames: { home: ['Arsenal'], away: ['Manchester City'] } },
   });
   return {
     store, service, fake, downloads, library,
@@ -129,19 +121,17 @@ async function setup() {
   };
 }
 
-test('a requested SSS event goes from search to review to download to library', async (t) => {
+test('a requested event goes from search to review to download to library', async (t) => {
   const env = await setup();
   t.after(() => env.cleanup());
   const { service, store, fake } = env;
 
-  const sync = await service.syncEvents();
-  assert.equal(sync.count, 1, 'events outside the lookback window are skipped');
   const event = store.getEvent('epl:101');
   assert.equal(event.promotionId, 'epl');
 
   const request = await service.requestEvent('epl:101');
   assert.equal(request.status, 'wanted');
-  assert.equal(store.getEvent('epl:101').time, '15:30', 'detail refresh records the start time');
+  assert.equal(request.nextSearchAt, '2026-09-22T12:00:00.000Z', 'already three hours past kick-off, so due now');
   const again = await service.requestEvent('epl:101');
   assert.equal(again.id, request.id, 'requesting twice returns the same request');
 
@@ -191,7 +181,6 @@ test('usenet approvals go to SABnzbd and a failed job can pick another release',
   const env = await setup();
   t.after(() => env.cleanup());
   const { service, store, fake } = env;
-  await service.syncEvents();
   const request = await service.requestEvent('epl:101');
   await service.searchRequest(request.id);
   const usenet = store.listCandidates(request.id).find((c) => c.protocol === 'usenet' && c.decision === 'matched');
@@ -253,7 +242,6 @@ test('a qBittorrent API key is used instead of logging in', async (t) => {
   t.after(() => env.cleanup());
   const { service, store, fake } = env;
   saveSettings(store, { qbittorrent: { apiKey: 'qbt_testkey1234567890123456789', password: 'wrong' } });
-  await service.syncEvents();
   const request = await service.requestEvent('epl:101');
   await service.searchRequest(request.id);
   const torrent = store.listCandidates(request.id).find((c) => c.protocol === 'torrent' && c.decision === 'matched');
@@ -282,7 +270,6 @@ test('every configured indexer is searched, and Easynews results download throug
     { id: 'en', type: 'easynews', name: 'Easynews', username: 'en-user', password: 'en-pass', downloadFolder: easynewsFolder, maxQueries: 1 },
     { id: 'off', type: 'prowlarr', name: 'Disabled', url: fake.base, apiKey: 'nope', enabled: false },
   ] });
-  await service.syncEvents();
   const request = await service.requestEvent('epl:101');
   await service.searchRequest(request.id);
 

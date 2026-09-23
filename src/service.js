@@ -1,4 +1,3 @@
-import * as sssAdapter from './adapters/sss.js';
 import * as prowlarrAdapter from './adapters/prowlarr.js';
 import * as qbittorrentAdapter from './adapters/qbittorrent.js';
 import * as sabnzbdAdapter from './adapters/sabnzbd.js';
@@ -8,6 +7,7 @@ import { configurePromotions, evaluate, promotionFor, promotions, searchTitles }
 import { ImportError, importDownload } from './importer.js';
 import { scoreCandidate } from './scoring.js';
 import { indexerReady, loadSettings, mapRemotePath } from './settings.js';
+import { createMetadata } from './metadata/manager.js';
 
 export class UserError extends Error {
   constructor(message, status = 400) {
@@ -32,11 +32,15 @@ const QUERY_PAUSE_MS = { easynews: 800 };
 
 export function createService(store, overrides = {}) {
   const adapters = {
-    sss: sssAdapter, prowlarr: prowlarrAdapter, bitmagnet: bitmagnetAdapter, easynews: easynewsAdapter,
+    prowlarr: prowlarrAdapter, bitmagnet: bitmagnetAdapter, easynews: easynewsAdapter,
     qbittorrent: qbittorrentAdapter, sabnzbd: sabnzbdAdapter,
     ...overrides.adapters,
   };
   const clock = overrides.now || (() => new Date());
+  const metadata = overrides.metadata || createMetadata(store, {
+    settings: () => loadSettings(store), logoDir: overrides.logoDir || 'data/logos', clock,
+    ...(overrides.fetchEvents ? { fetchEvents: overrides.fetchEvents } : {}),
+  });
   const iso = (offsetMs = 0) => new Date(clock().getTime() + offsetMs).toISOString();
 
   configurePromotions(store);
@@ -82,27 +86,11 @@ export function createService(store, overrides = {}) {
     },
 
     // --- metadata -------------------------------------------------------
-    async syncEvents() {
-      const settings = loadSettings(store);
-      const events = await adapters.sss.listEvents(settings.sss, { today: clock() });
-      let count = 0;
-      for (const item of events) {
-        const promotion = promotions.getByEventId(item.id);
-        const existing = store.getEvent(item.id);
-        store.upsertEvent({
-          id: item.id,
-          promotionId: promotion?.id || existing?.promotionId || null,
-          title: item.title,
-          date: item.date,
-          time: existing?.time || null,
-          aliases: existing?.aliases || [],
-          source: 'sss',
-          sourceRevision: item.catalog,
-        });
-        count += 1;
-      }
-      store.log('metadata', `Imported ${count} events from SSS`);
-      return { count };
+    metadata,
+
+    // Refresh followed promotions in the background; progress via metadata.status().
+    syncEvents(ids) {
+      return metadata.refresh(ids);
     },
 
     addManualEvent({ promotionId, title, date, time, aliases }) {
@@ -125,19 +113,10 @@ export function createService(store, overrides = {}) {
 
     // --- requests -------------------------------------------------------
     async requestEvent(eventId) {
-      let event = store.getEvent(String(eventId || ''));
+      const event = store.getEvent(String(eventId || ''));
       if (!event) throw new UserError('Event not found.', 404);
       const owned = store.libraryFor(event.id);
       if (owned) throw new UserError('This event is already in your library.', 409);
-      if (event.source === 'sss') {
-        // Aliases and the exact start time live on the SSS detail record.
-        try {
-          const detail = await adapters.sss.fetchEventDetail(loadSettings(store).sss, event.id);
-          if (detail) event = store.upsertEvent({ ...event, ...detail, title: detail.title || event.title, date: detail.date || event.date });
-        } catch (error) {
-          store.log('warning', `Could not refresh ${event.title} from SSS: ${error.message}`);
-        }
-      }
       const { request, created } = store.createRequest(event.id);
       if (!created) return request;
       store.setStatus(request.id, 'wanted', { nextSearchAt: firstSearchAt(event) });
@@ -345,7 +324,11 @@ export function createService(store, overrides = {}) {
       const settings = loadSettings(store);
       const issues = [];
       const add = (type, message, link) => issues.push({ type, message, link });
-      if (!settings.sss.manifestUrl) add('warning', 'No SSS install is connected, so events must be added by hand', 'settings/metadata');
+      const followed = metadata.list().filter((p) => p.followed);
+      if (!followed.length) add('warning', 'No promotions are followed yet; add some under Metadata › Promotions', 'metadata/promotions');
+      for (const promotion of followed.filter((p) => p.refreshError)) {
+        add('warning', `${promotion.name}: ${promotion.refreshError}`, 'metadata/promotions');
+      }
       if (!settings.indexers.some(indexerReady)) add('error', 'No indexer is configured; searches cannot run', 'settings/indexers');
       for (const indexer of settings.indexers.filter((i) => i.type === 'easynews' && indexerReady(i) && !i.downloadFolder)) {
         add('warning', `${indexer.name} has no download folder, so its results cannot be grabbed`, 'settings/indexers');
@@ -364,7 +347,7 @@ export function createService(store, overrides = {}) {
     tasks() {
       const last = store.getSetting('tasks', {});
       return [
-        { name: 'sync-events', title: 'Refresh Events', interval: 'Manual', lastRun: last['sync-events'] || null },
+        { name: 'sync-events', title: 'Refresh Metadata', interval: `${loadSettings(store).metadata.refreshHours || 'Manual'}${loadSettings(store).metadata.refreshHours ? ' hours' : ''}`, lastRun: metadata.status().finishedAt || null },
         { name: 'search-missing', title: 'Search Missing', interval: '30 seconds (due requests)', lastRun: last['search-missing'] || null },
         { name: 'check-downloads', title: 'Check For Finished Downloads', interval: '30 seconds', lastRun: last['check-downloads'] || null },
       ];
@@ -372,7 +355,7 @@ export function createService(store, overrides = {}) {
 
     async runTask(name) {
       const record = () => store.setSetting('tasks', { ...store.getSetting('tasks', {}), [name]: iso() });
-      if (name === 'sync-events') { const result = await service.syncEvents(); record(); return result; }
+      if (name === 'sync-events') { const result = service.syncEvents(); record(); return result; }
       if (name === 'search-missing') {
         const count = store.markAllDue(iso());
         store.log('search', `Search queued for ${count} missing request${count === 1 ? '' : 's'}`);
@@ -391,6 +374,7 @@ export function createService(store, overrides = {}) {
 
     // --- worker ---------------------------------------------------------
     async tick() {
+      metadata.maybeAutoRefresh();
       for (const request of store.dueForSearch(iso()).slice(0, 3)) {
         try { await service.searchRequest(request.id); }
         catch (error) {

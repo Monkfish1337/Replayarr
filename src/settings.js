@@ -1,7 +1,12 @@
 import { randomUUID } from 'node:crypto';
 
 export const DEFAULTS = {
-  sss: { manifestUrl: '', lookbackDays: 30, lookaheadDays: 7 },
+  // Schedule metadata. TheSportsDB's free key is public; the others are
+  // needed only by promotions whose provider uses that service.
+  metadata: {
+    tsdbApiKey: '123', footballDataApiKey: '', apiFootballApiKey: '', tmdbApiKey: '',
+    daysBack: 30, daysAhead: 90, refreshHours: 6,
+  },
   // Search sources, like Sonarr's indexer list. See INDEXER_TYPES.
   indexers: [],
   qbittorrent: { url: '', apiKey: '', username: '', password: '', category: 'replayarr' },
@@ -28,7 +33,8 @@ export const INDEXER_TYPES = {
 const INDEXER_NAMES = { prowlarr: 'Prowlarr', bitmagnet: 'Bitmagnet', easynews: 'Easynews' };
 const INDEXER_SECRETS = ['apiKey', 'password'];
 
-const SECRETS = [['qbittorrent', 'apiKey'], ['qbittorrent', 'password'], ['sabnzbd', 'apiKey']];
+const SECRETS = [['qbittorrent', 'apiKey'], ['qbittorrent', 'password'], ['sabnzbd', 'apiKey'],
+  ['metadata', 'footballDataApiKey'], ['metadata', 'apiFootballApiKey'], ['metadata', 'tmdbApiKey']];
 export const MASK = '••••••••';
 
 export function loadSettings(store) {

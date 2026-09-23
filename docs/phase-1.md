@@ -4,7 +4,7 @@
 
 | Table | Key fields | Purpose |
 | --- | --- | --- |
-| `events` | id (`<promotion prefix>:<id>`), promotion, title, date, time, aliases, source | Stable identity independent of release naming |
+| `events` | id (`<promotion prefix>:<id>`), promotion, title, date, time, aliases, source, payload (full normalised record) | Stable identity independent of release naming |
 | `requests` | event (unique), status, chosen candidate, search count, next search, error | One acquisition intent per event |
 | `search_attempts` | request, queries, results, matched, duration, error | Explains gaps and bounds indexer load |
 | `candidates` | request, identity (btih or guid), title, protocol, size, score, decision, reason, evidence | Review and duplicate suppression |
@@ -12,6 +12,8 @@
 | `library` | event (unique), path, size, quality, release title | What is actually on disk |
 | `activity` | request, kind, text | History and System › Events |
 | `promotion_rules` | promotion id, kind (`custom`/`overlay`), spec | Operator-learned matching rules |
+| `promotion_meta` | promotion id, followed, provider, start date, logo, last refresh result | Metadata choices per promotion |
+| `providers` | id, name, source | User-created schedule providers |
 
 Schema changes are appended to `MIGRATIONS` in `src/db.js`; `PRAGMA user_version` records how many have run.
 
@@ -37,13 +39,19 @@ All routes are under `/api`. Writes must be `application/json`, which a cross-si
 | --- | --- | --- |
 | GET | `/promotions` | Promotions with event/request/library counts |
 | GET/POST | `/events` | List (`q`, `promotion`, `from`, `to`) / add manually |
-| POST | `/events/sync` | Import from SSS |
+| POST | `/events/sync`, `/metadata/refresh` | Refresh followed promotions (or `{ ids }`) in the background |
+| GET | `/metadata/status` | Refresh progress |
+| PUT | `/metadata/promotions/:id` | `followed`, `providerId`, `startDate`, `logoUrl` |
+| GET | `/metadata/promotions/:id/logos?q=` | Logo candidates |
+| POST | `/metadata/promotions/:id/logo` | Upload a logo (`{ dataUrl }`, 2 MB max) |
+| GET/POST/DELETE | `/metadata/providers[/:id]` | List, create, delete providers |
+| POST | `/metadata/providers/preview` | Test a provider (`{ providerId }` or a draft) and show sample events |
 | GET/POST | `/requests` | List / request an event (idempotent) |
 | GET/DELETE | `/requests/:id` | Detail with candidates and searches / remove |
 | POST | `/requests/:id/search`, `/approve`, `/retry` | Search now, send a candidate, retry a failure |
 | GET | `/queue`, `/activity`, `/library`, `/health` | Activity, history, library, health checks |
 | GET/PUT | `/settings` | Secrets are masked on read and preserved when the mask is sent back |
-| POST | `/settings/test/:service` | `sss`, `qbittorrent`, `sabnzbd` |
+| POST | `/settings/test/:service` | `qbittorrent`, `sabnzbd` |
 | POST | `/indexers/test` | Test an indexer entry as entered (masked secrets use the saved value) |
 | PUT/DELETE | `/promotion-rules[/:id]` | Custom promotions and alias overlays |
 | POST | `/promotion-rules/suggest` | SSS alias learner |
@@ -53,7 +61,7 @@ All routes are under `/api`. Writes must be `application/json`, which a cross-si
 
 - One file per event. Multi-part releases (prelims and main card as separate files) import only the largest part.
 - No automatic grab, quality profiles or upgrades.
-- The SSS catalog is the only metadata feed; events outside its catalogs must be added manually.
+- TheSportsDB refreshes are slow (rate limited, walked round by round); keep start dates recent.
 - SQLite cannot open databases on Windows paths longer than 260 characters; keep `REPLAYARR_DB` short.
 
 ## Next

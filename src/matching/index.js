@@ -27,8 +27,14 @@ export function promotionFor(event) {
 
 // The SSS matchers read SSS's event shape. Replayarr keeps its own record and
 // translates at this one boundary.
+// Events fetched by Replayarr keep the full normalised record (team names,
+// week, season, round...) in `payload`, which the matchers use.
 export function matcherEvent(event) {
-  return { id: event.id, name: event.title, date: event.date, time: event.time, aliases: event.aliases || [], searchAliases: event.aliases || [] };
+  return {
+    ...(event.payload || {}),
+    id: event.id, name: event.title, date: event.date, time: event.payload?.time || event.time,
+    aliases: event.aliases || [], searchAliases: event.aliases || [],
+  };
 }
 
 export function searchTitles(event, limit = 6) {
