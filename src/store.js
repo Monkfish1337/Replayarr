@@ -47,7 +47,7 @@ function requestRow(row) {
 function candidateRow(row) {
   if (!row) return null;
   return {
-    id: row.id, requestId: row.request_id, identity: row.identity, source: row.source, indexer: row.indexer,
+    id: row.id, requestId: row.request_id, identity: row.identity, source: row.source, sourceId: row.source_id, indexer: row.indexer,
     protocol: row.protocol, title: row.title, downloadUrl: row.download_url, infoHash: row.info_hash,
     size: row.size, seeders: row.seeders, quality: row.quality, score: row.score, decision: row.decision,
     reason: row.reason, evidence: json(row.evidence, []), publishedAt: row.published_at, foundAt: row.found_at,
@@ -174,15 +174,15 @@ export function createStore(db) {
     // Re-finding a release refreshes its score and verdict but keeps its id,
     // so an approval the operator is looking at never points at a new row.
     saveCandidates(requestId, candidates) {
-      const insert = q(`INSERT INTO candidates (request_id, identity, source, indexer, protocol, title, download_url, info_hash,
+      const insert = q(`INSERT INTO candidates (request_id, identity, source, source_id, indexer, protocol, title, download_url, info_hash,
                           size, seeders, quality, score, decision, reason, evidence, published_at, found_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT (request_id, identity) DO UPDATE SET download_url = excluded.download_url,
-                          seeders = excluded.seeders, score = excluded.score, decision = excluded.decision,
+                          source = excluded.source, source_id = excluded.source_id, seeders = excluded.seeders, score = excluded.score, decision = excluded.decision,
                           reason = excluded.reason, evidence = excluded.evidence, found_at = excluded.found_at`);
       transaction(db, () => {
         for (const c of candidates) {
-          insert.run(requestId, c.identity, c.source, c.indexer || null, c.protocol, c.title, c.downloadUrl || null,
+          insert.run(requestId, c.identity, c.source, c.sourceId || null, c.indexer || null, c.protocol, c.title, c.downloadUrl || null,
             c.infoHash || null, c.size ?? null, c.seeders ?? null, c.quality || null, c.score, c.decision,
             c.reason || null, JSON.stringify(c.evidence || []), c.publishedAt || null, now());
         }

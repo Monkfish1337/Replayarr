@@ -100,6 +100,8 @@ const MIGRATIONS = [
      spec TEXT NOT NULL,
      updated_at TEXT NOT NULL
    );`,
+  // Which configured indexer found a candidate; Easynews downloads need its credentials.
+  `ALTER TABLE candidates ADD COLUMN source_id TEXT;`,
 ];
 
 export function openDatabase(file) {

@@ -27,13 +27,27 @@ test('writes must be JSON, so a cross-site form cannot trigger them', async (t) 
 
 test('secrets are masked on read and kept when the mask is saved back', async (t) => {
   const { call, json } = await start(t);
-  await json('PUT', '/settings', { prowlarr: { url: 'http://prowlarr:9696', apiKey: 'secret-key' } });
+  await json('PUT', '/settings', { indexers: [
+    { id: 'torrents', type: 'prowlarr', name: 'Prowlarr', url: 'http://prowlarr:9696', apiKey: 'secret-key' },
+    { id: 'usenet', type: 'prowlarr', name: 'Prowlarr (Usenet)', url: 'http://prowlarr-usenet:9797', apiKey: 'other-key' },
+  ] });
   const { settings } = await (await call('/settings')).json();
-  assert.equal(settings.prowlarr.apiKey, MASK);
+  assert.deepEqual(settings.indexers.map((i) => i.apiKey), [MASK, MASK]);
+  settings.indexers[1].name = 'Usenet';
   const saved = await (await json('PUT', '/settings', settings)).json();
-  assert.equal(saved.prowlarr.apiKey, MASK);
+  assert.equal(saved.indexers[1].name, 'Usenet');
+  assert.equal(saved.indexers[1].apiKey, MASK);
   const health = await (await call('/health')).json();
-  assert.ok(!health.some((issue) => /Prowlarr/.test(issue.message)), 'the key survived the round trip');
+  assert.ok(!health.some((issue) => /indexer/i.test(issue.message)), 'the keys survived the round trip');
+});
+
+test('a single saved Prowlarr from before indexer lists is carried over', async () => {
+  const store = createStore(openDatabase(':memory:'));
+  store.setSetting('config', { prowlarr: { url: 'http://prowlarr:9696', apiKey: 'old-key', maxQueries: 4 } });
+  const { indexers } = createService(store).settings();
+  assert.equal(indexers.length, 1);
+  assert.deepEqual({ type: indexers[0].type, url: indexers[0].url, apiKey: indexers[0].apiKey, maxQueries: indexers[0].maxQueries },
+    { type: 'prowlarr', url: 'http://prowlarr:9696', apiKey: 'old-key', maxQueries: 4 });
 });
 
 test('manual events are validated and matched to their promotion', async (t) => {

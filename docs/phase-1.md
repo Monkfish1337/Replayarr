@@ -43,7 +43,8 @@ All routes are under `/api`. Writes must be `application/json`, which a cross-si
 | POST | `/requests/:id/search`, `/approve`, `/retry` | Search now, send a candidate, retry a failure |
 | GET | `/queue`, `/activity`, `/library`, `/health` | Activity, history, library, health checks |
 | GET/PUT | `/settings` | Secrets are masked on read and preserved when the mask is sent back |
-| POST | `/settings/test/:service` | `sss`, `prowlarr`, `qbittorrent`, `sabnzbd` |
+| POST | `/settings/test/:service` | `sss`, `qbittorrent`, `sabnzbd` |
+| POST | `/indexers/test` | Test an indexer entry as entered (masked secrets use the saved value) |
 | PUT/DELETE | `/promotion-rules[/:id]` | Custom promotions and alias overlays |
 | POST | `/promotion-rules/suggest` | SSS alias learner |
 | GET/POST | `/system/tasks[/:name]` | `sync-events`, `search-missing`, `check-downloads` |
@@ -60,4 +61,3 @@ All routes are under `/api`. Writes must be `application/json`, which a cross-si
 1. Automatic grab above a score threshold per promotion, still logging the evidence.
 2. Quality profiles and upgrade monitoring.
 3. Media-server notifications (Plex/Jellyfin library refresh).
-4. Bitmagnet as a second search source.

@@ -27,7 +27,7 @@ Open [http://localhost:4173](http://localhost:4173), then go to **Settings** and
 | Settings page | What to enter |
 | --- | --- |
 | Metadata Source | Your SSS addon install URL (ends in `/manifest.json`, from your SSS account page) |
-| Indexers | Prowlarr URL and API key |
+| Indexers | Any mix of Prowlarr instances, Bitmagnet and Easynews |
 | Download Clients | qBittorrent and/or SABnzbd, plus remote path mappings if they run in other containers |
 | Media Management | The library folder Plex, Jellyfin or Emby scans, and the naming pattern |
 
@@ -57,9 +57,9 @@ Event ─▶ Request (wanted) ─▶ Search ─▶ Candidates ─▶ Review ─�
 ```
 
 - **Events** come from SSS's existing addon catalog (read-only) or are added by hand. Requesting one fetches its aliases and start time from SSS.
-- **Searching** waits until 3 hours after the event starts, then runs the promotion's search titles through Prowlarr, most precise first, up to *Queries Per Search*. When nothing matches it backs off: 30 minutes, 2, 6 and 12 hours, then daily.
+- **Searching** waits until 3 hours after the event starts, then sends the promotion's search titles to every enabled indexer, most precise first, up to each indexer's *Queries Per Search*. Indexers can be any number of Prowlarr instances, Bitmagnet (GraphQL, ordered by seeders) and Easynews. A release reported by several indexers is listed once. When nothing matches it backs off: 30 minutes, 2, 6 and 12 hours, then daily.
 - **Candidates** pass SSS's release filter and the promotion's matcher. Rejected releases stay visible in Interactive Search with the reason, such as `wrong-date` or `sports-noise`, but cannot be grabbed. Matches are scored from quality, source, seeders and protocol, and each score shows how it was reached.
-- **Review** is manual in Phase 1: choose a release from Interactive Search. A torrent goes to qBittorrent and an NZB to SABnzbd.
+- **Review** is manual in Phase 1: choose a release from Interactive Search. A torrent goes to qBittorrent and an NZB to SABnzbd. An Easynews result is a single file over HTTPS, so Replayarr's built-in downloader fetches it into that indexer's download folder (two at a time, resuming after a restart); Easynews credentials only ever go to easynews.com.
 - **Import** uses the largest non-sample video. It checks the minimum size and that the file name does not name a different date or event. It then hardlinks, copies or moves the file to `{promotion}/Season {year}/{promotion} - {date} - {title} [{quality}]`. Imports are idempotent, and a half-copied file never appears under its final name.
 
 State lives in SQLite. Request status changes only through an explicit transition table, so no code path can mark a request ready without an import.

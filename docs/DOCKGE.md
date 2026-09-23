@@ -29,7 +29,9 @@ On the shared network, use container names:
 | Setting | Example |
 | --- | --- |
 | Metadata Source › Install URL | Your SSS addon URL from the SSS account page. `http://serioussportsync:7000/u/…/manifest.json` if SSS is on the same network |
-| Indexers › Prowlarr URL | `http://gluetun:9696` if Prowlarr runs behind Gluetun, otherwise `http://prowlarr:9696` |
+| Indexers › Prowlarr | `http://prowlarr:9696`; add a second Prowlarr entry for a separate Usenet instance, e.g. `http://prowlarr-usenet:9797` |
+| Indexers › Bitmagnet | `http://gluetun:3333` when Bitmagnet shares Gluetun's network, otherwise `http://bitmagnet:3333` |
+| Indexers › Easynews | Your Easynews username and password, and a download folder such as `/data/downloads/easynews` |
 | Download Clients | `http://qbittorrent:8080`, `http://sabnzbd:8080`. For qBittorrent 5.2 or newer, use its API key (Options › WebUI › API Key) instead of a username and password |
 | Media Management › Library Folder | `/data/media/sports` (a folder under `DATA_ROOT`) |
 

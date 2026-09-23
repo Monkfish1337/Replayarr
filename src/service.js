@@ -2,10 +2,12 @@ import * as sssAdapter from './adapters/sss.js';
 import * as prowlarrAdapter from './adapters/prowlarr.js';
 import * as qbittorrentAdapter from './adapters/qbittorrent.js';
 import * as sabnzbdAdapter from './adapters/sabnzbd.js';
+import * as bitmagnetAdapter from './adapters/bitmagnet.js';
+import * as easynewsAdapter from './adapters/easynews.js';
 import { configurePromotions, evaluate, promotionFor, promotions, searchTitles } from './matching/index.js';
 import { ImportError, importDownload } from './importer.js';
 import { scoreCandidate } from './scoring.js';
-import { loadSettings, mapRemotePath } from './settings.js';
+import { indexerReady, loadSettings, mapRemotePath } from './settings.js';
 
 export class UserError extends Error {
   constructor(message, status = 400) {
@@ -21,12 +23,17 @@ const BACKOFF_MINUTES = [30, 120, 360, 720, 1440];
 const MISSING_JOB_GRACE_MS = 10 * MINUTE;
 const MAX_REJECTED_KEPT = 60;
 
-const CLIENT_FOR = { torrent: 'qbittorrent', usenet: 'sabnzbd' };
-const CLIENT_NAMES = { qbittorrent: 'qBittorrent', sabnzbd: 'SABnzbd' };
+// Easynews results are direct HTTPS files, fetched by the built-in downloader
+// in adapters/easynews.js using the credentials of the indexer that found them.
+const CLIENT_FOR = { torrent: 'qbittorrent', usenet: 'sabnzbd', easynews: 'easynews' };
+const CLIENT_NAMES = { qbittorrent: 'qBittorrent', sabnzbd: 'SABnzbd', easynews: 'Easynews' };
+// Easynews asks for a pause between queries; the others take them back to back.
+const QUERY_PAUSE_MS = { easynews: 800 };
 
 export function createService(store, overrides = {}) {
   const adapters = {
-    sss: sssAdapter, prowlarr: prowlarrAdapter, qbittorrent: qbittorrentAdapter, sabnzbd: sabnzbdAdapter,
+    sss: sssAdapter, prowlarr: prowlarrAdapter, bitmagnet: bitmagnetAdapter, easynews: easynewsAdapter,
+    qbittorrent: qbittorrentAdapter, sabnzbd: sabnzbdAdapter,
     ...overrides.adapters,
   };
   const clock = overrides.now || (() => new Date());
@@ -44,9 +51,18 @@ export function createService(store, overrides = {}) {
     return promotionFor(event)?.name || 'Sports';
   }
 
-  function clientConfigured(settings, client) {
+  function clientConfigured(settings, client, sourceId) {
+    if (client === 'easynews') return !!clientConfig(settings, client, sourceId)?.downloadFolder;
     const config = settings[client];
     return client === 'qbittorrent' ? !!config.url : !!(config.url && config.apiKey);
+  }
+
+  // The settings a download client runs with. Easynews downloads use the
+  // Easynews indexer they came from; its id is the first part of a job's
+  // remote id.
+  function clientConfig(settings, client, sourceId) {
+    if (client !== 'easynews') return settings[client];
+    return settings.indexers.find((i) => i.type === 'easynews' && i.id === sourceId) || null;
   }
 
   // Searching before an event has finished only returns older fixtures.
@@ -137,20 +153,35 @@ export function createService(store, overrides = {}) {
       const settings = loadSettings(store);
       request = store.setStatus(request.id, 'searching', { searchCount: request.searchCount + 1 });
 
-      const queries = searchTitles(event, settings.prowlarr.maxQueries);
-      const started = Date.now();
+      const indexers = settings.indexers.filter(indexerReady);
       const found = new Map();
       const errors = [];
-      for (const query of queries) {
-        try {
-          for (const result of await adapters.prowlarr.search(settings.prowlarr, query)) {
-            if (!found.has(result.identity)) found.set(result.identity, result);
+      const attempts = [];
+      if (!indexers.length) errors.push('No indexer is configured; add one under Settings › Indexers');
+      // Each indexer gets the promotion's search titles, most precise first,
+      // up to its own query budget. The first indexer to report a release
+      // (by info hash or indexer guid) keeps it.
+      for (const indexer of indexers) {
+        const queries = searchTitles(event, indexer.maxQueries);
+        const attempt = { source: indexer.name, queries, started: Date.now(), results: 0, error: null, found: [] };
+        for (const [index, query] of queries.entries()) {
+          if (index && QUERY_PAUSE_MS[indexer.type]) await new Promise((r) => setTimeout(r, QUERY_PAUSE_MS[indexer.type]));
+          try {
+            for (const result of await adapters[indexer.type].search(indexer, query)) {
+              attempt.results += 1;
+              if (found.has(result.identity)) continue;
+              const tagged = { ...result, source: indexer.name, sourceId: indexer.id };
+              found.set(result.identity, tagged);
+              attempt.found.push(tagged);
+            }
+          } catch (error) {
+            attempt.error ||= error.message;
+            // A configuration problem fails every query the same way.
+            if (/not configured|rejected|HTTP 401|HTTP 403/.test(error.message)) break;
           }
-        } catch (error) {
-          errors.push(error.message);
-          // A configuration problem fails every query the same way.
-          if (/not configured|HTTP 401|HTTP 403/.test(error.message)) break;
         }
+        if (attempt.error) errors.push(attempt.error);
+        attempts.push(attempt);
       }
 
       const verify = (title) => evaluate(title, event);
@@ -159,7 +190,7 @@ export function createService(store, overrides = {}) {
         const { score, quality, evidence } = scoreCandidate(result, {
           verdict, preferences: settings.preferences, minSizeMb: settings.library.minSizeMb,
         });
-        if (verdict.ok && !clientConfigured(settings, CLIENT_FOR[result.protocol])) {
+        if (verdict.ok && !clientConfigured(settings, CLIENT_FOR[result.protocol], result.sourceId)) {
           evidence.push(`No ${CLIENT_NAMES[CLIENT_FOR[result.protocol]]} connection configured`);
         }
         return { ...result, score, quality, evidence, decision: verdict.ok ? 'matched' : 'rejected', reason: verdict.ok ? null : `${verdict.stage}: ${verdict.reason}` };
@@ -167,10 +198,17 @@ export function createService(store, overrides = {}) {
       const matched = scored.filter((c) => c.decision === 'matched');
       const rejected = scored.filter((c) => c.decision === 'rejected').slice(0, MAX_REJECTED_KEPT);
       store.saveCandidates(request.id, [...matched, ...rejected]);
-      store.recordSearch({
-        requestId: request.id, source: 'Prowlarr', queries, resultCount: found.size, matchedCount: matched.length,
-        durationMs: Date.now() - started, error: errors.length ? errors[0] : null,
-      });
+      const matchedIds = new Set(matched.map((c) => c.identity));
+      for (const attempt of attempts) {
+        store.recordSearch({
+          requestId: request.id, source: attempt.source, queries: attempt.queries, resultCount: attempt.results,
+          matchedCount: attempt.found.filter((c) => matchedIds.has(c.identity)).length,
+          durationMs: Date.now() - attempt.started, error: attempt.error,
+        });
+      }
+      if (!attempts.length) {
+        store.recordSearch({ requestId: request.id, source: 'None', queries: [], resultCount: 0, matchedCount: 0, durationMs: 0, error: errors[0] });
+      }
 
       const everyQueryFailed = errors.length > 0 && found.size === 0;
       if (matched.length || store.listCandidates(request.id).some((c) => c.decision === 'matched')) {
@@ -193,13 +231,20 @@ export function createService(store, overrides = {}) {
       if (candidate.decision !== 'matched') throw new UserError('Only a release that matched this event can be sent.');
       const settings = loadSettings(store);
       const client = CLIENT_FOR[candidate.protocol];
-      if (!clientConfigured(settings, client)) throw new UserError(`Connect ${CLIENT_NAMES[client]} in Settings first.`);
+      if (client === 'easynews' && !clientConfig(settings, client, candidate.sourceId)) {
+        throw new UserError('The Easynews indexer that found this release has been removed; search again.');
+      }
+      if (!clientConfigured(settings, client, candidate.sourceId)) {
+        throw new UserError(client === 'easynews'
+          ? 'Set a download folder for Easynews under Settings › Indexers first.'
+          : `Connect ${CLIENT_NAMES[client]} in Settings first.`);
+      }
       const event = store.getEvent(request.eventId);
       if (request.status === 'failed') store.setStatus(request.id, 'review');
 
       const job = store.createJob({ requestId: request.id, candidateId: candidate.id, client, state: 'submitting' });
       try {
-        const { remoteId } = await adapters[client].add(settings[client], candidate, { tag: `replayarr-${job.id}` });
+        const { remoteId } = await adapters[client].add(clientConfig(settings, client, candidate.sourceId), candidate, { tag: `replayarr-${job.id}` });
         store.updateJob(job.id, { remoteId, state: 'queued' });
       } catch (error) {
         store.updateJob(job.id, { state: 'failed', error: error.message });
@@ -217,7 +262,9 @@ export function createService(store, overrides = {}) {
         const event = store.getEvent(store.getRequest(job.requestId).eventId);
         let remote;
         try {
-          remote = await adapters[job.client].status(settings[job.client], job.remoteId);
+          const config = clientConfig(settings, job.client, String(job.remoteId).split('|')[0]);
+          if (!config) throw new Error('its Easynews indexer has been removed from Settings');
+          remote = await adapters[job.client].status(config, job.remoteId);
         } catch (error) {
           store.updateJob(job.id, { error: error.message });
           continue;
@@ -299,7 +346,10 @@ export function createService(store, overrides = {}) {
       const issues = [];
       const add = (type, message, link) => issues.push({ type, message, link });
       if (!settings.sss.manifestUrl) add('warning', 'No SSS install is connected, so events must be added by hand', 'settings/metadata');
-      if (!settings.prowlarr.url || !settings.prowlarr.apiKey) add('error', 'Prowlarr is not configured; searches cannot run', 'settings/indexers');
+      if (!settings.indexers.some(indexerReady)) add('error', 'No indexer is configured; searches cannot run', 'settings/indexers');
+      for (const indexer of settings.indexers.filter((i) => i.type === 'easynews' && indexerReady(i) && !i.downloadFolder)) {
+        add('warning', `${indexer.name} has no download folder, so its results cannot be grabbed`, 'settings/indexers');
+      }
       if (!clientConfigured(settings, 'qbittorrent') && !clientConfigured(settings, 'sabnzbd')) add('error', 'No download client is configured', 'settings/downloadclients');
       if (!settings.library.root) add('error', 'No library folder is set; completed downloads cannot be imported', 'settings/mediamanagement');
       for (const job of store.queue().filter((j) => j.error && !['failed', 'completed'].includes(j.state))) {

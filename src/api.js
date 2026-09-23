@@ -1,6 +1,6 @@
 import { TransitionError } from './store.js';
 import { UserError } from './service.js';
-import { loadSettings, publicSettings, saveSettings } from './settings.js';
+import { indexerReady, loadSettings, MASK, publicSettings, saveSettings } from './settings.js';
 import { listPromotions, promotionAliases } from './matching/index.js';
 
 const MAX_BODY = 256 * 1024;
@@ -94,9 +94,19 @@ export function createApi(service, { testers, version = '', databasePath = '' })
     ['GET', /^\/api\/library$/, () => store.listLibrary().map((item) => ({ ...item, event: store.getEvent(item.eventId) }))],
     ['GET', /^\/api\/settings$/, () => ({ settings: publicSettings(loadSettings(store)), rules: store.listPromotionRules() })],
     ['PUT', /^\/api\/settings$/, (_m, body) => publicSettings(saveSettings(store, body))],
-    ['POST', /^\/api\/settings\/test\/(sss|prowlarr|qbittorrent|sabnzbd)$/, async ([, name]) => {
+    ['POST', /^\/api\/settings\/test\/(sss|qbittorrent|sabnzbd)$/, async ([, name]) => {
       const settings = loadSettings(store);
       return { ok: true, message: await testers[name](settings[name]) };
+    }],
+    // Tests the indexer as entered in the edit dialog, before it is saved. A
+    // masked secret means "unchanged", so the saved value is used.
+    ['POST', /^\/api\/indexers\/test$/, async (_m, body) => {
+      const saved = loadSettings(store).indexers.find((i) => i.id === body.id) || {};
+      const indexer = { ...body };
+      for (const key of ['apiKey', 'password']) if (indexer[key] === MASK) indexer[key] = saved[key] || '';
+      const tester = testers[indexer.type];
+      if (!tester) throw new UserError('Unknown indexer type.');
+      return { ok: true, message: await tester({ ...saved, ...indexer }) };
     }],
     // SSS's alias learner: turn good/bad example release names into rules.
     ['POST', /^\/api\/promotion-rules\/suggest$/, (_m, body) => promotionAliases.suggestPromotionSetup(
@@ -125,7 +135,7 @@ export function createApi(service, { testers, version = '', databasePath = '' })
 function configuredServices(settings) {
   return {
     sss: !!settings.sss.manifestUrl,
-    prowlarr: !!(settings.prowlarr.url && settings.prowlarr.apiKey),
+    indexers: settings.indexers.some(indexerReady),
     qbittorrent: !!settings.qbittorrent.url,
     sabnzbd: !!(settings.sabnzbd.url && settings.sabnzbd.apiKey),
     library: !!settings.library.root,

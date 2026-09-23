@@ -9,6 +9,8 @@ import { createService, startWorker } from './src/service.js';
 import { createApi } from './src/api.js';
 import * as sss from './src/adapters/sss.js';
 import * as prowlarr from './src/adapters/prowlarr.js';
+import * as bitmagnet from './src/adapters/bitmagnet.js';
+import * as easynews from './src/adapters/easynews.js';
 import * as qbittorrent from './src/adapters/qbittorrent.js';
 import * as sabnzbd from './src/adapters/sabnzbd.js';
 
@@ -37,6 +39,8 @@ const api = createApi(service, {
   testers: {
     sss: async (config) => `SSS ${(await sss.fetchManifest(config)).name || 'addon'} reachable`,
     prowlarr: prowlarr.testConnection,
+    bitmagnet: bitmagnet.testConnection,
+    easynews: easynews.testConnection,
     qbittorrent: qbittorrent.testConnection,
     sabnzbd: sabnzbd.testConnection,
   },

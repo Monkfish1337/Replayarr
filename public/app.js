@@ -11,6 +11,16 @@ const icon = (name) => `<svg viewBox="0 0 24 24" aria-hidden="true"><use href="#
 const today = () => new Date().toISOString().slice(0, 10);
 
 let promotionsCache = [];
+let indexersCache = [];
+
+// Sonarr-style indexer types: what each needs and how it is described.
+const INDEXER_TYPES = {
+  prowlarr: { label: 'Prowlarr', protocol: 'Torrent / Usenet', about: 'Searches every indexer in one Prowlarr instance. Add a second entry for a separate Usenet Prowlarr.' },
+  bitmagnet: { label: 'Bitmagnet', protocol: 'Torrent', about: 'Your local DHT index. Fast, returns info hashes directly; results go to qBittorrent.' },
+  easynews: { label: 'Easynews', protocol: 'Direct download', about: 'Searches Easynews and downloads matches directly over HTTPS with the built-in downloader.' },
+};
+const PROTOCOL_LABELS = { torrent: ['torrent', 'label-success'], usenet: ['nzb', 'label-info'], easynews: ['easynews', 'label-purple'] };
+const CLIENT_LABELS = { qbittorrent: 'qBittorrent', sabnzbd: 'SABnzbd', easynews: 'Easynews' };
 let pollTimer = null;
 let renderToken = 0;
 
@@ -307,7 +317,7 @@ const pages = {
         return `<tr><td class="narrow">${job.error ? `<span class="rejection" tabindex="0">${icon('warning')}<span class="tip">${esc(job.error)}</span></span>` : icon('download')}</td>
           <td class="nowrap">${esc(promotionOf(event)?.name || '')}</td><td class="title-cell">${esc(event?.title)}</td>
           <td class="title-cell hide-sm evidence">${esc(job.candidate?.title)}</td><td>${job.candidate?.quality ? `<span class="label label-default">${esc(job.candidate.quality)}</span>` : ''}</td>
-          <td class="nowrap hide-sm">${job.client === 'sabnzbd' ? 'SABnzbd' : 'qBittorrent'}</td>
+          <td class="nowrap hide-sm">${CLIENT_LABELS[job.client] || job.client}</td>
           <td style="min-width:130px"><div class="progress-bar tall"><span style="width:${job.request.status === 'importing' ? 100 : pct}%"></span><span class="progress-label">${state}</span></div></td></tr>`;
       }).join('')}
     </tbody></table></div>`;
@@ -363,12 +373,16 @@ const pages = {
         ${field('library.naming', 'Event Format', settings.library.naming, { help: 'Tokens: {promotion} {title} {date} {year} {quality} {release}. Use / for folders.' })}
         <div class="form-group"><span class="form-label">Example</span><div class="form-input"><code id="naming-example"></code></div></div></fieldset>`;
     } else if (tab === 'indexers') {
-      body = `<fieldset class="fieldset" style="border:0;padding:0"><legend>Prowlarr</legend>
-        ${field('prowlarr.url', 'URL', settings.prowlarr.url, { placeholder: 'http://prowlarr:9696' })}
-        ${field('prowlarr.apiKey', 'API Key', settings.prowlarr.apiKey, { type: 'password', help: 'Prowlarr › Settings › General › Security.' })}
-        ${field('prowlarr.maxQueries', 'Queries Per Search', settings.prowlarr.maxQueries, { type: 'number', help: 'Search titles come from the promotion matchers, most precise first. More queries find more, but load your indexers.' })}
-        ${field('prowlarr.timeoutMs', 'Query Timeout (ms)', settings.prowlarr.timeoutMs, { type: 'number' })}
-        ${test('prowlarr')}</fieldset>
+      indexersCache = settings.indexers;
+      body = `<fieldset class="fieldset" style="border:0;padding:0"><legend>Indexers</legend>
+        <div class="cards">${settings.indexers.map((indexer) => `<button type="button" class="card indexer-card" data-action="edit-indexer" data-id="${esc(indexer.id)}">
+            <h3>${esc(indexer.name)}</h3>
+            <div class="labels"><span class="label label-default">${esc(INDEXER_TYPES[indexer.type]?.label || indexer.type)}</span>
+              <span class="label label-outline">${esc(INDEXER_TYPES[indexer.type]?.protocol || '')}</span>
+              ${indexer.enabled ? '<span class="label label-success">Enabled</span>' : '<span class="label label-danger">Disabled</span>'}
+              <span class="label label-outline">${indexer.maxQueries} queries</span></div></button>`).join('')}
+          <button type="button" class="card indexer-card add-card" data-action="add-indexer" aria-label="Add indexer">${icon('plus')}</button></div>
+        <p class="form-help" style="max-width:none">Every enabled indexer is searched with the promotion's search titles, most precise first, up to its query limit. A release found by several indexers is listed once.</p></fieldset>
         <fieldset class="fieldset" style="border:0;padding:0"><legend>Release Preferences</legend>
         ${field('preferences.protocol', 'Preferred Protocol', settings.preferences.protocol, { options: [['any', 'No preference'], ['usenet', 'Prefer Usenet'], ['torrent', 'Prefer Torrent']] })}
         ${field('preferences.minSeeders', 'Minimum Seeders', settings.preferences.minSeeders, { type: 'number' })}</fieldset>`;
@@ -490,10 +504,10 @@ async function renderReleases(requestId) {
     ${detail.candidates.map((c) => {
       const rejected = c.decision !== 'matched';
       const chosen = detail.candidateId === c.id;
-      return `<tr class="${rejected ? 'rejected' : ''}"><td class="hide-sm"><span class="label ${c.protocol === 'usenet' ? 'label-info' : 'label-success'}">${c.protocol === 'usenet' ? 'nzb' : 'torrent'}</span></td>
+      return `<tr class="${rejected ? 'rejected' : ''}"><td class="hide-sm"><span class="label ${(PROTOCOL_LABELS[c.protocol] || PROTOCOL_LABELS.torrent)[1]}">${(PROTOCOL_LABELS[c.protocol] || PROTOCOL_LABELS.torrent)[0]}</span></td>
         <td class="nowrap hide-sm">${esc(age(c.publishedAt))}</td>
         <td class="title-cell">${esc(c.title)}${!rejected ? `<div class="evidence">${esc(c.evidence.join(' · '))}</div>` : ''}</td>
-        <td class="hide-sm">${esc(c.indexer || '')}</td><td class="nowrap">${formatSize(c.size)}</td>
+        <td class="hide-sm">${esc(c.source && c.indexer && c.indexer !== c.source ? `${c.source} · ${c.indexer}` : (c.source || c.indexer || ''))}</td><td class="nowrap">${formatSize(c.size)}</td>
         <td class="hide-sm">${c.protocol === 'torrent' ? esc(c.seeders ?? '') : ''}</td>
         <td>${c.quality ? `<span class="label label-default">${esc(c.quality)}</span>` : ''}</td>
         <td class="score">${rejected ? '' : c.score}</td>
@@ -537,6 +551,57 @@ async function promotionRuleModal(id) {
       <div class="form-group"><span></span><label class="form-inline"><input type="checkbox" name="requireDateInTitle" ${spec.requireDateInTitle ? 'checked' : ''}> Require the event date in release names</label></div>
     </form>
     <div class="modal-footer"><button class="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit" form="rule-form">Save</button></div>`);
+}
+
+function indexerModal(indexer) {
+  const isNew = !indexer.id;
+  const type = INDEXER_TYPES[indexer.type];
+  const input = (name, label, value, { type: inputType = 'text', help = '', placeholder = '' } = {}) => `<div class="form-group"><label class="form-label" for="ix-${name}">${label}</label><div class="form-input">
+    <input id="ix-${name}" name="${name}" type="${inputType}" value="${esc(value ?? '')}" placeholder="${esc(placeholder)}" autocomplete="off">${help ? `<div class="form-help">${help}</div>` : ''}</div></div>`;
+  const fields = {
+    prowlarr: input('url', 'URL', indexer.url, { placeholder: 'http://prowlarr:9696' })
+      + input('apiKey', 'API Key', indexer.apiKey, { type: 'password', help: 'Prowlarr › Settings › General › API Key.' })
+      + input('timeoutMs', 'Query Timeout (ms)', indexer.timeoutMs ?? 20000, { type: 'number' }),
+    bitmagnet: input('url', 'URL', indexer.url, { placeholder: 'http://gluetun:3333', help: 'The Bitmagnet web address; /graphql is added automatically.' })
+      + input('limit', 'Results Per Query', indexer.limit ?? 100, { type: 'number', help: 'Ordered by seeders, so a limit keeps the best-seeded end.' })
+      + input('timeoutMs', 'Query Timeout (ms)', indexer.timeoutMs ?? 15000, { type: 'number' }),
+    easynews: input('username', 'Username', indexer.username)
+      + input('password', 'Password', indexer.password, { type: 'password' })
+      + input('downloadFolder', 'Download Folder', indexer.downloadFolder, { placeholder: '/data/downloads/easynews', help: 'Where Replayarr saves Easynews files before importing. Put it on the same drive as the library so imports can be hardlinks.' })
+      + input('timeoutMs', 'Search Timeout (ms)', indexer.timeoutMs ?? 20000, { type: 'number' }),
+  }[indexer.type];
+  const defaultQueries = { prowlarr: 6, bitmagnet: 12, easynews: 4 }[indexer.type];
+  openModal(`<div class="modal-header"><span>${isNew ? 'Add' : 'Edit'} Indexer – ${esc(type.label)}</span><button class="icon-button" data-action="close-modal" aria-label="Close">${icon('x')}</button></div>
+    <form id="indexer-form" class="modal-body" data-id="${esc(indexer.id || '')}" data-type="${esc(indexer.type)}">
+      <p class="form-help" style="max-width:none;margin-top:0">${esc(type.about)}</p>
+      ${input('name', 'Name', indexer.name || type.label)}
+      <div class="form-group"><span></span><label class="form-inline"><input type="checkbox" name="enabled" ${indexer.enabled === false ? '' : 'checked'}> Enable</label></div>
+      ${fields}
+      ${input('maxQueries', 'Queries Per Search', indexer.maxQueries ?? defaultQueries, { type: 'number', help: 'How many of the promotion\'s search titles to send, most precise first.' })}
+    </form>
+    <div class="modal-footer">${isNew ? '' : '<button class="button button-danger" data-action="delete-indexer" style="margin-right:auto">Delete</button>'}
+      <span class="test-result" data-result="indexer" style="align-self:center"></span>
+      <button class="button" data-action="test-indexer">${icon('check')} Test</button>
+      <button class="button" data-action="close-modal">Cancel</button>
+      <button class="button button-primary" type="submit" form="indexer-form">Save</button></div>`, { small: true });
+}
+
+function indexerTypeModal() {
+  openModal(`<div class="modal-header"><span>Add Indexer</span><button class="icon-button" data-action="close-modal" aria-label="Close">${icon('x')}</button></div>
+    <div class="modal-body"><div class="cards">${Object.entries(INDEXER_TYPES).map(([key, type]) => `<button type="button" class="card indexer-card" data-action="new-indexer" data-type="${key}">
+      <h3>${esc(type.label)}</h3><p class="form-help" style="margin:0">${esc(type.about)}</p></button>`).join('')}</div></div>`, { small: true });
+}
+
+function readIndexerForm() {
+  const form = $('#indexer-form');
+  const data = { id: form.dataset.id || undefined, type: form.dataset.type, enabled: form.elements.enabled.checked };
+  for (const el of form.querySelectorAll('input[name]')) if (el.type !== 'checkbox') data[el.name] = el.value;
+  return data;
+}
+
+async function saveIndexers(list, success) {
+  const saved = await run(() => api('/settings', { method: 'PUT', body: { indexers: list } }), success);
+  if (saved) { indexersCache = saved.indexers; closeModal(); render({ quiet: true }); }
 }
 
 // --- router -------------------------------------------------------------
@@ -695,6 +760,27 @@ const actions = {
     await run(() => api(`/system/tasks/${el.dataset.task}`, { method: 'POST' }), 'Task complete');
     render({ quiet: true });
   },
+  'add-indexer': () => indexerTypeModal(),
+  'new-indexer': (el) => indexerModal({ type: el.dataset.type }),
+  'edit-indexer': (el) => indexerModal(indexersCache.find((i) => i.id === el.dataset.id)),
+  'test-indexer': async () => {
+    const out = $('[data-result="indexer"]');
+    out.className = 'test-result';
+    out.textContent = 'Testing…';
+    try {
+      const result = await api('/indexers/test', { method: 'POST', body: readIndexerForm() });
+      out.className = 'test-result ok';
+      out.textContent = result.message;
+    } catch (error) {
+      out.className = 'test-result fail';
+      out.textContent = error.message;
+    }
+  },
+  'delete-indexer': async () => {
+    const { id } = readIndexerForm();
+    if (!confirm('Delete this indexer?')) return;
+    await saveIndexers(indexersCache.filter((i) => i.id !== id), 'Indexer deleted');
+  },
   'promotion-rule': async (el) => { promotionsCache = promotionsCache.length ? promotionsCache : await api('/promotions'); promotionRuleModal(el.dataset.id || ''); },
   'delete-rule': async (el) => {
     if (!confirm('Remove these rules?')) return;
@@ -733,6 +819,11 @@ document.addEventListener('submit', async (event) => {
     closeModal();
     location.hash = `#/promotion/${created.promotionId}`;
     render();
+  }
+  if (form.id === 'indexer-form') {
+    const data = readIndexerForm();
+    const list = data.id ? indexersCache.map((i) => (i.id === data.id ? data : i)) : [...indexersCache, data];
+    await saveIndexers(list, 'Indexer saved');
   }
   if (form.id === 'rule-form') {
     const lines = (name) => form.elements[name].value.split('\n').map((v) => v.trim()).filter(Boolean);

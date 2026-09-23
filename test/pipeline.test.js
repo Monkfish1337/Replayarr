@@ -13,7 +13,8 @@ import * as qbittorrent from '../src/adapters/qbittorrent.js';
 // Stand-ins for SSS, Prowlarr, qBittorrent and SABnzbd that speak just enough
 // of each real API for the pipeline to run against them over HTTP.
 async function fakeServices(downloadDir) {
-  const state = { torrents: [], sab: { queue: [], history: [] }, prowlarrQueries: [], logins: 0 };
+  const state = { torrents: [], sab: { queue: [], history: [] }, prowlarrQueries: [], logins: 0, prowlarrKeys: [], bitmagnetQueries: 0, easynewsQueries: 0, easynewsRanges: [] };
+  const easynewsFile = Buffer.alloc(2 * 1024 * 1024, 7);
   const hash = 'a'.repeat(40);
   const server = createServer(async (req, res) => {
     const url = new URL(req.url, 'http://x');
@@ -34,7 +35,8 @@ async function fakeServices(downloadDir) {
     }
     // Prowlarr
     if (url.pathname === '/api/v1/search') {
-      assert.equal(req.headers['x-api-key'], 'prowlarr-key');
+      assert.ok(['prowlarr-key', 'usenet-key'].includes(req.headers['x-api-key']));
+      state.prowlarrKeys.push(req.headers['x-api-key']);
       state.prowlarrQueries.push(url.searchParams.get('query'));
       return json([
         { title: 'Premier.League.2026.09.21.Arsenal.vs.Manchester.City.1080p.WEB-DL.H264', protocol: 'torrent', size: 5e9, seeders: 40, indexer: 'Tracker', magnetUrl: `magnet:?xt=urn:btih:${hash}`, guid: 'g1' },
@@ -42,6 +44,35 @@ async function fakeServices(downloadDir) {
         { title: 'Premier.League.2025.09.21.Arsenal.vs.Manchester.City.1080p', protocol: 'torrent', size: 5e9, seeders: 90, indexer: 'Tracker', magnetUrl: `magnet:?xt=urn:btih:${'b'.repeat(40)}`, guid: 'g3' },
         { title: 'Arsenal vs Manchester City 2026.09.21 Highlights 1080p', protocol: 'torrent', size: 4e8, seeders: 5, indexer: 'Tracker', magnetUrl: `magnet:?xt=urn:btih:${'c'.repeat(40)}`, guid: 'g4' },
       ]);
+    }
+    // Bitmagnet GraphQL
+    if (url.pathname === '/graphql' && req.method === 'POST') {
+      const { variables } = JSON.parse(body);
+      if (!variables?.input) return json({ data: { __typename: 'Query' } });
+      state.bitmagnetQueries += 1;
+      assert.deepEqual(variables.input.orderBy, [{ field: 'seeders', descending: true }]);
+      return json({ data: { torrentContent: { search: { items: [
+        { infoHash: 'd'.repeat(40), publishedAt: '1999-01-01T00:00:00Z', seeders: 12, torrent: { name: 'EPL.2026.09.21.Arsenal.vs.Man.City.2160p.WEB.h265', size: 9e9, seeders: 12, magnetUri: 'magnet:?xt=urn:btih:' + 'd'.repeat(40) } },
+        { infoHash: 'a'.repeat(40), seeders: 40, torrent: { name: 'Premier.League.2026.09.21.Arsenal.vs.Manchester.City.1080p.WEB-DL.H264', size: 5e9 } },
+      ] } } } });
+    }
+    // Easynews search and file download
+    const basic = 'Basic ' + Buffer.from('en-user:en-pass').toString('base64');
+    if (url.pathname === '/2.0/search/solr-search/advanced') {
+      if (req.headers.authorization !== basic) return res.writeHead(401).end();
+      state.easynewsQueries += 1;
+      return json({ dlFarm: 'farm1', dlPort: 443, downURL: '//evil.example.com', data: [
+        { 0: 'enhash1', 10: 'Premier.League.2026.09.21.Arsenal.vs.Manchester.City.720p.WEB', 11: '.mkv', type: 'VIDEO', rawSize: easynewsFile.length, 14: '1h 52m', 5: '2026-09-21 18:00:00' },
+        { 0: 'enhash2', 10: 'Arsenal.City.thumbs', 11: '.mp4', type: 'VIDEO', rawSize: 1000, 14: '40s' },
+      ] });
+    }
+    if (url.pathname === '/farm1/443/enhash1.mkv/' + encodeURIComponent('Premier.League.2026.09.21.Arsenal.vs.Manchester.City.720p.WEB') + '.mkv') {
+      if (req.headers.authorization !== basic) return res.writeHead(401).end();
+      const range = /bytes=(\d+)-/.exec(req.headers.range || '');
+      state.easynewsRanges.push(range ? Number(range[1]) : 0);
+      const start = range ? Number(range[1]) : 0;
+      res.writeHead(range ? 206 : 200, { 'content-length': easynewsFile.length - start });
+      return res.end(easynewsFile.subarray(start));
     }
     // qBittorrent
     if (url.pathname === '/api/v2/auth/login') {
@@ -236,4 +267,78 @@ test('a qBittorrent API key is used instead of logging in', async (t) => {
     /API key rejected/,
   );
   assert.equal(fake.state.logins, 0, 'a rejected key does not fall back to a password login');
+});
+
+test('every configured indexer is searched, and Easynews results download through the built-in downloader', async (t) => {
+  const env = await setup();
+  process.env.REPLAYARR_EASYNEWS_BASE_URL = env.fake.base;
+  t.after(() => { delete process.env.REPLAYARR_EASYNEWS_BASE_URL; return env.cleanup(); });
+  const { service, store, fake } = env;
+  const easynewsFolder = join(env.downloads, 'easynews');
+  saveSettings(store, { indexers: [
+    { id: 'torrents', type: 'prowlarr', name: 'Prowlarr', url: fake.base, apiKey: 'prowlarr-key', maxQueries: 1 },
+    { id: 'usenet', type: 'prowlarr', name: 'Prowlarr (Usenet)', url: fake.base, apiKey: 'usenet-key', maxQueries: 1 },
+    { id: 'dht', type: 'bitmagnet', name: 'Bitmagnet', url: fake.base + '/graphql', maxQueries: 2 },
+    { id: 'en', type: 'easynews', name: 'Easynews', username: 'en-user', password: 'en-pass', downloadFolder: easynewsFolder, maxQueries: 1 },
+    { id: 'off', type: 'prowlarr', name: 'Disabled', url: fake.base, apiKey: 'nope', enabled: false },
+  ] });
+  await service.syncEvents();
+  const request = await service.requestEvent('epl:101');
+  await service.searchRequest(request.id);
+
+  assert.deepEqual(fake.state.prowlarrKeys, ['prowlarr-key', 'usenet-key'], 'both Prowlarr instances, not the disabled one');
+  assert.equal(fake.state.bitmagnetQueries, 2);
+  assert.equal(fake.state.easynewsQueries, 1);
+  const candidates = store.listCandidates(request.id);
+  const bySource = (source) => candidates.filter((c) => c.source === source).map((c) => c.title);
+  assert.ok(bySource('Bitmagnet').includes('EPL.2026.09.21.Arsenal.vs.Man.City.2160p.WEB.h265'));
+  assert.ok(!bySource('Bitmagnet').some((title) => title.includes('1080p')), 'a hash Prowlarr already reported is not duplicated');
+  assert.equal(candidates.find((c) => c.source === 'Bitmagnet').publishedAt, null, "Bitmagnet's 1999 placeholder is not a date");
+  const easy = candidates.find((c) => c.protocol === 'easynews');
+  assert.equal(easy.decision, 'matched');
+  assert.equal(candidates.filter((c) => c.protocol === 'easynews').length, 1, 'thumbnail strips are dropped');
+  assert.ok(!easy.downloadUrl.includes('en-pass') && !easy.downloadUrl.includes(Buffer.from('en-user:en-pass').toString('base64')));
+  assert.deepEqual(store.listSearches(request.id).map((s) => s.source).sort(), ['Bitmagnet', 'Easynews', 'Prowlarr', 'Prowlarr (Usenet)']);
+
+  await service.approve(request.id, easy.id);
+  const job = store.latestJob(request.id);
+  assert.equal(job.client, 'easynews');
+  for (let i = 0; i < 50 && store.getRequest(request.id).status === 'downloading'; i += 1) {
+    await new Promise((r) => setTimeout(r, 20));
+    await service.reconcileJobs();
+  }
+  assert.equal(store.getRequest(request.id).status, 'importing');
+  await service.tick();
+  const done = store.getRequest(request.id);
+  assert.equal(done.status, 'ready', done.error || '');
+  const item = store.libraryFor('epl:101');
+  assert.match(item.path, /Premier League - 2026-09-21 - Arsenal vs Manchester City \[720p\]\.mkv$/);
+  assert.deepEqual(await readFile(item.path), Buffer.alloc(2 * 1024 * 1024, 7));
+});
+
+test('an interrupted Easynews download resumes from the partial file', async (t) => {
+  const env = await setup();
+  process.env.REPLAYARR_EASYNEWS_BASE_URL = env.fake.base;
+  t.after(() => { delete process.env.REPLAYARR_EASYNEWS_BASE_URL; return env.cleanup(); });
+  const easynews = await import('../src/adapters/easynews.js');
+  const config = { id: 'en', username: 'en-user', password: 'en-pass', downloadFolder: join(env.downloads, 'en') };
+  const [result] = await easynews.search(config, 'Arsenal');
+  assert.equal(new URL(easynews.fileUrl(easynews.unpackToken(result.downloadUrl.slice(9)))).host, new URL(env.fake.base).host);
+  delete process.env.REPLAYARR_EASYNEWS_BASE_URL;
+  assert.equal(new URL(easynews.fileUrl({ u: '//evil.example.com', h: 'x' })).host, 'members.easynews.com', 'only easynews.com hosts receive credentials');
+  process.env.REPLAYARR_EASYNEWS_BASE_URL = env.fake.base;
+
+  // Simulate a restart: a partial file exists and the process has no record of the job.
+  const folder = join(config.downloadFolder, 'replayarr-99');
+  await mkdir(folder, { recursive: true });
+  await writeFile(join(folder, 'Premier.League.2026.09.21.Arsenal.vs.Manchester.City.720p.WEB.mkv.part'), Buffer.alloc(1024 * 1024, 7));
+  const remoteId = `en|replayarr-99|${result.downloadUrl.slice(9)}`;
+  let status = await easynews.status(config, remoteId);
+  for (let i = 0; i < 50 && status.state !== 'completed'; i += 1) {
+    await new Promise((r) => setTimeout(r, 20));
+    status = await easynews.status(config, remoteId);
+  }
+  assert.equal(status.state, 'completed');
+  assert.deepEqual(env.fake.state.easynewsRanges, [1024 * 1024], 'resumed with a Range request');
+  assert.deepEqual(await readFile(join(folder, 'Premier.League.2026.09.21.Arsenal.vs.Manchester.City.720p.WEB.mkv')), Buffer.alloc(2 * 1024 * 1024, 7));
 });

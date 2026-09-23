@@ -61,8 +61,14 @@ export function scoreCandidate(candidate, { verdict, preferences = {}, minSizeMb
   } else if (candidate.protocol === 'usenet') {
     score += 6;
     evidence.push('Usenet +6');
+  } else if (candidate.protocol === 'easynews') {
+    // A direct download: no swarm to depend on, nothing to repair or unpack.
+    score += 6;
+    evidence.push('Easynews direct +6');
   }
-  if (preferences.protocol && preferences.protocol !== 'any' && candidate.protocol === preferences.protocol) {
+  // Easynews is Usenet content, so a Usenet preference covers it.
+  const family = candidate.protocol === 'easynews' ? 'usenet' : candidate.protocol;
+  if (preferences.protocol && preferences.protocol !== 'any' && family === preferences.protocol) {
     score += 6;
     evidence.push(`Preferred protocol +6`);
   }
