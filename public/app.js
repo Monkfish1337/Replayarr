@@ -141,7 +141,7 @@ const NAV = [
   { key: 'settings', label: 'Settings', icon: 'settings', href: '#/settings/mediamanagement', children: [
     ['Media Management', '#/settings/mediamanagement'], ['Indexers', '#/settings/indexers'], ['Download Clients', '#/settings/downloadclients'],
     ['Connect', '#/settings/connect'], ['General', '#/settings/general']] },
-  { key: 'system', label: 'System', icon: 'system', href: '#/system/status', children: [['Status', '#/system/status'], ['Tasks', '#/system/tasks'], ['Events', '#/system/events']] },
+  { key: 'system', label: 'System', icon: 'system', href: '#/system/status', children: [['Status', '#/system/status'], ['Tasks', '#/system/tasks'], ['Events', '#/system/events'], ['Logs', '#/system/logs']] },
 ];
 const sectionOf = { promotions: 'promotions', promotion: 'promotions', add: 'promotions', library: 'promotions', calendar: 'calendar', activity: 'activity', wanted: 'wanted', metadata: 'metadata', settings: 'settings', system: 'system' };
 let navCounts = { queue: 0, review: 0 };
@@ -538,9 +538,10 @@ const pages = {
           <li>For events imported before this was set up, run <strong>Library › Rename Files</strong>, then <strong>Write Metadata</strong>.</li>
         </ol></fieldset>`;
     } else if (tab === 'general') {
-      setToolbar();
       const status = await api('/system/status');
-      body = `<fieldset class="fieldset" style="border:0;padding:0"><legend>Security</legend>
+      body = `<fieldset class="fieldset" style="border:0;padding:0"><legend>Logging</legend>
+        ${field('logging.level', 'Log Level', settings.logging.level, { options: [['info', 'Info'], ['debug', 'Debug (every request, query and verdict)'], ['warn', 'Warnings and errors only']], help: 'Use Debug while troubleshooting, then set it back to Info. Logs are under System › Logs and in the logs folder beside the database; API keys and passwords are always removed.' })}</fieldset>
+        <fieldset class="fieldset" style="border:0;padding:0"><legend>Security</legend>
         <p>Set <code>REPLAYARR_USERNAME</code> and <code>REPLAYARR_PASSWORD</code> in the environment to require a login. Replayarr listens on <code>HOST</code> (default 127.0.0.1) and <code>PORT</code> (default 4173).</p></fieldset>
         <fieldset class="fieldset" style="border:0;padding:0"><legend>Storage</legend><p>Database: <code>${esc(status.database)}</code> (set <code>REPLAYARR_DB</code> to move it).</p></fieldset>`;
     }
@@ -555,6 +556,23 @@ const pages = {
         ${tasks.map((t) => `<tr><td>${esc(t.title)}</td><td class="hide-sm">${esc(t.interval)}</td><td title="${esc(formatDateTime(t.lastRun))}">${t.lastRun ? relative(t.lastRun) : '<span class="muted">Never</span>'}</td>
           <td class="actions"><button class="icon-button" data-action="run-task" data-task="${esc(t.name)}" title="Run now" aria-label="Run ${esc(t.title)} now">${icon('refresh')}</button></td></tr>`).join('')}
       </tbody></table></div>`;
+    }
+    if (tab === 'logs') {
+      setToolbar(
+        toolbarButton('logs-refresh', 'refresh', 'Refresh') + toolbarButton('logs-download', 'download', 'Download') + toolbarButton('logs-clear', 'trash', 'Clear'),
+        toolbarButton('logs-live', 'play', logFilters.live ? 'Live: On' : 'Live: Off', { id: 'logs-live' }),
+      );
+      const data = await api(`/logs?${new URLSearchParams({ level: logFilters.level, component: logFilters.component, q: logFilters.q, limit: 500 })}`);
+      const option = (value, label, current) => `<option value="${esc(value)}" ${value === current ? 'selected' : ''}>${esc(label)}</option>`;
+      startLogPolling();
+      return `<div class="form-inline" style="margin-bottom:14px">
+          <select class="inline-input" id="log-level" aria-label="Minimum level">${[['debug', 'Debug and up'], ['info', 'Info and up'], ['warn', 'Warnings and errors'], ['error', 'Errors']].map(([v, l]) => option(v, l, logFilters.level)).join('')}</select>
+          <select class="inline-input" id="log-component" aria-label="Component">${option('', 'All components', logFilters.component)}${data.components.map((c) => option(c, c, logFilters.component)).join('')}</select>
+          <input class="inline-input" id="log-search" type="search" placeholder="Search messages" value="${esc(logFilters.q)}" style="max-width:320px;flex:1">
+          <span class="muted">Recording at <strong>${esc(data.level)}</strong> level · <a href="#/settings/general">change</a></span>
+        </div>
+        <div class="table-panel"><table class="table log-table"><thead><tr><th></th><th>Time</th><th>Component</th><th>Message</th></tr></thead>
+        <tbody id="log-rows">${logRows(data.entries)}</tbody></table></div>`;
     }
     if (tab === 'events') {
       setToolbar(toolbarButton('reload', 'refresh', 'Refresh'));
@@ -809,6 +827,34 @@ function previewHtml(result) {
   return `<div class="alert alert-success">${icon('check')}<div>Connected to ${esc(result.source.name)} · ${result.normalized} event${result.normalized === 1 ? '' : 's'} read${rows ? `<div style="margin-top:6px">${rows}</div>` : '<div class="evidence">No events in the preview window.</div>'}</div></div>`;
 }
 
+// --- System › Logs --------------------------------------------------------
+const logFilters = { level: 'info', component: '', q: '', live: true };
+let logTimer = null;
+let logSearchTimer = null;
+const LOG_LABELS = { debug: 'label-default', info: 'label-info', warn: 'label-warning', error: 'label-danger' };
+
+function logRows(entries) {
+  if (!entries.length) return '<tr><td colspan="4" class="muted">No log entries match.</td></tr>';
+  return entries.map((e) => `<tr class="log-${esc(e.level)}">
+    <td class="narrow"><span class="label ${LOG_LABELS[e.level] || 'label-default'}">${esc(e.level)}</span></td>
+    <td class="nowrap" title="${esc(e.time)}">${esc(new Date(e.time).toLocaleTimeString())}</td>
+    <td class="nowrap">${esc(e.component)}</td>
+    <td class="title-cell">${esc(e.message)}${e.details ? `<div class="evidence log-details">${esc(e.details)}</div>` : ''}</td></tr>`).join('');
+}
+
+async function refreshLogRows() {
+  const body = $('#log-rows');
+  if (!body) return;
+  const data = await api(`/logs?${new URLSearchParams({ level: logFilters.level, component: logFilters.component, q: logFilters.q, limit: 500 })}`).catch(() => null);
+  if (data && $('#log-rows')) $('#log-rows').innerHTML = logRows(data.entries);
+}
+
+// Live mode re-reads the log every few seconds without redrawing the filters.
+function startLogPolling() {
+  clearInterval(logTimer);
+  if (logFilters.live) logTimer = setInterval(() => { if ($('#log-rows')) refreshLogRows(); else clearInterval(logTimer); }, 3000);
+}
+
 // --- router -------------------------------------------------------------
 function currentRoute() {
   const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean).map(decodeURIComponent);
@@ -949,6 +995,14 @@ const actions = {
     el.classList.remove('spinning');
   },
   'check-downloads': async () => { await run(() => api('/system/tasks/check-downloads', { method: 'POST' })); render(); },
+  'logs-refresh': () => refreshLogRows(),
+  'logs-download': () => { location.href = `/api/logs/download?level=${encodeURIComponent(logFilters.level === 'info' ? 'debug' : logFilters.level)}`; },
+  'logs-clear': async () => {
+    if (!confirm('Clear the log shown here? Log files on disk are kept.')) return;
+    await run(() => api('/logs', { method: 'DELETE' }), 'Log cleared');
+    refreshLogRows();
+  },
+  'logs-live': () => { logFilters.live = !logFilters.live; render({ quiet: true }); },
   'search-promotion': async () => {
     const id = currentRoute()[1];
     const requests = (await api('/requests')).filter((r) => r.event?.promotionId === id && r.status === 'wanted');
@@ -1123,6 +1177,11 @@ document.addEventListener('input', (event) => {
     $('#pv-id').value = event.target.value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 50);
   }
   if (event.target.id === 'pv-id') event.target.dataset.manual = '1';
+  if (event.target.id === 'log-search') {
+    logFilters.q = event.target.value;
+    clearTimeout(logSearchTimer);
+    logSearchTimer = setTimeout(refreshLogRows, 250);
+  }
   if (event.target.id === 'add-search') {
     clearTimeout(addTimer);
     addTimer = setTimeout(async () => {
@@ -1161,6 +1220,10 @@ document.addEventListener('focusout', (event) => {
 document.addEventListener('change', async (event) => {
   const el = event.target;
   if (el.id === 'pv-type') return showProviderFields();
+  if (el.id === 'log-level' || el.id === 'log-component') {
+    logFilters[el.id === 'log-level' ? 'level' : 'component'] = el.value;
+    return refreshLogRows();
+  }
   if (el.id === 'logo-file' && el.files?.[0]) {
     const file = el.files[0];
     if (file.size > 2 * 1024 * 1024) return message('Logos must be 2 MB or smaller.', 'error');

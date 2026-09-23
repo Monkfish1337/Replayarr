@@ -23,6 +23,8 @@ export const DEFAULTS = {
   },
   // Told to rescan after imports and renames.
   jellyfin: { url: '', apiKey: '' },
+  // System › Logs detail: 'info' normally, 'debug' when troubleshooting.
+  logging: { level: 'info' },
   // Download clients often run in their own container and report paths as
   // they see them. Each mapping rewrites a remote prefix to the local one.
   pathMappings: [],
@@ -125,6 +127,7 @@ export function saveSettings(store, incoming) {
   }
   if (!['hardlink', 'copy', 'move'].includes(next.library.mode)) next.library.mode = DEFAULTS.library.mode;
   if (!['yes', 'no'].includes(next.library.writeMetadata)) next.library.writeMetadata = 'yes';
+  if (!['debug', 'info', 'warn', 'error'].includes(next.logging.level)) next.logging.level = 'info';
   if (!['any', 'torrent', 'usenet'].includes(next.preferences.protocol)) next.preferences.protocol = 'any';
   store.setSetting('config', next);
   return next;

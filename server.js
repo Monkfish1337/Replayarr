@@ -13,6 +13,8 @@ import * as easynews from './src/adapters/easynews.js';
 import * as qbittorrent from './src/adapters/qbittorrent.js';
 import * as sabnzbd from './src/adapters/sabnzbd.js';
 import * as jellyfin from './src/adapters/jellyfin.js';
+import { configureLogging, logger } from './src/logger.js';
+import { loadSettings } from './src/settings.js';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const publicDir = resolve(root, 'public');
@@ -31,6 +33,10 @@ const types = {
 };
 
 const store = createStore(openDatabase(dataFile));
+// Log files sit beside the database (in Docker: /config/logs); every line is
+// also printed, so `docker logs` and Dozzle show them.
+configureLogging({ console: true, dir: resolve(dirname(dataFile), 'logs'), level: loadSettings(store).logging.level });
+const log = logger('system');
 // Uploaded promotion logos live beside the database.
 const logoDir = resolve(dirname(dataFile), 'logos');
 const service = createService(store, { logoDir });
@@ -111,8 +117,8 @@ createServer(async (request, response) => {
   if (url.pathname.startsWith('/logos/')) return serveLogo(response, url.pathname.slice('/logos/'.length));
   return serveStatic(request, response, url.pathname);
 }).listen(port, host, () => {
-  console.log(`Replayarr: http://${host === '0.0.0.0' ? 'localhost' : host}:${port} (database ${dataFile})`);
-  if (!credentials && host !== '127.0.0.1') console.warn('Replayarr is listening beyond localhost without REPLAYARR_USERNAME/REPLAYARR_PASSWORD.');
+  log.info(`Replayarr ${version}${revision ? ` (${revision})` : ''} listening on http://${host === '0.0.0.0' ? 'localhost' : host}:${port}`, { database: dataFile, logLevel: loadSettings(store).logging.level });
+  if (!credentials && host !== '127.0.0.1') log.warn('Listening beyond localhost without REPLAYARR_USERNAME/REPLAYARR_PASSWORD.');
 });
 
 if (process.env.REPLAYARR_WORKER !== 'off') startWorker(service, Number(process.env.REPLAYARR_TICK_MS) || 30000);

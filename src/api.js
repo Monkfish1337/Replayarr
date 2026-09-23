@@ -3,6 +3,9 @@ import { UserError } from './service.js';
 import { indexerReady, loadSettings, MASK, normaliseIndexer, publicSettings, saveSettings } from './settings.js';
 import { listPromotions, promotionAliases } from './matching/index.js';
 import { MetadataError } from './metadata/manager.js';
+import { clearLogs, formatEntry, listLogs, logComponents, logger, setLogLevel } from './logger.js';
+
+const log = logger('api');
 
 const MAX_BODY = 256 * 1024;
 // Logo uploads arrive as a base64 data URL (2 MB image, plus encoding).
@@ -108,7 +111,18 @@ export function createApi(service, { testers, version = '', revision = '', uiBui
     ['POST', /^\/api\/library\/metadata$/, () => service.writeAllMetadata()],
     ['GET', /^\/api\/library$/, () => store.listLibrary().map((item) => ({ ...item, event: store.getEvent(item.eventId) }))],
     ['GET', /^\/api\/settings$/, () => ({ settings: publicSettings(loadSettings(store)), rules: store.listPromotionRules() })],
-    ['PUT', /^\/api\/settings$/, (_m, body) => publicSettings(saveSettings(store, body))],
+    ['PUT', /^\/api\/settings$/, (_m, body) => {
+      const saved = saveSettings(store, body);
+      setLogLevel(saved.logging.level);
+      return publicSettings(saved);
+    }],
+    // --- System › Logs --------------------------------------------------
+    ['GET', /^\/api\/logs$/, (_m, _b, url) => ({
+      entries: listLogs(Object.fromEntries(url.searchParams)),
+      components: logComponents(),
+      level: loadSettings(store).logging.level,
+    })],
+    ['DELETE', /^\/api\/logs$/, () => { clearLogs(); }],
     ['POST', /^\/api\/settings\/test\/(qbittorrent|sabnzbd|jellyfin)$/, async ([, name]) => {
       const settings = loadSettings(store);
       return { ok: true, message: await testers[name](settings[name]) };
@@ -132,6 +146,16 @@ export function createApi(service, { testers, version = '', revision = '', uiBui
   ];
 
   return async function handle(request, response, url) {
+    // Plain-text download of the in-memory log (oldest first), for sharing.
+    if (request.method === 'GET' && url.pathname === '/api/logs/download') {
+      const text = listLogs({ level: url.searchParams.get('level') || 'debug', limit: 5000 }).reverse().map(formatEntry).join('\n') + '\n';
+      const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+      response.writeHead(200, {
+        'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store',
+        'content-disposition': `attachment; filename="replayarr-${stamp}.txt"`,
+      });
+      return response.end(text);
+    }
     const route = routes.find(([method, pattern]) => method === request.method && pattern.test(url.pathname));
     if (!route) return send(response, 404, { error: 'Not found' });
     try {
@@ -139,11 +163,17 @@ export function createApi(service, { testers, version = '', revision = '', uiBui
       const result = await route[2](url.pathname.match(route[1]), body, url);
       send(response, result === undefined ? 204 : 200, result);
     } catch (error) {
-      if (error instanceof UserError || error instanceof MetadataError) return send(response, error.status, { error: error.message });
+      if (error instanceof UserError || error instanceof MetadataError) {
+        log.debug(`${request.method} ${url.pathname}: ${error.message}`, { status: error.status });
+        return send(response, error.status, { error: error.message });
+      }
       if (error instanceof TransitionError) return send(response, 409, { error: error.message });
-      if (error.service) return send(response, 502, { error: error.message });
-      console.error(error);
-      send(response, 500, { error: 'Something went wrong. Check the server log.' });
+      if (error.service) {
+        log.warn(`${request.method} ${url.pathname}: ${error.message}`);
+        return send(response, 502, { error: error.message });
+      }
+      log.error(`${request.method} ${url.pathname} failed`, error);
+      send(response, 500, { error: 'Something went wrong. See System › Logs.' });
     }
   };
 }

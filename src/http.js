@@ -1,3 +1,7 @@
+import { logger } from './logger.js';
+
+const log = logger('http');
+
 export class ServiceError extends Error {
   constructor(service, message, status) {
     super(`${service}: ${message}`);
@@ -16,11 +20,14 @@ export async function request(service, url, { timeoutMs: requestedTimeout, maxBy
   if (!/^https?:\/\//i.test(String(url))) throw new ServiceError(service, 'URL is not configured');
   // Settings can arrive as form text; AbortSignal.timeout only takes a number.
   const timeoutMs = Number(requestedTimeout) > 0 ? Number(requestedTimeout) : 20000;
+  const method = init.method || 'GET';
+  const started = Date.now();
   let response;
   try {
     response = await fetch(url, { ...init, redirect: init.redirect || 'follow', signal: AbortSignal.timeout(timeoutMs) });
   } catch (error) {
     const reason = error.name === 'TimeoutError' ? `timed out after ${timeoutMs} ms` : (error.cause?.code || error.message);
+    log.warn(`${service} ${method} ${url} failed: ${reason}`, { ms: Date.now() - started });
     throw new ServiceError(service, reason);
   }
   const length = Number(response.headers.get('content-length') || 0);
@@ -28,7 +35,12 @@ export async function request(service, url, { timeoutMs: requestedTimeout, maxBy
   const buffer = Buffer.from(await response.arrayBuffer());
   if (buffer.length > maxBytes) throw new ServiceError(service, 'response too large', response.status);
   const text = buffer.toString('utf8');
-  if (!response.ok) throw new ServiceError(service, `HTTP ${response.status} ${text.slice(0, 160)}`.trim(), response.status);
+  const ms = Date.now() - started;
+  if (!response.ok) {
+    log.warn(`${service} ${method} ${url} -> HTTP ${response.status}`, { ms, body: text.slice(0, 300) });
+    throw new ServiceError(service, `HTTP ${response.status} ${text.slice(0, 160)}`.trim(), response.status);
+  }
+  log.debug(`${service} ${method} ${url} -> ${response.status}`, { ms, bytes: buffer.length });
   return { response, text };
 }
 

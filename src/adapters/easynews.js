@@ -4,6 +4,9 @@ import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { requestJson, ServiceError } from '../http.js';
+import { logger } from '../logger.js';
+
+const log = logger('easynews');
 
 // Easynews search, ported from SSS lib/sources/easynews.js, plus a built-in
 // downloader. Easynews serves each result as a single already-decoded file
@@ -72,7 +75,9 @@ export async function search(config, query) {
   if (!config.username || !config.password) throw new ServiceError(SERVICE, 'username and password are not configured');
   const body = await searchPage(config, query, 100);
   const context = { dlFarm: body?.dlFarm, dlPort: body?.dlPort, downURL: body?.downURL };
-  return (Array.isArray(body?.data) ? body.data : []).map((file) => normalise(file, context)).filter(Boolean);
+  const results = (Array.isArray(body?.data) ? body.data : []).map((file) => normalise(file, context)).filter(Boolean);
+  log.debug(`Search "${query}": ${results.length} usable of ${Array.isArray(body?.data) ? body.data.length : 0} file(s)`, { ...context, downloadBase: downloadBase(context.downURL) });
+  return results;
 }
 
 export async function testConnection(config) {
@@ -138,8 +143,10 @@ async function openDownload(config, url, offset, signal) {
     if (trusted(new URL(current).host)) headers.authorization = basicAuth(config);
     if (offset) headers.range = `bytes=${offset}-`;
     const response = await fetch(current, { headers, redirect: 'manual', signal });
+    log.debug(`GET ${current} -> ${response.status}`, { range: headers.range, authenticated: !!headers.authorization });
     if (response.status >= 300 && response.status < 400 && response.headers.get('location')) {
       current = new URL(response.headers.get('location'), current).toString();
+      log.debug(`Redirected to ${current}`);
       continue;
     }
     return response;
@@ -193,6 +200,7 @@ async function run(config, remoteId) {
     let idle = setTimeout(() => controller.abort(new Error('stalled')), IDLE_TIMEOUT_MS);
     try {
       let offset = (await stat(target.partial).catch(() => null))?.size || 0;
+      log.info(`${offset ? 'Resuming' : 'Downloading'} ${file.t}${file.e || ''}`, { url: fileUrl(file), attempt, offset: offset || undefined, folder: target.folder });
       const response = await openDownload(config, fileUrl(file), offset, controller.signal);
       if (response.status === 401 || response.status === 403) throw Object.assign(new Error('Easynews rejected the username or password'), { fatal: true });
       // Name the address that failed (it carries no credentials), so a file
@@ -215,11 +223,13 @@ async function run(config, remoteId) {
       clearTimeout(idle);
       if (job.total && job.received < job.total) throw new Error('connection closed early');
       await rename(target.partial, target.final);
+      log.info(`Finished ${file.t}${file.e || ''}`, { bytes: job.received, path: target.final });
       Object.assign(job, { state: 'completed', path: target.folder, error: null });
       return;
     } catch (error) {
       clearTimeout(idle);
       job.error = error.message || String(error);
+      log.warn(`${file.t}${file.e || ''}: ${job.error}`, { attempt, of: MAX_ATTEMPTS, giveUp: !!error.fatal || attempt === MAX_ATTEMPTS, received: job.received });
       if (error.fatal || attempt === MAX_ATTEMPTS) {
         Object.assign(job, { state: 'failed', path: target.folder });
         return;
