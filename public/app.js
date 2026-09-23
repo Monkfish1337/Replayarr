@@ -760,13 +760,33 @@ async function logoModal(id, query = '') {
     out.innerHTML = `<div class="empty-state">No logos found${result.errors.length ? ` (${esc(result.errors.join('; '))})` : ''}. Try another search, a URL or an upload.</div>`;
     return;
   }
-  out.innerHTML = `<div class="logo-grid">${result.candidates.map((c) => `<button type="button" class="logo-tile ${c.url === promotion.logo ? 'current' : ''}" data-action="logo-choose" data-id="${esc(id)}" data-url="${esc(c.url)}" title="${esc(c.url)}">
-    <div class="img" style="background-image:url('${esc(c.thumb)}')"></div><small><strong>${esc(c.source)}</strong><br>${esc(c.label)}</small></button>`).join('')}</div>`;
-  // Hide candidates whose image does not load, so broken art is never offered.
-  for (const tile of out.querySelectorAll('.logo-tile')) {
+  // One section per source, in the order the sources answered best.
+  const groups = new Map();
+  for (const c of result.candidates) {
+    if (!groups.has(c.source)) groups.set(c.source, []);
+    groups.get(c.source).push(c);
+  }
+  const tile = (c) => `<button type="button" class="logo-tile ${c.url === promotion.logo ? 'current' : ''}" data-action="logo-choose" data-id="${esc(id)}" data-url="${esc(c.url)}" title="${esc(c.url)}">
+    <div class="img" style="background-image:url('${esc(c.thumb)}')"></div><small>${esc(c.label)}</small></button>`;
+  const notes = [
+    ...result.errors.map((e) => `<span class="error-text">${esc(e)}</span>`),
+    ...(result.tmdb ? [] : ['<span class="muted">Add a TMDB key under <a href="#/metadata/settings">Metadata › Settings</a> to include TMDB company logos and posters.</span>']),
+  ];
+  out.innerHTML = [...groups.entries()].map(([source, items]) => `<section class="logo-group" data-source="${esc(source)}">
+      <h3 class="logo-group-title">${esc(source)} <span class="muted">${items.length}</span></h3>
+      <div class="logo-grid">${items.map(tile).join('')}</div></section>`).join('')
+    + (notes.length ? `<div class="form-help" style="max-width:none;margin-top:12px">${notes.join('<br>')}</div>` : '');
+  // Hide candidates whose image does not load, so broken art is never offered;
+  // drop a section once it has nothing left.
+  for (const el of out.querySelectorAll('.logo-tile')) {
     const probe = new Image();
-    probe.onerror = () => tile.remove();
-    probe.src = tile.querySelector('.img').style.backgroundImage.slice(5, -2);
+    probe.onerror = () => {
+      const group = el.closest('.logo-group');
+      el.remove();
+      if (group && !group.querySelector('.logo-tile')) group.remove();
+      else if (group) group.querySelector('.logo-group-title .muted').textContent = group.querySelectorAll('.logo-tile').length;
+    };
+    probe.src = el.querySelector('.img').style.backgroundImage.slice(5, -2);
   }
 }
 

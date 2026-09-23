@@ -213,7 +213,12 @@ export function createMetadata(store, { settings, logoDir, clock = () => new Dat
 
     async logoCandidates(promotionId, query) {
       const promotion = requirePromotion(promotionId);
-      return logoCandidates({ promotion, source: resolve(promotion).source, tsdbApiKey: settings().metadata.tsdbApiKey, query });
+      const keys = settings().metadata;
+      const recentEvents = store.listEvents({ promotionId: promotion.id, to: clock().toISOString().slice(0, 10), limit: 4 });
+      return logoCandidates({
+        promotion, source: resolve(promotion).source, query, recentEvents,
+        tsdbApiKey: keys.tsdbApiKey, tmdbApiKey: keys.tmdbApiKey,
+      });
     },
 
     // Queue promotions for refresh (all followed ones when none are given).

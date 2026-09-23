@@ -11,7 +11,7 @@ import { dirname, extname, join, relative, resolve, sep } from 'node:path';
 
 const IMAGE_TYPES = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif' };
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
-const USER_AGENT = 'Replayarr/0.2 (self-hosted sports replay manager)';
+const USER_AGENT = 'Replayarr/0.2 (https://github.com/Monkfish1337/Replayarr; self-hosted sports replay manager)';
 
 const xml = (value) => String(value ?? '')
   .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '')

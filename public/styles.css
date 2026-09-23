@@ -281,3 +281,5 @@ h1, h2, h3 { color: var(--text-strong); font-weight: 400; margin: 0; }
 .log-table tr.log-warn td:last-child { color: #ffd28a; }
 .log-table tr.log-error td:last-child { color: #ff9c9c; }
 .log-table tr.log-debug td { color: var(--muted); }
+.logo-group { margin-bottom: 18px; }
+.logo-group-title { font-size: 15px; margin: 0 0 8px; }
