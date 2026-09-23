@@ -131,3 +131,17 @@ test('manual search runs the typed query, and a rejected release can be grabbed 
   await assert.rejects(service.manualSearch(request.id, { query: ' ' }), /Type something/);
   await assert.rejects(service.manualSearch(request.id, { query: 'x y', indexerId: 'nope' }), /disabled or not set up/);
 });
+
+test('an event stored without its metadata asks for its promotion to be refreshed', async (t) => {
+  const prowlarr = await fakeProwlarr(t);
+  const store = createStore(openDatabase(':memory:'));
+  const refreshed = [];
+  const metadata = { refresh: (ids) => refreshed.push(...ids), list: () => [], maybeAutoRefresh: () => {} };
+  const service = createService(store, { now: () => new Date('2026-09-11T12:00:00Z'), metadata });
+  saveSettings(store, { indexers: [{ id: 'p', type: 'prowlarr', name: 'Prowlarr', url: prowlarr.base, apiKey: 'k' }] });
+  store.upsertEvent({ ...MAN_UTD_SABAH, payload: null, source: 'sss' });
+  const request = await service.requestEvent(MAN_UTD_SABAH.id);
+  await service.searchRequest(request.id);
+  assert.deepEqual(refreshed, ['ucl']);
+  assert.equal(prowlarr.queries.filter((q) => /MUN/.test(q)).length, 0, 'without team codes the MUN-SAB queries cannot be built');
+});

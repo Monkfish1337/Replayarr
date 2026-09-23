@@ -250,6 +250,14 @@ export function createService(store, overrides = {}) {
       const event = store.getEvent(request.eventId);
       const settings = loadSettings(store);
       request = store.setStatus(request.id, 'searching', { searchCount: request.searchCount + 1 });
+      // Events saved before Replayarr kept the provider's full record (or by
+      // the old SSS sync) have no team names or codes, so the queries built
+      // from them ("MUN SAB", "Sabah Man Utd ...") are missing. Refreshing the
+      // promotion replaces the record; the next search uses it.
+      if (!event.payload && event.source !== 'manual' && event.promotionId) {
+        searchLog.warn(`${event.title} has no stored metadata (team names, codes), so some searches are missing; refreshing ${promotionName(event)} metadata`);
+        metadata.refresh([event.promotionId]);
+      }
 
       const indexers = byPriority(settings.indexers.filter(indexerReady));
       const stopAtFirstMatch = settings.preferences.stopAtFirstMatch !== 'no';
