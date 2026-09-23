@@ -1,11 +1,14 @@
 import { TransitionError } from './store.js';
 import { UserError } from './service.js';
-import { loadSettings, publicSettings, saveSettings } from './settings.js';
+import { indexerReady, loadSettings, MASK, normaliseIndexer, publicSettings, saveSettings } from './settings.js';
 import { listPromotions, promotionAliases } from './matching/index.js';
+import { MetadataError } from './metadata/manager.js';
 
 const MAX_BODY = 256 * 1024;
+// Logo uploads arrive as a base64 data URL (2 MB image, plus encoding).
+const MAX_UPLOAD_BODY = 3 * 1024 * 1024;
 
-async function readJson(request) {
+async function readJson(request, maxBody = MAX_BODY) {
   // Requiring a JSON content type means a cross-site form cannot reach these
   // routes without a CORS preflight, which this server never grants.
   if (!/^application\/json\b/i.test(request.headers['content-type'] || '')) {
@@ -15,7 +18,7 @@ async function readJson(request) {
   const chunks = [];
   for await (const chunk of request) {
     size += chunk.length;
-    if (size > MAX_BODY) throw new UserError('Request body too large.', 413);
+    if (size > maxBody) throw new UserError('Request body too large.', 413);
     chunks.push(chunk);
   }
   if (!size) return {};
@@ -23,8 +26,9 @@ async function readJson(request) {
   catch { throw new UserError('The request body is not valid JSON.'); }
 }
 
+let uiBuildHeader = '';
 function send(response, status, payload) {
-  response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+  response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-replayarr-ui': uiBuildHeader });
   response.end(payload === undefined ? '' : JSON.stringify(payload));
 }
 
@@ -43,7 +47,8 @@ function requestView(store, request) {
   };
 }
 
-export function createApi(service, { testers, version = '', databasePath = '' }) {
+export function createApi(service, { testers, version = '', revision = '', uiBuild = '', databasePath = '' }) {
+  uiBuildHeader = uiBuild;
   const { store } = service;
   const startedAt = new Date().toISOString();
   const routes = [
@@ -53,10 +58,17 @@ export function createApi(service, { testers, version = '', databasePath = '' })
       activity: store.listActivity(8),
       configured: configuredServices(loadSettings(store)),
     })],
-    ['GET', /^\/api\/promotions$/, () => {
-      const stats = store.promotionStats();
-      return listPromotions().map((p) => ({ ...p, stats: stats[p.id] || { events: 0, requested: 0, downloaded: 0, nextDate: null, lastDate: null } }));
-    }],
+    ['GET', /^\/api\/promotions$/, () => service.metadata.list()],
+    // --- Metadata section ---------------------------------------------------
+    ['PUT', /^\/api\/metadata\/promotions\/([a-z0-9-]+)$/, ([, id], body) => service.metadata.update(id, body)],
+    ['GET', /^\/api\/metadata\/promotions\/([a-z0-9-]+)\/logos$/, ([, id], _b, url) => service.metadata.logoCandidates(id, url.searchParams.get('q') || '')],
+    ['POST', /^\/api\/metadata\/promotions\/([a-z0-9-]+)\/logo$/, ([, id], body) => service.metadata.uploadLogo(id, body.dataUrl), { maxBody: MAX_UPLOAD_BODY }],
+    ['GET', /^\/api\/metadata\/providers$/, () => service.metadata.providers()],
+    ['POST', /^\/api\/metadata\/providers$/, (_m, body) => service.metadata.createProvider(body)],
+    ['DELETE', /^\/api\/metadata\/providers\/([a-z0-9_-]+)$/, ([, id]) => { service.metadata.deleteProvider(id); }],
+    ['POST', /^\/api\/metadata\/providers\/preview$/, (_m, body) => service.metadata.preview(body)],
+    ['POST', /^\/api\/metadata\/refresh$/, (_m, body) => service.syncEvents(Array.isArray(body.ids) ? body.ids : undefined)],
+    ['GET', /^\/api\/metadata\/status$/, () => service.metadata.status()],
     ['GET', /^\/api\/queue$/, () => store.queue().map((job) => ({
       ...job,
       request: requestView(store, store.getRequest(job.requestId)),
@@ -64,7 +76,7 @@ export function createApi(service, { testers, version = '', databasePath = '' })
     }))],
     ['GET', /^\/api\/health$/, () => service.health()],
     ['GET', /^\/api\/system\/status$/, () => ({
-      version, node: process.version, platform: process.platform, database: databasePath,
+      version, revision, uiBuild, node: process.version, platform: process.platform, database: databasePath,
       startedAt, promotions: listPromotions().length,
     })],
     ['GET', /^\/api\/system\/tasks$/, () => service.tasks()],
@@ -91,12 +103,26 @@ export function createApi(service, { testers, version = '', databasePath = '' })
     ['POST', /^\/api\/requests\/(\d+)\/approve$/, async ([, id], body) => requestView(store, await service.approve(id, body.candidateId))],
     ['POST', /^\/api\/requests\/(\d+)\/retry$/, ([, id]) => requestView(store, service.retry(id))],
     ['GET', /^\/api\/activity$/, () => store.listActivity(200)],
+    ['GET', /^\/api\/library\/rename$/, () => service.renamePlan()],
+    ['POST', /^\/api\/library\/rename$/, () => service.renameFiles()],
+    ['POST', /^\/api\/library\/metadata$/, () => service.writeAllMetadata()],
     ['GET', /^\/api\/library$/, () => store.listLibrary().map((item) => ({ ...item, event: store.getEvent(item.eventId) }))],
     ['GET', /^\/api\/settings$/, () => ({ settings: publicSettings(loadSettings(store)), rules: store.listPromotionRules() })],
     ['PUT', /^\/api\/settings$/, (_m, body) => publicSettings(saveSettings(store, body))],
-    ['POST', /^\/api\/settings\/test\/(sss|prowlarr|qbittorrent|sabnzbd)$/, async ([, name]) => {
+    ['POST', /^\/api\/settings\/test\/(qbittorrent|sabnzbd|jellyfin)$/, async ([, name]) => {
       const settings = loadSettings(store);
       return { ok: true, message: await testers[name](settings[name]) };
+    }],
+    // Tests the indexer as entered in the edit dialog, before it is saved. A
+    // masked secret means "unchanged", so the saved value is used.
+    ['POST', /^\/api\/indexers\/test$/, async (_m, body) => {
+      const saved = loadSettings(store).indexers.find((i) => i.id === body.id) || {};
+      const indexer = { ...body };
+      for (const key of ['apiKey', 'password']) if (indexer[key] === MASK) indexer[key] = saved[key] || '';
+      const tester = testers[indexer.type];
+      if (!tester) throw new UserError('Unknown indexer type.');
+      // Clean the form values exactly as saving would (numbers, trimming).
+      return { ok: true, message: await tester(normaliseIndexer({ ...saved, ...indexer })) };
     }],
     // SSS's alias learner: turn good/bad example release names into rules.
     ['POST', /^\/api\/promotion-rules\/suggest$/, (_m, body) => promotionAliases.suggestPromotionSetup(
@@ -109,11 +135,11 @@ export function createApi(service, { testers, version = '', databasePath = '' })
     const route = routes.find(([method, pattern]) => method === request.method && pattern.test(url.pathname));
     if (!route) return send(response, 404, { error: 'Not found' });
     try {
-      const body = ['POST', 'PUT'].includes(request.method) ? await readJson(request) : {};
+      const body = ['POST', 'PUT'].includes(request.method) ? await readJson(request, route[3]?.maxBody) : {};
       const result = await route[2](url.pathname.match(route[1]), body, url);
       send(response, result === undefined ? 204 : 200, result);
     } catch (error) {
-      if (error instanceof UserError) return send(response, error.status, { error: error.message });
+      if (error instanceof UserError || error instanceof MetadataError) return send(response, error.status, { error: error.message });
       if (error instanceof TransitionError) return send(response, 409, { error: error.message });
       if (error.service) return send(response, 502, { error: error.message });
       console.error(error);
@@ -124,8 +150,8 @@ export function createApi(service, { testers, version = '', databasePath = '' })
 
 function configuredServices(settings) {
   return {
-    sss: !!settings.sss.manifestUrl,
-    prowlarr: !!(settings.prowlarr.url && settings.prowlarr.apiKey),
+
+    indexers: settings.indexers.some(indexerReady),
     qbittorrent: !!settings.qbittorrent.url,
     sabnzbd: !!(settings.sabnzbd.url && settings.sabnzbd.apiKey),
     library: !!settings.library.root,

@@ -1,16 +1,18 @@
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { timingSafeEqual } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { dirname, extname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDatabase } from './src/db.js';
 import { createStore } from './src/store.js';
 import { createService, startWorker } from './src/service.js';
 import { createApi } from './src/api.js';
-import * as sss from './src/adapters/sss.js';
 import * as prowlarr from './src/adapters/prowlarr.js';
+import * as bitmagnet from './src/adapters/bitmagnet.js';
+import * as easynews from './src/adapters/easynews.js';
 import * as qbittorrent from './src/adapters/qbittorrent.js';
 import * as sabnzbd from './src/adapters/sabnzbd.js';
+import * as jellyfin from './src/adapters/jellyfin.js';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const publicDir = resolve(root, 'public');
@@ -29,16 +31,27 @@ const types = {
 };
 
 const store = createStore(openDatabase(dataFile));
-const service = createService(store);
+// Uploaded promotion logos live beside the database.
+const logoDir = resolve(dirname(dataFile), 'logos');
+const service = createService(store, { logoDir });
 const { version } = JSON.parse(await readFile(resolve(root, 'package.json'), 'utf8'));
+// Changes whenever the served UI changes, so an open tab can tell it is stale.
+const uiBuild = createHash('sha256')
+  .update(await readFile(resolve(publicDir, 'app.js'))).update(await readFile(resolve(publicDir, 'styles.css'))).update(await readFile(resolve(publicDir, 'index.html')))
+  .digest('hex').slice(0, 12);
+const revision = (process.env.REPLAYARR_REVISION || '').slice(0, 7);
 const api = createApi(service, {
   version,
+  revision,
+  uiBuild,
   databasePath: dataFile,
   testers: {
-    sss: async (config) => `SSS ${(await sss.fetchManifest(config)).name || 'addon'} reachable`,
     prowlarr: prowlarr.testConnection,
+    bitmagnet: bitmagnet.testConnection,
+    easynews: easynews.testConnection,
     qbittorrent: qbittorrent.testConnection,
     sabnzbd: sabnzbd.testConnection,
+    jellyfin: jellyfin.testConnection,
   },
 });
 
@@ -64,6 +77,22 @@ async function serveStatic(request, response, pathname) {
   }
 }
 
+const LOGO_TYPES = { png: 'image/png', jpg: 'image/jpeg', webp: 'image/webp', svg: 'image/svg+xml', gif: 'image/gif' };
+async function serveLogo(response, name) {
+  const match = /^([a-z0-9-]+)\.(png|jpg|webp|svg|gif)$/.exec(name);
+  if (!match) return response.writeHead(404).end();
+  try {
+    const body = await readFile(resolve(logoDir, name));
+    // An uploaded SVG opened directly must not run script in this origin.
+    response.writeHead(200, {
+      'content-type': LOGO_TYPES[match[2]], 'cache-control': 'no-cache',
+      'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+    }).end(body);
+  } catch {
+    response.writeHead(404).end();
+  }
+}
+
 createServer(async (request, response) => {
   response.setHeader('x-content-type-options', 'nosniff');
   response.setHeader('x-frame-options', 'DENY');
@@ -79,6 +108,7 @@ createServer(async (request, response) => {
   }
   const url = new URL(request.url, 'http://localhost');
   if (url.pathname.startsWith('/api/')) return api(request, response, url);
+  if (url.pathname.startsWith('/logos/')) return serveLogo(response, url.pathname.slice('/logos/'.length));
   return serveStatic(request, response, url.pathname);
 }).listen(port, host, () => {
   console.log(`Replayarr: http://${host === '0.0.0.0' ? 'localhost' : host}:${port} (database ${dataFile})`);

@@ -32,6 +32,7 @@ function eventRow(row) {
   return {
     id: row.id, promotionId: row.promotion_id, title: row.title, date: row.date, time: row.time,
     aliases: json(row.aliases, []), source: row.source, sourceRevision: row.source_revision, updatedAt: row.updated_at,
+    payload: row.payload ? json(row.payload, null) : null,
   };
 }
 
@@ -47,7 +48,7 @@ function requestRow(row) {
 function candidateRow(row) {
   if (!row) return null;
   return {
-    id: row.id, requestId: row.request_id, identity: row.identity, source: row.source, indexer: row.indexer,
+    id: row.id, requestId: row.request_id, identity: row.identity, source: row.source, sourceId: row.source_id, indexer: row.indexer,
     protocol: row.protocol, title: row.title, downloadUrl: row.download_url, infoHash: row.info_hash,
     size: row.size, seeders: row.seeders, quality: row.quality, score: row.score, decision: row.decision,
     reason: row.reason, evidence: json(row.evidence, []), publishedAt: row.published_at, foundAt: row.found_at,
@@ -68,6 +69,7 @@ function libraryRow(row) {
   return {
     id: row.id, eventId: row.event_id, requestId: row.request_id, path: row.path, size: row.size,
     quality: row.quality, releaseTitle: row.release_title, importedAt: row.imported_at,
+    season: row.season, episode: row.episode,
   };
 }
 
@@ -89,13 +91,14 @@ export function createStore(db) {
 
     // --- events ---------------------------------------------------------
     upsertEvent(event) {
-      q(`INSERT INTO events (id, promotion_id, title, date, time, aliases, source, source_revision, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      q(`INSERT INTO events (id, promotion_id, title, date, time, aliases, source, source_revision, payload, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (id) DO UPDATE SET promotion_id = excluded.promotion_id, title = excluded.title,
            date = excluded.date, time = excluded.time, aliases = excluded.aliases, source = excluded.source,
-           source_revision = excluded.source_revision, updated_at = excluded.updated_at`)
+           source_revision = excluded.source_revision, payload = excluded.payload, updated_at = excluded.updated_at`)
         .run(event.id, event.promotionId || null, event.title, event.date, event.time || null,
-          JSON.stringify(event.aliases || []), event.source, event.sourceRevision || null, now());
+          JSON.stringify(event.aliases || []), event.source, event.sourceRevision || null,
+          event.payload ? JSON.stringify(event.payload) : null, now());
       return store.getEvent(event.id);
     },
     getEvent(id) {
@@ -111,6 +114,58 @@ export function createStore(db) {
       const sql = `SELECT * FROM events ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
                    ORDER BY date DESC, title LIMIT ?`;
       return q(sql).all(...args, Math.min(Math.max(Number(limit) || 200, 1), 1000)).map(eventRow);
+    },
+
+    // Drop a promotion's fetched events that its source no longer lists,
+    // keeping anything requested, imported, or added by hand.
+    pruneEvents(promotionId, keepIds) {
+      const keep = new Set(keepIds);
+      const rows = q(`SELECT events.id FROM events
+                      LEFT JOIN requests ON requests.event_id = events.id
+                      LEFT JOIN library ON library.event_id = events.id
+                      WHERE events.promotion_id = ? AND events.source != 'manual'
+                        AND requests.id IS NULL AND library.id IS NULL`).all(promotionId);
+      const remove = q('DELETE FROM events WHERE id = ?');
+      let removed = 0;
+      transaction(db, () => {
+        for (const row of rows) if (!keep.has(row.id)) { remove.run(row.id); removed += 1; }
+      });
+      return removed;
+    },
+
+    // --- metadata providers and per-promotion settings -------------------
+    listProviders() {
+      return q('SELECT * FROM providers ORDER BY name').all()
+        .map((row) => ({ id: row.id, name: row.name, source: json(row.source, {}), system: false, createdAt: row.created_at }));
+    },
+    saveProvider(provider) {
+      q(`INSERT INTO providers (id, name, source, created_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT (id) DO UPDATE SET name = excluded.name, source = excluded.source`)
+        .run(provider.id, provider.name, JSON.stringify(provider.source), now());
+    },
+    deleteProvider(id) {
+      transaction(db, () => {
+        q('DELETE FROM providers WHERE id = ?').run(id);
+        q('UPDATE promotion_meta SET provider_id = NULL WHERE provider_id = ?').run(id);
+      });
+    },
+    listPromotionMeta() {
+      return Object.fromEntries(q('SELECT * FROM promotion_meta').all().map((row) => [row.promotion_id, {
+        followed: !!row.followed, providerId: row.provider_id, startDate: row.start_date, logoUrl: row.logo_url,
+        refreshedAt: row.refreshed_at, refreshCount: row.refresh_count, refreshError: row.refresh_error,
+      }]));
+    },
+    updatePromotionMeta(promotionId, patch) {
+      const current = store.listPromotionMeta()[promotionId] || {};
+      const next = { followed: false, providerId: null, startDate: null, logoUrl: null, refreshedAt: null, refreshCount: null, refreshError: null, ...current, ...patch };
+      q(`INSERT INTO promotion_meta (promotion_id, followed, provider_id, start_date, logo_url, refreshed_at, refresh_count, refresh_error)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (promotion_id) DO UPDATE SET followed = excluded.followed, provider_id = excluded.provider_id,
+           start_date = excluded.start_date, logo_url = excluded.logo_url, refreshed_at = excluded.refreshed_at,
+           refresh_count = excluded.refresh_count, refresh_error = excluded.refresh_error`)
+        .run(promotionId, next.followed ? 1 : 0, next.providerId || null, next.startDate || null, next.logoUrl || null,
+          next.refreshedAt || null, next.refreshCount ?? null, next.refreshError || null);
+      return store.listPromotionMeta()[promotionId];
     },
 
     // --- requests -------------------------------------------------------
@@ -174,15 +229,15 @@ export function createStore(db) {
     // Re-finding a release refreshes its score and verdict but keeps its id,
     // so an approval the operator is looking at never points at a new row.
     saveCandidates(requestId, candidates) {
-      const insert = q(`INSERT INTO candidates (request_id, identity, source, indexer, protocol, title, download_url, info_hash,
+      const insert = q(`INSERT INTO candidates (request_id, identity, source, source_id, indexer, protocol, title, download_url, info_hash,
                           size, seeders, quality, score, decision, reason, evidence, published_at, found_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT (request_id, identity) DO UPDATE SET download_url = excluded.download_url,
-                          seeders = excluded.seeders, score = excluded.score, decision = excluded.decision,
+                          source = excluded.source, source_id = excluded.source_id, seeders = excluded.seeders, score = excluded.score, decision = excluded.decision,
                           reason = excluded.reason, evidence = excluded.evidence, found_at = excluded.found_at`);
       transaction(db, () => {
         for (const c of candidates) {
-          insert.run(requestId, c.identity, c.source, c.indexer || null, c.protocol, c.title, c.downloadUrl || null,
+          insert.run(requestId, c.identity, c.source, c.sourceId || null, c.indexer || null, c.protocol, c.title, c.downloadUrl || null,
             c.infoHash || null, c.size ?? null, c.seeders ?? null, c.quality || null, c.score, c.decision,
             c.reason || null, JSON.stringify(c.evidence || []), c.publishedAt || null, now());
         }
@@ -227,13 +282,21 @@ export function createStore(db) {
 
     // --- library --------------------------------------------------------
     addLibraryItem(item) {
-      q(`INSERT INTO library (event_id, request_id, path, size, quality, release_title, imported_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+      q(`INSERT INTO library (event_id, request_id, path, size, quality, release_title, imported_at, season, episode)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (event_id) DO UPDATE SET request_id = excluded.request_id, path = excluded.path,
            size = excluded.size, quality = excluded.quality, release_title = excluded.release_title,
-           imported_at = excluded.imported_at`)
-        .run(item.eventId, item.requestId, item.path, item.size, item.quality || null, item.releaseTitle || null, now());
+           imported_at = excluded.imported_at, season = excluded.season, episode = excluded.episode`)
+        .run(item.eventId, item.requestId, item.path, item.size, item.quality || null, item.releaseTitle || null, now(),
+          item.season ?? null, item.episode ?? null);
       return libraryRow(q('SELECT * FROM library WHERE event_id = ?').get(item.eventId));
+    },
+    updateLibraryItem(eventId, { path, season, episode }) {
+      q('UPDATE library SET path = ?, season = ?, episode = ? WHERE event_id = ?').run(path, season ?? null, episode ?? null, eventId);
+      return store.libraryFor(eventId);
+    },
+    eventsOnDate(promotionId, date) {
+      return q('SELECT * FROM events WHERE promotion_id = ? AND date = ?').all(promotionId, date).map(eventRow);
     },
     listLibrary() {
       return q('SELECT * FROM library ORDER BY imported_at DESC').all().map(libraryRow);

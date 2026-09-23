@@ -1,7 +1,12 @@
+# Dockge: paste into a stack named replayarr; see docs/DOCKGE.md.
+name: replayarr
+
 services:
   replayarr:
     container_name: replayarr
     image: ghcr.io/monkfish1337/replayarr:${REPLAYARR_TAG:-latest}
+    # Dockge's Update button then always fetches the newest build of the tag.
+    pull_policy: always
     restart: unless-stopped
     # Match the owner of your media and download folders so imported files
     # (and hardlinks) belong to the same user as the rest of your *arr stack.
@@ -45,4 +50,4 @@ volumes:
 # networks:
 #   default:
 #     external: true
-#     name: my-arr-network
+#     name: stremio-stack_stremio-net

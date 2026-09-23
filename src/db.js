@@ -100,6 +100,35 @@ const MIGRATIONS = [
      spec TEXT NOT NULL,
      updated_at TEXT NOT NULL
    );`,
+  // Which configured indexer found a candidate; Easynews downloads need its credentials.
+  `ALTER TABLE candidates ADD COLUMN source_id TEXT;`,
+  // Replayarr fetches schedules itself. Events keep the full normalised record
+  // the matchers read (team names, week, season, round...); promotions carry
+  // follow state, provider choice, start date, logo and last refresh result.
+  `ALTER TABLE events ADD COLUMN payload TEXT;
+   CREATE TABLE providers (
+     id TEXT PRIMARY KEY,
+     name TEXT NOT NULL,
+     source TEXT NOT NULL,
+     created_at TEXT NOT NULL
+   );
+   CREATE TABLE promotion_meta (
+     promotion_id TEXT PRIMARY KEY,
+     followed INTEGER NOT NULL DEFAULT 0,
+     provider_id TEXT,
+     start_date TEXT,
+     logo_url TEXT,
+     refreshed_at TEXT,
+     refresh_count INTEGER,
+     refresh_error TEXT
+   );
+   INSERT INTO promotion_meta (promotion_id, followed)
+     SELECT DISTINCT events.promotion_id, 1 FROM events JOIN requests ON requests.event_id = events.id
+     WHERE events.promotion_id IS NOT NULL;`,
+  // Season/episode numbers given to an imported event, kept so renames and
+  // media-server metadata stay stable.
+  `ALTER TABLE library ADD COLUMN season INTEGER;
+   ALTER TABLE library ADD COLUMN episode INTEGER;`,
 ];
 
 export function openDatabase(file) {

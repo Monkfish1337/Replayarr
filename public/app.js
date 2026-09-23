@@ -11,10 +11,38 @@ const icon = (name) => `<svg viewBox="0 0 24 24" aria-hidden="true"><use href="#
 const today = () => new Date().toISOString().slice(0, 10);
 
 let promotionsCache = [];
+let indexersCache = [];
+let providersCache = [];
+
+// Sonarr-style indexer types: what each needs and how it is described.
+const INDEXER_TYPES = {
+  prowlarr: { label: 'Prowlarr', protocol: 'Torrent / Usenet', about: 'Searches every indexer in one Prowlarr instance. Add a second entry for a separate Usenet Prowlarr.' },
+  bitmagnet: { label: 'Bitmagnet', protocol: 'Torrent', about: 'Your local DHT index. Fast, returns info hashes directly; results go to qBittorrent.' },
+  easynews: { label: 'Easynews', protocol: 'Direct download', about: 'Searches Easynews and downloads matches directly over HTTPS with the built-in downloader.' },
+};
+const PROTOCOL_LABELS = { torrent: ['torrent', 'label-success'], usenet: ['nzb', 'label-info'], easynews: ['easynews', 'label-purple'] };
+const CLIENT_LABELS = { qbittorrent: 'qBittorrent', sabnzbd: 'SABnzbd', easynews: 'Easynews' };
 let pollTimer = null;
 let renderToken = 0;
 
 // --- API ----------------------------------------------------------------
+// The UI build this tab loaded. The server sends its current build on every
+// API response; a difference means Replayarr was updated since the page
+// loaded, and the tab should be reloaded to get the new interface.
+let loadedBuild = null;
+function checkBuild(response) {
+  const build = response.headers.get('x-replayarr-ui');
+  if (!build) return;
+  if (loadedBuild === null) { loadedBuild = build; return; }
+  if (build !== loadedBuild && !$('#update-banner')) {
+    const banner = document.createElement('div');
+    banner.id = 'update-banner';
+    banner.className = 'update-banner';
+    banner.innerHTML = 'Replayarr has been updated. <button class="button button-primary" type="button" onclick="location.reload()">Reload</button>';
+    document.body.append(banner);
+  }
+}
+
 async function api(path, { method = 'GET', body } = {}) {
   // The server only accepts JSON on writes (its CSRF guard), so every
   // POST/PUT carries a JSON body even when there is nothing to send.
@@ -24,6 +52,7 @@ async function api(path, { method = 'GET', body } = {}) {
     headers: writes ? { 'content-type': 'application/json' } : {},
     body: writes ? JSON.stringify(body ?? {}) : undefined,
   });
+  checkBuild(response);
   if (response.status === 204) return null;
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
@@ -107,12 +136,14 @@ const NAV = [
   { key: 'calendar', label: 'Calendar', icon: 'calendar', href: '#/calendar' },
   { key: 'activity', label: 'Activity', icon: 'activity', href: '#/activity/queue', count: 'queue', children: [['Queue', '#/activity/queue'], ['History', '#/activity/history']] },
   { key: 'wanted', label: 'Wanted', icon: 'wanted', href: '#/wanted/missing', count: 'review', children: [['Missing', '#/wanted/missing'], ['Needs Review', '#/wanted/review']] },
+  { key: 'metadata', label: 'Metadata', icon: 'metadata', href: '#/metadata/promotions', children: [
+    ['Promotions', '#/metadata/promotions'], ['Providers', '#/metadata/providers'], ['Matching Rules', '#/metadata/rules'], ['Settings', '#/metadata/settings']] },
   { key: 'settings', label: 'Settings', icon: 'settings', href: '#/settings/mediamanagement', children: [
     ['Media Management', '#/settings/mediamanagement'], ['Indexers', '#/settings/indexers'], ['Download Clients', '#/settings/downloadclients'],
-    ['Metadata Source', '#/settings/metadata'], ['Promotions', '#/settings/promotions'], ['General', '#/settings/general']] },
+    ['Connect', '#/settings/connect'], ['General', '#/settings/general']] },
   { key: 'system', label: 'System', icon: 'system', href: '#/system/status', children: [['Status', '#/system/status'], ['Tasks', '#/system/tasks'], ['Events', '#/system/events']] },
 ];
-const sectionOf = { promotions: 'promotions', promotion: 'promotions', add: 'promotions', library: 'promotions', calendar: 'calendar', activity: 'activity', wanted: 'wanted', settings: 'settings', system: 'system' };
+const sectionOf = { promotions: 'promotions', promotion: 'promotions', add: 'promotions', library: 'promotions', calendar: 'calendar', activity: 'activity', wanted: 'wanted', metadata: 'metadata', settings: 'settings', system: 'system' };
 let navCounts = { queue: 0, review: 0 };
 
 function renderSidebar(route) {
@@ -146,11 +177,14 @@ async function refreshChrome() {
 }
 
 // --- shared pieces ------------------------------------------------------
+// A chosen logo wins; otherwise the promotion's shipped artwork, else its name.
+const logoOf = (promotion) => promotion.logo || promotion.defaultLogo || '';
 function posterStyle(promotion) {
-  return promotion.poster ? `style="background-image:url('${esc(promotion.poster)}')"` : '';
+  const logo = logoOf(promotion);
+  return logo ? `style="background-image:url('${esc(logo)}')"` : '';
 }
 function posterFallback(promotion) {
-  return promotion.poster ? '' : `<span class="poster-fallback">${esc(promotion.name)}</span>`;
+  return logoOf(promotion) ? '' : `<span class="poster-fallback">${esc(promotion.name)}</span>`;
 }
 
 function eventRows(events, { showPromotion = false } = {}) {
@@ -172,6 +206,29 @@ function eventRows(events, { showPromotion = false } = {}) {
   }).join('');
 }
 
+function promotionGrid(list) {
+  return `<div class="poster-grid">${list.sort((a, b) => a.name.localeCompare(b.name)).map((p) => {
+    const pct = p.stats.requested ? Math.round((p.stats.downloaded / p.stats.requested) * 100) : 0;
+    return `<a class="poster-card" href="#/promotion/${esc(p.id)}">
+      <div class="poster logo" ${posterStyle(p)}>${posterFallback(p)}${p.stats.requested ? '<span class="poster-flag" title="Has requested events"></span>' : ''}</div>
+      <div class="progress-bar ${pct < 100 && p.stats.requested ? 'partial' : ''}" title="${p.stats.downloaded} of ${p.stats.requested} requested events downloaded"><span style="width:${p.stats.requested ? Math.max(pct, 2) : 0}%"></span></div>
+      <div class="poster-info"><div class="poster-title">${esc(p.name)}</div>
+      <div class="poster-meta">${p.refreshState === 'queued' ? 'Queued for refresh' : p.refreshing ? 'Refreshing…' : p.refreshError ? 'Refresh failed' : p.stats.nextDate ? `Next: ${formatDate(p.stats.nextDate)}` : `${p.stats.events} event${p.stats.events === 1 ? '' : 's'}`}</div>
+      <div class="poster-meta">${p.stats.downloaded} / ${p.stats.requested} downloaded</div></div>
+    </a>`;
+  }).join('')}</div>`;
+}
+
+// While a metadata refresh runs, pages that show promotions re-render every
+// few seconds so counts and status fill in.
+async function refreshBanner() {
+  const status = await api('/metadata/status').catch(() => null);
+  if (!status?.running) return '';
+  schedulePoll(3000);
+  const current = promotionsCache.find((p) => p.id === status.current)?.name || status.current;
+  return `<div class="alert">${icon('refresh')}<div>Refreshing metadata: <strong>${esc(current || '…')}</strong>${status.queued.length ? ` · ${status.queued.length} more queued` : ''}. TheSportsDB promotions can take a few minutes.</div></div>`;
+}
+
 // Requesting is idempotent server-side, and returns the full request view.
 function ensureRequest(eventId) {
   return api('/requests', { method: 'POST', body: { eventId } });
@@ -181,30 +238,23 @@ function ensureRequest(eventId) {
 const pages = {
   async promotions() {
     setToolbar(
-      toolbarButton('sync-events', 'refresh', 'Refresh Events') + toolbarButton('search-missing', 'search', 'Search Missing'),
-      toolbarButton('go-add', 'plus', 'Add Event'),
+      toolbarButton('sync-events', 'refresh', 'Refresh Metadata') + toolbarButton('search-missing', 'search', 'Search Missing'),
+      toolbarButton('go-add', 'plus', 'Add Promotion'),
     );
     const promotions = await api('/promotions');
     promotionsCache = promotions;
-    const withEvents = promotions.filter((p) => p.stats.events > 0);
+    const withEvents = promotions.filter((p) => p.followed || p.stats.events > 0);
+    const banner = await refreshBanner();
     if (!withEvents.length) {
-      return `<div class="empty-state"><h2>No events yet</h2><p>Connect your SSS install under <a href="#/settings/metadata">Settings › Metadata Source</a> and refresh, or <a href="#/add">add an event by hand</a>.</p></div>`;
+      return `${banner}<div class="empty-state"><h2>No promotions yet</h2><p><a href="#/add">Add a promotion</a> to start fetching its schedule, as you would add a series in Sonarr.</p></div>`;
     }
-    return `<div class="poster-grid">${withEvents.sort((a, b) => a.name.localeCompare(b.name)).map((p) => {
-      const pct = p.stats.requested ? Math.round((p.stats.downloaded / p.stats.requested) * 100) : 0;
-      return `<a class="poster-card" href="#/promotion/${esc(p.id)}">
-        <div class="poster ${esc(p.posterShape)}" ${posterStyle(p)}>${posterFallback(p)}${p.stats.requested ? '<span class="poster-flag" title="Has requested events"></span>' : ''}</div>
-        <div class="progress-bar ${pct < 100 && p.stats.requested ? 'partial' : ''}" title="${p.stats.downloaded} of ${p.stats.requested} requested events downloaded"><span style="width:${p.stats.requested ? Math.max(pct, 2) : 0}%"></span></div>
-        <div class="poster-info"><div class="poster-title">${esc(p.name)}</div>
-        <div class="poster-meta">${p.stats.nextDate ? `Next: ${formatDate(p.stats.nextDate)}` : `${p.stats.events} event${p.stats.events === 1 ? '' : 's'}`}</div>
-        <div class="poster-meta">${p.stats.downloaded} / ${p.stats.requested} downloaded</div></div>
-      </a>`;
-    }).join('')}</div>`;
+    return banner + promotionGrid(withEvents);
   },
+
 
   async promotion([id]) {
     setToolbar(
-      toolbarButton('sync-events', 'refresh', 'Refresh Events') + toolbarButton('search-promotion', 'search', 'Search Monitored'),
+      toolbarButton('refresh-promotion', 'refresh', 'Refresh') + toolbarButton('search-promotion', 'search', 'Search Monitored') + toolbarButton('logo-picker', 'image', 'Logo'),
       toolbarButton('expand-all', 'list', 'Expand All') + toolbarButton('collapse-all', 'grid', 'Collapse All'),
     );
     promotionsCache = await api('/promotions');
@@ -230,25 +280,78 @@ const pages = {
       </section>`;
     }).join('');
     return `<div class="details-header">
-        <div class="poster ${esc(promotion.posterShape)}" ${posterStyle(promotion)}>${posterFallback(promotion)}</div>
+        <div class="poster logo" data-action="logo-picker" data-id="${esc(promotion.id)}" title="Change logo" style="cursor:pointer;${logoOf(promotion) ? `background-image:url('${esc(logoOf(promotion))}')` : ''}">${posterFallback(promotion)}</div>
         <div class="details-info"><h1 class="details-title">${esc(promotion.name)}</h1>
-          <div class="details-sub">${promotion.custom ? 'Custom promotion' : 'Built-in promotion'}${promotion.overlay ? ' · learned aliases applied' : ''}</div>
+          <div class="details-sub">${promotion.custom ? 'Custom promotion' : 'Built-in promotion'} · ${esc(promotion.providerName)}${promotion.overlay ? ' · learned aliases applied' : ''}</div>
+          ${promotion.refreshError ? `<div class="alert alert-warning">${icon('warning')}<div>Last refresh failed: ${esc(promotion.refreshError)} <a href="#/metadata/promotions">Metadata</a></div></div>` : ''}
           <div class="labels"><span class="label label-outline">${stats.events} events</span><span class="label label-outline">${stats.requested} requested</span>
             <span class="label ${stats.requested && stats.downloaded === stats.requested ? 'label-success' : 'label-outline'}">${stats.downloaded} downloaded</span>
-            ${stats.nextDate ? `<span class="label label-primary">Next ${formatDate(stats.nextDate)}</span>` : ''}</div></div>
+            ${stats.nextDate ? `<span class="label label-primary">Next ${formatDate(stats.nextDate)}</span>` : ''}
+            ${promotion.followed ? '<span class="label label-success">Followed</span>' : `<button class="button button-primary" data-action="follow-promotion" data-id="${esc(promotion.id)}">${icon('plus')} Follow</button>`}</div></div>
       </div>${seasons || '<div class="empty-state">No events for this promotion yet.</div>'}`;
   },
 
   async add() {
-    setToolbar(toolbarButton('sync-events', 'refresh', 'Refresh From SSS'), toolbarButton('manual-event', 'plus', 'Add Manually'));
+    setToolbar(toolbarButton('sync-events', 'refresh', 'Refresh Metadata'), toolbarButton('manual-event', 'plus', 'Add Event Manually'));
     promotionsCache = await api('/promotions');
-    return `<h1 class="page-title">Add New</h1>
-      <div class="header-search" style="max-width:none;margin:0 0 20px"><input id="add-search" type="search" placeholder="Search events by team, promotion or name" autocomplete="off"></div>
-      <div class="table-panel" id="add-results"><div class="empty-state">Start typing to find an event from your SSS calendar.</div></div>`;
+    const available = promotionsCache.filter((p) => !p.followed).sort((a, b) => a.name.localeCompare(b.name));
+    return `<h1 class="page-title">Add New Promotion</h1>
+      <p class="muted">Following a promotion fetches its schedule and keeps it up to date. Change its provider, start date or logo under <a href="#/metadata/promotions">Metadata › Promotions</a>.</p>
+      <div class="header-search" style="max-width:none;margin:0 0 20px"><input id="promo-filter" type="search" placeholder="Filter promotions" autocomplete="off"></div>
+      ${available.length ? `<div class="poster-grid" id="add-promos">${available.map((p) => `<div class="poster-card add-promo" data-name="${esc(p.name.toLowerCase())}">
+        <div class="poster logo" ${posterStyle(p)}>${posterFallback(p)}</div>
+        <div class="poster-info"><div class="poster-title">${esc(p.name)}</div><div class="poster-meta">${esc(p.providerName)}</div></div>
+        <button class="button button-primary" data-action="follow-promotion" data-id="${esc(p.id)}">${icon('plus')} Add</button></div>`).join('')}</div>`
+        : '<div class="empty-state">You follow every promotion. Create more under <a href="#/metadata/rules">Metadata › Matching Rules</a>.</div>'}
+      <h2 class="page-title" style="margin-top:30px">Find an Event</h2>
+      <div class="header-search" style="max-width:none;margin:0 0 20px"><input id="add-search" type="search" placeholder="Search fetched events by team, promotion or name" autocomplete="off"></div>
+      <div class="table-panel" id="add-results"><div class="empty-state">Start typing to find an event from your followed promotions.</div></div>`;
+  },
+
+  async metadata([tab = 'promotions']) {
+    if (tab === 'settings') return pages.settings(['metadatakeys']);
+    if (tab === 'rules') return pages.settings(['promotions']);
+    if (tab === 'providers') {
+      setToolbar(toolbarButton('add-provider', 'plus', 'Add Provider'));
+      const providers = await api('/metadata/providers');
+      providersCache = providers;
+      return `<h1 class="page-title">Providers</h1>
+        <p class="muted">Where schedules come from. Shipped providers cover the built-in promotions; add your own for another league, team or any public JSON schedule, then assign it under Promotions.</p>
+        <div id="provider-preview"></div>
+        <div class="table-panel"><table class="table"><thead><tr><th>Provider</th><th class="hide-sm">Adapter</th><th>Used By</th><th>Kind</th><th></th></tr></thead><tbody>
+        ${providers.map((p) => `<tr><td><strong>${esc(p.name)}</strong><div class="evidence">${esc(p.id)}</div></td>
+          <td class="hide-sm"><span class="label label-info">${esc(p.source.type)}</span><div class="evidence">${esc(p.description)}</div></td>
+          <td>${esc(p.usedBy.join(', ') || '—')}</td>
+          <td>${p.system ? '<span class="label label-default">Shipped</span>' : '<span class="label label-success">Custom</span>'}</td>
+          <td class="actions"><button class="button" data-action="preview-provider" data-id="${esc(p.id)}">Test &amp; Preview</button>
+            ${p.system ? '' : `<button class="icon-button danger" data-action="delete-provider" data-id="${esc(p.id)}" title="Delete" aria-label="Delete provider">${icon('trash')}</button>`}</td></tr>`).join('')}
+        </tbody></table></div>`;
+    }
+    setToolbar(toolbarButton('sync-events', 'refresh', 'Refresh Followed'), toolbarButton('go-add', 'plus', 'Add Promotion'));
+    const [list, providers] = await Promise.all([api('/promotions'), api('/metadata/providers')]);
+    promotionsCache = list;
+    providersCache = providers;
+    const banner = await refreshBanner();
+    const sorted = list.slice().sort((a, b) => (b.followed - a.followed) || a.name.localeCompare(b.name));
+    return `<h1 class="page-title">Promotions</h1>${banner}
+      <div class="table-panel"><table class="table"><thead><tr><th>Promotion</th><th>Follow</th><th>Provider</th><th class="hide-sm">Start Date</th><th class="hide-sm">Events</th><th>Last Refresh</th><th></th></tr></thead><tbody>
+      ${sorted.map((p) => `<tr data-id="${esc(p.id)}">
+        <td><div class="promo-cell"><button class="logo-thumb ${logoOf(p) ? '' : 'empty'}" data-action="logo-picker" data-id="${esc(p.id)}" title="Choose logo" aria-label="Choose logo for ${esc(p.name)}" ${logoOf(p) ? `style="background-image:url('${esc(logoOf(p))}')"` : ''}>${logoOf(p) ? '' : icon('image')}</button>
+          <div><a href="#/promotion/${esc(p.id)}">${esc(p.name)}</a><div class="evidence">${esc(p.id)}${p.custom ? ' · custom' : ''}</div></div></div></td>
+        <td><label class="switch" title="${p.followed ? 'Following' : 'Not followed'}"><input type="checkbox" data-change="follow" ${p.followed ? 'checked' : ''} aria-label="Follow ${esc(p.name)}"><span></span></label></td>
+        <td><select class="inline-input" data-change="provider" aria-label="Provider for ${esc(p.name)}">${providers.map((pr) => `<option value="${esc(pr.id)}" ${(p.providerId ? p.providerId === pr.id : pr.usedBy.includes(p.name)) ? 'selected' : ''}>${esc(pr.name)}</option>`).join('')}
+          ${!p.providerId && !providers.some((pr) => pr.usedBy.includes(p.name)) ? `<option value="" selected>${esc(p.providerName)}</option>` : ''}</select></td>
+        <td class="hide-sm"><input class="inline-input" type="date" data-change="start" value="${esc(p.startDate || '')}" aria-label="Start date for ${esc(p.name)}"></td>
+        <td class="hide-sm">${p.stats.events}</td>
+        <td class="nowrap">${p.refreshState === 'queued' ? '<span class="label label-default">Queued</span>' : p.refreshing ? '<span class="label label-info">Refreshing…</span>'
+          : p.refreshError ? `<span class="rejection" tabindex="0">${icon('warning')}<span class="tip">${esc(p.refreshError)}</span></span> <span class="muted">${relative(p.refreshedAt)}</span>`
+          : p.refreshedAt ? `<span class="muted" title="${esc(formatDateTime(p.refreshedAt))}">${relative(p.refreshedAt)} · ${p.refreshCount}</span>` : '<span class="muted">Never</span>'}</td>
+        <td class="actions"><button class="icon-button" data-action="refresh-promotion" data-id="${esc(p.id)}" title="Refresh now" aria-label="Refresh ${esc(p.name)}" ${p.refreshing ? 'disabled' : ''}>${icon('refresh')}</button></td></tr>`).join('')}
+      </tbody></table></div>`;
   },
 
   async library() {
-    setToolbar();
+    setToolbar(toolbarButton('rename-preview', 'list', 'Rename Files') + toolbarButton('write-metadata', 'save', 'Write Metadata'));
     promotionsCache = await api('/promotions');
     const items = await api('/library');
     if (!items.length) return `<h1 class="page-title">Library</h1><div class="empty-state">Nothing has been imported yet.</div>`;
@@ -307,7 +410,7 @@ const pages = {
         return `<tr><td class="narrow">${job.error ? `<span class="rejection" tabindex="0">${icon('warning')}<span class="tip">${esc(job.error)}</span></span>` : icon('download')}</td>
           <td class="nowrap">${esc(promotionOf(event)?.name || '')}</td><td class="title-cell">${esc(event?.title)}</td>
           <td class="title-cell hide-sm evidence">${esc(job.candidate?.title)}</td><td>${job.candidate?.quality ? `<span class="label label-default">${esc(job.candidate.quality)}</span>` : ''}</td>
-          <td class="nowrap hide-sm">${job.client === 'sabnzbd' ? 'SABnzbd' : 'qBittorrent'}</td>
+          <td class="nowrap hide-sm">${CLIENT_LABELS[job.client] || job.client}</td>
           <td style="min-width:130px"><div class="progress-bar tall"><span style="width:${job.request.status === 'importing' ? 100 : pct}%"></span><span class="progress-label">${state}</span></div></td></tr>`;
       }).join('')}
     </tbody></table></div>`;
@@ -360,15 +463,20 @@ const pages = {
         ${field('library.mode', 'Import Mode', settings.library.mode, { options: [['hardlink', 'Hardlink (fall back to copy)'], ['copy', 'Copy'], ['move', 'Move']], help: 'Hardlinks keep torrents seeding without using extra space. Move stops a torrent from seeding.' })}
         ${field('library.minSizeMb', 'Minimum File Size (MB)', settings.library.minSizeMb, { type: 'number', help: 'Files smaller than this are rejected as samples or clips.' })}</fieldset>
         <fieldset class="fieldset" style="border:0;padding:0"><legend>Event Naming</legend>
-        ${field('library.naming', 'Event Format', settings.library.naming, { help: 'Tokens: {promotion} {title} {date} {year} {quality} {release}. Use / for folders.' })}
+        ${field('library.naming', 'Event Format', settings.library.naming, { help: 'Tokens: {promotion} {title} {date} {year} {season} {episode} {quality} {release}. Use / for folders. Keep S{season}E{episode} in the name so Jellyfin can number events; {episode} is the date (MMDD) plus the order that day. After changing it, use Library › Rename Files.' })}
+        ${field('library.writeMetadata', 'Media Server Metadata', settings.library.writeMetadata, { options: [['yes', 'Write .nfo files and artwork (Jellyfin, Kodi)'], ['no', 'Do not write']], help: 'Saves each event’s details and TheSportsDB artwork next to the file, plus the promotion’s poster (your chosen logo). Set the Jellyfin library to use NFO and turn off its online metadata downloaders.' })}
         <div class="form-group"><span class="form-label">Example</span><div class="form-input"><code id="naming-example"></code></div></div></fieldset>`;
     } else if (tab === 'indexers') {
-      body = `<fieldset class="fieldset" style="border:0;padding:0"><legend>Prowlarr</legend>
-        ${field('prowlarr.url', 'URL', settings.prowlarr.url, { placeholder: 'http://prowlarr:9696' })}
-        ${field('prowlarr.apiKey', 'API Key', settings.prowlarr.apiKey, { type: 'password', help: 'Prowlarr › Settings › General › Security.' })}
-        ${field('prowlarr.maxQueries', 'Queries Per Search', settings.prowlarr.maxQueries, { type: 'number', help: 'Search titles come from the promotion matchers, most precise first. More queries find more, but load your indexers.' })}
-        ${field('prowlarr.timeoutMs', 'Query Timeout (ms)', settings.prowlarr.timeoutMs, { type: 'number' })}
-        ${test('prowlarr')}</fieldset>
+      indexersCache = settings.indexers;
+      body = `<fieldset class="fieldset" style="border:0;padding:0"><legend>Indexers</legend>
+        <div class="cards">${settings.indexers.map((indexer) => `<button type="button" class="card indexer-card" data-action="edit-indexer" data-id="${esc(indexer.id)}">
+            <h3>${esc(indexer.name)}</h3>
+            <div class="labels"><span class="label label-default">${esc(INDEXER_TYPES[indexer.type]?.label || indexer.type)}</span>
+              <span class="label label-outline">${esc(INDEXER_TYPES[indexer.type]?.protocol || '')}</span>
+              ${indexer.enabled ? '<span class="label label-success">Enabled</span>' : '<span class="label label-danger">Disabled</span>'}
+              <span class="label label-outline">${indexer.maxQueries} queries</span></div></button>`).join('')}
+          <button type="button" class="card indexer-card add-card" data-action="add-indexer" aria-label="Add indexer">${icon('plus')}</button></div>
+        <p class="form-help" style="max-width:none">Every enabled indexer is searched with the promotion's search titles, most precise first, up to its query limit. A release found by several indexers is listed once.</p></fieldset>
         <fieldset class="fieldset" style="border:0;padding:0"><legend>Release Preferences</legend>
         ${field('preferences.protocol', 'Preferred Protocol', settings.preferences.protocol, { options: [['any', 'No preference'], ['usenet', 'Prefer Usenet'], ['torrent', 'Prefer Torrent']] })}
         ${field('preferences.minSeeders', 'Minimum Seeders', settings.preferences.minSeeders, { type: 'number' })}</fieldset>`;
@@ -376,9 +484,11 @@ const pages = {
       const mappings = settings.pathMappings.length ? settings.pathMappings : [{ remote: '', local: '' }];
       body = `<fieldset class="fieldset" style="border:0;padding:0"><legend>qBittorrent</legend>
         ${field('qbittorrent.url', 'URL', settings.qbittorrent.url, { placeholder: 'http://qbittorrent:8080' })}
-        ${field('qbittorrent.username', 'Username', settings.qbittorrent.username)}
+        ${field('qbittorrent.apiKey', 'API Key', settings.qbittorrent.apiKey, { type: 'password', help: 'qBittorrent 5.2 or newer: Options › WebUI › API Key. When set, the username and password are not used.' })}
+        ${field('qbittorrent.username', 'Username', settings.qbittorrent.username, { help: 'Only needed without an API key.' })}
         ${field('qbittorrent.password', 'Password', settings.qbittorrent.password, { type: 'password' })}
         ${field('qbittorrent.category', 'Category', settings.qbittorrent.category)}
+        ${field('qbittorrent.savePath', 'Save Path', settings.qbittorrent.savePath, { placeholder: '/downloads/replays', help: 'Where qBittorrent saves Replayarr torrents, as a path inside qBittorrent. Blank uses the category save path. Add a Remote Path Mapping below if Replayarr sees that folder under a different path.' })}
         ${test('qbittorrent')}</fieldset>
         <fieldset class="fieldset" style="border:0;padding:0"><legend>SABnzbd</legend>
         ${field('sabnzbd.url', 'URL', settings.sabnzbd.url, { placeholder: 'http://sabnzbd:8080' })}
@@ -390,17 +500,21 @@ const pages = {
         <div class="table-panel"><table class="table" id="mappings"><thead><tr><th>Remote Path</th><th>Local Path</th><th></th></tr></thead><tbody>
         ${mappings.map((m) => `<tr><td class="form-input"><input data-map="remote" value="${esc(m.remote)}" placeholder="/downloads"></td><td class="form-input"><input data-map="local" value="${esc(m.local)}" placeholder="/data/downloads"></td><td class="actions"><button class="icon-button danger" data-action="remove-mapping" aria-label="Remove mapping">${icon('trash')}</button></td></tr>`).join('')}
         </tbody></table><button type="button" class="button" data-action="add-mapping" style="margin-top:10px">${icon('plus')} Add Mapping</button></div></fieldset>`;
-    } else if (tab === 'metadata') {
-      body = `<fieldset class="fieldset" style="border:0;padding:0"><legend>SeriousSportSync</legend>
-        <div class="alert">${icon('warning')}<div>Replayarr only reads from SSS: the calendar, event names and search aliases. Nothing is written back.</div></div>
-        ${field('sss.manifestUrl', 'Install URL', settings.sss.manifestUrl, { type: 'password', placeholder: 'https://sss.example.com/u/…/manifest.json', help: 'The addon install URL from your SSS account page. It contains your SSS token, so it is stored like a password.' })}
-        ${field('sss.lookbackDays', 'Import Past Days', settings.sss.lookbackDays, { type: 'number' })}
-        ${field('sss.lookaheadDays', 'Import Upcoming Days', settings.sss.lookaheadDays, { type: 'number' })}
-        ${test('sss')}</fieldset>`;
+    } else if (tab === 'metadatakeys') {
+      const m = settings.metadata;
+      body = `<fieldset class="fieldset" style="border:0;padding:0"><legend>Schedule</legend>
+        ${field('metadata.daysBack', 'Import Past Days', m.daysBack, { type: 'number', help: 'How far back a refresh fetches, unless a promotion has its own start date. Longer windows make TheSportsDB refreshes much slower.' })}
+        ${field('metadata.daysAhead', 'Import Upcoming Days', m.daysAhead, { type: 'number' })}
+        ${field('metadata.refreshHours', 'Refresh Every (hours)', m.refreshHours, { type: 'number', help: 'Followed promotions refresh in the background on this interval.' })}</fieldset>
+        <fieldset class="fieldset" style="border:0;padding:0"><legend>API Keys</legend>
+        ${field('metadata.tsdbApiKey', 'TheSportsDB', m.tsdbApiKey, { help: '123 is TheSportsDB\'s free key. A Patreon key lifts its rate and result limits.' })}
+        ${field('metadata.footballDataApiKey', 'football-data.org', m.footballDataApiKey, { type: 'password', help: 'Needed for the Premier League and other football-data providers. Free at football-data.org/client/register.' })}
+        ${field('metadata.apiFootballApiKey', 'API-Football', m.apiFootballApiKey, { type: 'password', help: 'Only for API-Football providers.' })}
+        ${field('metadata.tmdbApiKey', 'TMDB', m.tmdbApiKey, { type: 'password', help: 'Needed for Match of the Day and other TMDB providers. Free at themoviedb.org.' })}</fieldset>`;
     } else if (tab === 'promotions') {
       promotionsCache = await api('/promotions');
       setToolbar(toolbarButton('promotion-rule', 'plus', 'Add Rule'));
-      return `<h1 class="page-title">Promotions</h1>
+      return `<h1 class="page-title">Matching Rules</h1>
         <p class="form-help" style="max-width:none">Matching comes from SSS's promotion matchers. Add learned aliases to a built-in promotion, or create a custom promotion, when releases use names the matchers do not know.</p>
         <div class="table-panel"><table class="table"><thead><tr><th>Promotion</th><th>Type</th><th class="hide-sm">Aliases</th><th></th></tr></thead><tbody>
         ${promotionsCache.map((p) => {
@@ -410,6 +524,19 @@ const pages = {
             <td class="actions"><button class="icon-button" data-action="promotion-rule" data-id="${esc(p.id)}" title="Edit rules" aria-label="Edit rules">${icon('settings')}</button>
             ${rule ? `<button class="icon-button danger" data-action="delete-rule" data-id="${esc(p.id)}" title="Remove rules" aria-label="Remove rules">${icon('trash')}</button>` : ''}</td></tr>`;
         }).join('')}</tbody></table></div>`;
+    } else if (tab === 'connect') {
+      body = `<fieldset class="fieldset" style="border:0;padding:0"><legend>Jellyfin</legend>
+        <p class="form-help" style="max-width:none">Replayarr asks Jellyfin to rescan its libraries after importing or renaming, so events appear straight away.</p>
+        ${field('jellyfin.url', 'URL', settings.jellyfin.url, { placeholder: 'http://jellyfin:8096' })}
+        ${field('jellyfin.apiKey', 'API Key', settings.jellyfin.apiKey, { type: 'password', help: 'Jellyfin › Dashboard › API Keys › +.' })}
+        ${test('jellyfin')}</fieldset>
+        <fieldset class="fieldset" style="border:0;padding:0"><legend>Jellyfin library setup</legend>
+        <ol class="form-help" style="max-width:none;line-height:1.7">
+          <li>Add a library of type <strong>Shows</strong> pointing at your Replayarr library folder as Jellyfin sees it (for example <code>/data/media/sports</code>).</li>
+          <li>Under <strong>Metadata downloaders</strong> and <strong>Image fetchers</strong>, untick everything (TheMovieDb, TheTVDB, OMDb…). Online databases do not carry sports events and will mis-match them.</li>
+          <li>Leave <strong>Nfo</strong> ticked under <strong>Metadata readers</strong>. Jellyfin then uses the .nfo files and artwork Replayarr writes.</li>
+          <li>For events imported before this was set up, run <strong>Library › Rename Files</strong>, then <strong>Write Metadata</strong>.</li>
+        </ol></fieldset>`;
     } else if (tab === 'general') {
       setToolbar();
       const status = await api('/system/status');
@@ -440,7 +567,7 @@ const pages = {
     return `<fieldset class="fieldset" style="border:0;padding:0"><legend>Health</legend>
       ${health.length ? health.map((h) => `<div class="alert alert-${h.type}">${icon('warning')}<div>${esc(h.message)} ${h.link ? `<a href="#/${esc(h.link)}">Fix</a>` : ''}</div></div>`).join('') : `<div class="alert alert-success">${icon('check')}<div>No issues with your configuration.</div></div>`}</fieldset>
       <fieldset class="fieldset" style="border:0;padding:0"><legend>About</legend><table class="table info-table"><tbody>
-        <tr><td>Version</td><td>${esc(status.version)}</td></tr><tr><td>Node.js</td><td>${esc(status.node)} (${esc(status.platform)})</td></tr>
+        <tr><td>Version</td><td>${esc(status.version)}${status.revision ? ` (build <a href="https://github.com/Monkfish1337/Replayarr/commit/${esc(status.revision)}" target="_blank" rel="noopener">${esc(status.revision)}</a>)` : ''}</td></tr><tr><td>Node.js</td><td>${esc(status.node)} (${esc(status.platform)})</td></tr>
         <tr><td>Database</td><td class="title-cell">${esc(status.database)}</td></tr><tr><td>Promotions</td><td>${status.promotions}</td></tr>
         <tr><td>Started</td><td>${formatDateTime(status.startedAt)}</td></tr>
         <tr><td>Matching</td><td>Ported from SeriousSportSync</td></tr></tbody></table></fieldset>`;
@@ -489,10 +616,10 @@ async function renderReleases(requestId) {
     ${detail.candidates.map((c) => {
       const rejected = c.decision !== 'matched';
       const chosen = detail.candidateId === c.id;
-      return `<tr class="${rejected ? 'rejected' : ''}"><td class="hide-sm"><span class="label ${c.protocol === 'usenet' ? 'label-info' : 'label-success'}">${c.protocol === 'usenet' ? 'nzb' : 'torrent'}</span></td>
+      return `<tr class="${rejected ? 'rejected' : ''}"><td class="hide-sm"><span class="label ${(PROTOCOL_LABELS[c.protocol] || PROTOCOL_LABELS.torrent)[1]}">${(PROTOCOL_LABELS[c.protocol] || PROTOCOL_LABELS.torrent)[0]}</span></td>
         <td class="nowrap hide-sm">${esc(age(c.publishedAt))}</td>
         <td class="title-cell">${esc(c.title)}${!rejected ? `<div class="evidence">${esc(c.evidence.join(' · '))}</div>` : ''}</td>
-        <td class="hide-sm">${esc(c.indexer || '')}</td><td class="nowrap">${formatSize(c.size)}</td>
+        <td class="hide-sm">${esc(c.source && c.indexer && c.indexer !== c.source ? `${c.source} · ${c.indexer}` : (c.source || c.indexer || ''))}</td><td class="nowrap">${formatSize(c.size)}</td>
         <td class="hide-sm">${c.protocol === 'torrent' ? esc(c.seeders ?? '') : ''}</td>
         <td>${c.quality ? `<span class="label label-default">${esc(c.quality)}</span>` : ''}</td>
         <td class="score">${rejected ? '' : c.score}</td>
@@ -538,6 +665,150 @@ async function promotionRuleModal(id) {
     <div class="modal-footer"><button class="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit" form="rule-form">Save</button></div>`);
 }
 
+function indexerModal(indexer) {
+  const isNew = !indexer.id;
+  const type = INDEXER_TYPES[indexer.type];
+  const input = (name, label, value, { type: inputType = 'text', help = '', placeholder = '' } = {}) => `<div class="form-group"><label class="form-label" for="ix-${name}">${label}</label><div class="form-input">
+    <input id="ix-${name}" name="${name}" type="${inputType}" value="${esc(value ?? '')}" placeholder="${esc(placeholder)}" autocomplete="off">${help ? `<div class="form-help">${help}</div>` : ''}</div></div>`;
+  const fields = {
+    prowlarr: input('url', 'URL', indexer.url, { placeholder: 'http://prowlarr:9696' })
+      + input('apiKey', 'API Key', indexer.apiKey, { type: 'password', help: 'Prowlarr › Settings › General › API Key.' })
+      + input('timeoutMs', 'Query Timeout (ms)', indexer.timeoutMs ?? 20000, { type: 'number' }),
+    bitmagnet: input('url', 'URL', indexer.url, { placeholder: 'http://gluetun:3333', help: 'The Bitmagnet web address; /graphql is added automatically.' })
+      + input('limit', 'Results Per Query', indexer.limit ?? 100, { type: 'number', help: 'Ordered by seeders, so a limit keeps the best-seeded end.' })
+      + input('timeoutMs', 'Query Timeout (ms)', indexer.timeoutMs ?? 15000, { type: 'number' }),
+    easynews: input('username', 'Username', indexer.username)
+      + input('password', 'Password', indexer.password, { type: 'password' })
+      + input('downloadFolder', 'Download Folder', indexer.downloadFolder, { placeholder: '/data/downloads/easynews', help: 'Where Replayarr saves Easynews files before importing. Put it on the same drive as the library so imports can be hardlinks.' })
+      + input('timeoutMs', 'Search Timeout (ms)', indexer.timeoutMs ?? 20000, { type: 'number' }),
+  }[indexer.type];
+  const defaultQueries = { prowlarr: 6, bitmagnet: 12, easynews: 4 }[indexer.type];
+  openModal(`<div class="modal-header"><span>${isNew ? 'Add' : 'Edit'} Indexer – ${esc(type.label)}</span><button class="icon-button" data-action="close-modal" aria-label="Close">${icon('x')}</button></div>
+    <form id="indexer-form" class="modal-body" data-id="${esc(indexer.id || '')}" data-type="${esc(indexer.type)}">
+      <p class="form-help" style="max-width:none;margin-top:0">${esc(type.about)}</p>
+      ${input('name', 'Name', indexer.name || type.label)}
+      <div class="form-group"><span></span><label class="form-inline"><input type="checkbox" name="enabled" ${indexer.enabled === false ? '' : 'checked'}> Enable</label></div>
+      ${fields}
+      ${input('maxQueries', 'Queries Per Search', indexer.maxQueries ?? defaultQueries, { type: 'number', help: 'How many of the promotion\'s search titles to send, most precise first.' })}
+    </form>
+    <div class="modal-footer">${isNew ? '' : '<button class="button button-danger" data-action="delete-indexer" style="margin-right:auto">Delete</button>'}
+      <span class="test-result" data-result="indexer" style="align-self:center"></span>
+      <button class="button" data-action="test-indexer">${icon('check')} Test</button>
+      <button class="button" data-action="close-modal">Cancel</button>
+      <button class="button button-primary" type="submit" form="indexer-form">Save</button></div>`, { small: true });
+}
+
+function indexerTypeModal() {
+  openModal(`<div class="modal-header"><span>Add Indexer</span><button class="icon-button" data-action="close-modal" aria-label="Close">${icon('x')}</button></div>
+    <div class="modal-body"><div class="cards">${Object.entries(INDEXER_TYPES).map(([key, type]) => `<button type="button" class="card indexer-card" data-action="new-indexer" data-type="${key}">
+      <h3>${esc(type.label)}</h3><p class="form-help" style="margin:0">${esc(type.about)}</p></button>`).join('')}</div></div>`, { small: true });
+}
+
+function readIndexerForm() {
+  const form = $('#indexer-form');
+  const data = { id: form.dataset.id || undefined, type: form.dataset.type, enabled: form.elements.enabled.checked };
+  for (const el of form.querySelectorAll('input[name]')) if (el.type !== 'checkbox') data[el.name] = el.value;
+  return data;
+}
+
+async function saveIndexers(list, success) {
+  const saved = await run(() => api('/settings', { method: 'PUT', body: { indexers: list } }), success);
+  if (saved) { indexersCache = saved.indexers; closeModal(); render({ quiet: true }); }
+}
+
+async function logoModal(id, query = '') {
+  const promotion = promotionsCache.find((p) => p.id === id) || (await api('/promotions')).find((p) => p.id === id);
+  if (!promotion) return;
+  openModal(`<div class="modal-header"><span>Logo – ${esc(promotion.name)}</span><button class="icon-button" data-action="close-modal" aria-label="Close">${icon('x')}</button></div>
+    <div class="modal-body" data-promotion="${esc(id)}">
+      <div class="logo-current"><div class="img" style="${logoOf(promotion) ? `background-image:url('${esc(logoOf(promotion))}')` : ''}"></div>
+        <div><div>${promotion.logo ? 'Custom logo' : promotion.defaultLogo ? 'Shipped artwork' : 'No logo'}</div>
+        ${promotion.logo ? `<button class="button" data-action="logo-reset" data-id="${esc(id)}" style="margin-top:8px">Reset to default</button>` : ''}</div></div>
+      <div class="form-inline" style="margin-bottom:14px">
+        <input class="inline-input" id="logo-query" style="max-width:none;flex:1" value="${esc(query)}" placeholder="Search Wikipedia and Wikimedia Commons, e.g. ${esc(promotion.name)} logo">
+        <button class="button" data-action="logo-search" data-id="${esc(id)}">${icon('search')} Search</button>
+      </div>
+      <div class="form-inline" style="margin-bottom:14px">
+        <input class="inline-input" id="logo-url" style="max-width:none;flex:1" placeholder="https://… image URL">
+        <button class="button" data-action="logo-use-url" data-id="${esc(id)}">Use URL</button>
+        <label class="button">${icon('download')} Upload<input type="file" id="logo-file" data-id="${esc(id)}" accept="image/png,image/jpeg,image/webp,image/svg+xml,image/gif" hidden></label>
+      </div>
+      <div id="logo-results"><div class="empty-state">Finding logos…</div></div>
+    </div>`);
+  const out = $('#logo-results');
+  const result = await run(() => api(`/metadata/promotions/${encodeURIComponent(id)}/logos?q=${encodeURIComponent(query)}`));
+  if (!result || !out) return;
+  if (!result.candidates.length) {
+    out.innerHTML = `<div class="empty-state">No logos found${result.errors.length ? ` (${esc(result.errors.join('; '))})` : ''}. Try another search, a URL or an upload.</div>`;
+    return;
+  }
+  out.innerHTML = `<div class="logo-grid">${result.candidates.map((c) => `<button type="button" class="logo-tile ${c.url === promotion.logo ? 'current' : ''}" data-action="logo-choose" data-id="${esc(id)}" data-url="${esc(c.url)}" title="${esc(c.url)}">
+    <div class="img" style="background-image:url('${esc(c.thumb)}')"></div><small><strong>${esc(c.source)}</strong><br>${esc(c.label)}</small></button>`).join('')}</div>`;
+  // Hide candidates whose image does not load, so broken art is never offered.
+  for (const tile of out.querySelectorAll('.logo-tile')) {
+    const probe = new Image();
+    probe.onerror = () => tile.remove();
+    probe.src = tile.querySelector('.img').style.backgroundImage.slice(5, -2);
+  }
+}
+
+async function setLogo(id, logoUrl) {
+  const ok = await run(() => api(`/metadata/promotions/${encodeURIComponent(id)}`, { method: 'PUT', body: { logoUrl } }), logoUrl ? 'Logo updated' : 'Logo reset');
+  if (ok) { closeModal(); render({ quiet: true }); }
+}
+
+const PROVIDER_TYPES = [
+  ['json-feed', 'Custom JSON/API schedule'], ['thesportsdb', 'TheSportsDB league'], ['espn', 'ESPN league'],
+  ['football-data', 'football-data.org'], ['api-football', 'API-Football competition'], ['uefa', 'UEFA official competition'],
+  ['tmdb', 'TMDB TV series'], ['mlb', 'MLB official schedule'], ['onefc', 'ONE official schedule'], ['aew', 'AEW official schedule'],
+];
+function providerModal() {
+  const input = (name, label, { placeholder = '', help = '', type = 'text' } = {}) => `<div class="form-group"><label class="form-label" for="pv-${name}">${label}</label><div class="form-input"><input id="pv-${name}" name="${name}" type="${type}" placeholder="${esc(placeholder)}" autocomplete="off">${help ? `<div class="form-help">${help}</div>` : ''}</div></div>`;
+  const group = (type, html) => `<div class="provider-fields" data-type="${type}">${html}</div>`;
+  openModal(`<div class="modal-header"><span>Add Provider</span><button class="icon-button" data-action="close-modal" aria-label="Close">${icon('x')}</button></div>
+    <form id="provider-form" class="modal-body">
+      ${input('name', 'Name', { placeholder: 'ESPN · NHL' })}
+      ${input('id', 'Provider ID', { placeholder: 'espn-nhl', help: 'Lowercase letters, numbers, - and _. Filled in from the name.' })}
+      <div class="form-group"><label class="form-label" for="pv-type">Type</label><div class="form-input"><select id="pv-type" name="type">${PROVIDER_TYPES.map(([v, l]) => `<option value="${v}">${esc(l)}</option>`).join('')}</select></div></div>
+      ${group('json-feed', input('url', 'JSON/API URL', { type: 'url', placeholder: 'https://api.example.com/events' })
+        + input('arrayPath', 'Event List Path', { placeholder: 'data.events', help: 'Leave blank when the response itself is a list.' })
+        + input('nameField', 'Event Name Field', { placeholder: 'title' }) + input('dateField', 'Event Date Field', { placeholder: 'start.date' })
+        + input('idField', 'Event ID Field', { placeholder: 'id (optional)' }) + input('timeField', 'Start Time Field', { placeholder: 'start.time (optional)' })
+        + input('venueField', 'Venue Field', { placeholder: 'optional' }) + input('posterField', 'Artwork Field', { placeholder: 'optional' })
+        + input('descriptionField', 'Description Field', { placeholder: 'optional' }))}
+      ${group('thesportsdb', input('leagueId', 'League ID', { placeholder: '4424', help: 'The number in a thesportsdb.com league URL.' }))}
+      ${group('espn', input('league', 'League', { placeholder: 'nhl, nfl, nba, mlb, eng.1, usa.1…' }))}
+      ${group('football-data', input('competitionId', 'Competition ID/Code', { placeholder: 'PL or 2021' }) + input('teamId', 'Team ID', { placeholder: '66 (instead of a competition)' }))}
+      ${group('api-football', input('apiFootballLeagueId', 'Competition ID', { placeholder: '2' }))}
+      ${group('uefa', input('uefaCompetitionId', 'Competition ID', { placeholder: '1', help: 'Champions League is 1. No API key needed.' }))}
+      ${group('tmdb', input('tvIds', 'TV IDs', { placeholder: '224, 3231' }))}
+      ${group('mlb', '<p class="muted">No settings: uses MLB\'s official schedule.</p>')}
+      ${group('onefc', '<p class="muted">No settings: uses ONE\'s official schedule.</p>')}
+      ${group('aew', '<p class="muted">No settings: uses AEW\'s official schedule.</p>')}
+      <div id="draft-preview"></div>
+    </form>
+    <div class="modal-footer"><button class="button" data-action="preview-draft">Test &amp; Preview</button><button class="button" data-action="close-modal">Cancel</button><button class="button button-primary" type="submit" form="provider-form">Save</button></div>`, { small: true });
+  showProviderFields();
+}
+function showProviderFields() {
+  const type = $('#pv-type')?.value;
+  document.querySelectorAll('.provider-fields').forEach((el) => { el.hidden = el.dataset.type !== type; });
+}
+function readProviderForm() {
+  const form = $('#provider-form');
+  const data = { type: form.elements.type.value };
+  for (const el of form.querySelectorAll('input[name]')) {
+    if (el.closest('.provider-fields')?.hidden) continue;
+    if (el.value.trim()) data[el.name] = el.value.trim();
+  }
+  return data;
+}
+function previewHtml(result) {
+  if (!result.ok) return `<div class="alert alert-error">${icon('warning')}<div>Test failed: ${esc(result.error || 'unknown error')}</div></div>`;
+  const rows = (result.events || []).map((e) => `<div class="evidence">${esc(e.date || 'No date')} · ${esc(e.name)}${e.venue ? ' · ' + esc(e.venue) : ''}</div>`).join('');
+  return `<div class="alert alert-success">${icon('check')}<div>Connected to ${esc(result.source.name)} · ${result.normalized} event${result.normalized === 1 ? '' : 's'} read${rows ? `<div style="margin-top:6px">${rows}</div>` : '<div class="evidence">No events in the preview window.</div>'}</div></div>`;
+}
+
 // --- router -------------------------------------------------------------
 function currentRoute() {
   const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean).map(decodeURIComponent);
@@ -578,7 +849,7 @@ function updateNamingExample() {
   const input = $('[name="library.naming"]');
   const out = $('#naming-example');
   if (!input || !out) return;
-  const tokens = { promotion: 'Premier League', title: 'Arsenal vs Manchester City', date: '2026-09-21', year: '2026', quality: '1080p', release: 'EPL.2026.09.21.Arsenal.vs.Man.City.1080p.WEB' };
+  const tokens = { promotion: 'Premier League', title: 'Arsenal vs Manchester City', date: '2026-09-21', year: '2026', season: '2026', episode: '092101', quality: '1080p', release: 'EPL.2026.09.21.Arsenal.vs.Man.City.1080p.WEB' };
   out.textContent = input.value.replace(/\{(\w+)\}/g, (_, key) => tokens[key] ?? '') + '.mkv';
 }
 
@@ -604,15 +875,78 @@ const actions = {
   reload: () => render(),
   'go-add': () => { location.hash = '#/add'; },
   'manual-event': async () => { promotionsCache = promotionsCache.length ? promotionsCache : await api('/promotions'); manualEventModal(); },
-  'sync-events': async (el) => {
-    el.classList.add('spinning');
-    await run(() => api('/events/sync', { method: 'POST' }), (r) => `Imported ${r.count} events from SSS`);
-    el.classList.remove('spinning');
-    render();
+  'sync-events': async () => {
+    const status = await run(() => api('/metadata/refresh', { method: 'POST' }));
+    if (status) message(status.running ? 'Refreshing followed promotions in the background' : 'No followed promotions to refresh', status.running ? 'success' : 'info');
+    render({ quiet: true });
+  },
+  'refresh-promotion': async (el) => {
+    const id = el.dataset.id || currentRoute()[1];
+    await run(() => api('/metadata/refresh', { method: 'POST', body: { ids: [id] } }), 'Refresh started');
+    render({ quiet: true });
+  },
+  'follow-promotion': async (el) => {
+    const id = el.dataset.id;
+    const ok = await run(() => api(`/metadata/promotions/${encodeURIComponent(id)}`, { method: 'PUT', body: { followed: true } }), 'Promotion added; fetching its schedule');
+    if (ok) location.hash = `#/promotion/${id}`;
+  },
+  'logo-picker': (el) => logoModal(el.dataset.id || currentRoute()[1]),
+  'logo-search': (el) => logoModal(el.dataset.id, $('#logo-query')?.value.trim() || ''),
+  'logo-choose': (el) => setLogo(el.dataset.id, el.dataset.url),
+  'logo-use-url': (el) => {
+    const url = $('#logo-url')?.value.trim();
+    if (url) setLogo(el.dataset.id, url);
+  },
+  'logo-reset': (el) => setLogo(el.dataset.id, ''),
+  'add-provider': () => providerModal(),
+  'preview-provider': async (el) => {
+    const out = $('#provider-preview');
+    out.innerHTML = `<div class="alert">${icon('refresh')}<div>Testing ${esc(el.closest('tr').querySelector('strong').textContent)}…</div></div>`;
+    const result = await api('/metadata/providers/preview', { method: 'POST', body: { providerId: el.dataset.id } }).catch((error) => ({ ok: false, error: error.message }));
+    out.innerHTML = previewHtml(result);
+  },
+  'preview-draft': async () => {
+    const out = $('#draft-preview');
+    out.innerHTML = `<div class="alert">${icon('refresh')}<div>Testing without saving…</div></div>`;
+    const result = await api('/metadata/providers/preview', { method: 'POST', body: readProviderForm() }).catch((error) => ({ ok: false, error: error.message }));
+    out.innerHTML = previewHtml(result);
+  },
+  'delete-provider': async (el) => {
+    if (!confirm('Delete this provider? Promotions using it go back to their shipped source.')) return;
+    await run(() => api(`/metadata/providers/${encodeURIComponent(el.dataset.id)}`, { method: 'DELETE' }), 'Provider deleted');
+    render({ quiet: true });
   },
   'search-missing': async () => {
     await run(() => api('/system/tasks/search-missing', { method: 'POST' }), (r) => `Search queued for ${r.queued} missing event${r.queued === 1 ? '' : 's'}`);
     render();
+  },
+  // Sonarr-style: show every old -> new name first, rename on confirm.
+  'rename-preview': async () => {
+    const plan = await run(() => api('/library/rename'));
+    if (!plan) return;
+    const changes = plan.filter((p) => p.changed);
+    const name = (path) => esc(path.split(/[\\/]/).slice(-3).join(' / '));
+    openModal(`<div class="modal-header"><span>Rename Files</span><button class="icon-button" data-action="close-modal" aria-label="Close">${icon('x')}</button></div>
+      <div class="modal-body">${changes.length
+        ? `<p class="muted">${changes.length} file${changes.length === 1 ? '' : 's'} will be renamed to match the current naming pattern. Their .nfo and artwork move with them.</p>
+          <table class="table"><thead><tr><th>Event</th><th>Existing</th><th>New</th></tr></thead><tbody>
+          ${changes.map((p) => `<tr><td>${esc(p.title)}</td><td class="title-cell evidence">${name(p.from)}</td><td class="title-cell evidence">${name(p.to)}</td></tr>`).join('')}</tbody></table>`
+        : '<div class="empty-state">Every file already matches the naming pattern.</div>'}</div>
+      <div class="modal-footer"><button class="button" data-action="close-modal">Close</button>${changes.length ? '<button class="button button-primary" data-action="rename-apply">Rename</button>' : ''}</div>`);
+  },
+  'rename-apply': async (el) => {
+    el.disabled = true;
+    const results = await run(() => api('/library/rename', { method: 'POST' }));
+    if (!results) { el.disabled = false; return; }
+    const failed = results.filter((r) => !r.ok);
+    message(failed.length ? `${failed.length} rename${failed.length === 1 ? '' : 's'} failed: ${failed.map((r) => r.error).join('; ')}` : `Renamed ${results.filter((r) => r.renamed).length} file(s)`, failed.length ? 'error' : 'success');
+    closeModal();
+    render({ quiet: true });
+  },
+  'write-metadata': async (el) => {
+    el.classList.add('spinning');
+    await run(() => api('/library/metadata', { method: 'POST' }), (r) => `Wrote .nfo files and artwork for ${r.count} event${r.count === 1 ? '' : 's'}`);
+    el.classList.remove('spinning');
   },
   'check-downloads': async () => { await run(() => api('/system/tasks/check-downloads', { method: 'POST' })); render(); },
   'search-promotion': async () => {
@@ -694,6 +1028,27 @@ const actions = {
     await run(() => api(`/system/tasks/${el.dataset.task}`, { method: 'POST' }), 'Task complete');
     render({ quiet: true });
   },
+  'add-indexer': () => indexerTypeModal(),
+  'new-indexer': (el) => indexerModal({ type: el.dataset.type }),
+  'edit-indexer': (el) => indexerModal(indexersCache.find((i) => i.id === el.dataset.id)),
+  'test-indexer': async () => {
+    const out = $('[data-result="indexer"]');
+    out.className = 'test-result';
+    out.textContent = 'Testing…';
+    try {
+      const result = await api('/indexers/test', { method: 'POST', body: readIndexerForm() });
+      out.className = 'test-result ok';
+      out.textContent = result.message;
+    } catch (error) {
+      out.className = 'test-result fail';
+      out.textContent = error.message;
+    }
+  },
+  'delete-indexer': async () => {
+    const { id } = readIndexerForm();
+    if (!confirm('Delete this indexer?')) return;
+    await saveIndexers(indexersCache.filter((i) => i.id !== id), 'Indexer deleted');
+  },
   'promotion-rule': async (el) => { promotionsCache = promotionsCache.length ? promotionsCache : await api('/promotions'); promotionRuleModal(el.dataset.id || ''); },
   'delete-rule': async (el) => {
     if (!confirm('Remove these rules?')) return;
@@ -733,6 +1088,16 @@ document.addEventListener('submit', async (event) => {
     location.hash = `#/promotion/${created.promotionId}`;
     render();
   }
+  if (form.id === 'provider-form') {
+    const data = readProviderForm();
+    const saved = await run(() => api('/metadata/providers', { method: 'POST', body: data }), 'Provider saved; assign it under Metadata › Promotions');
+    if (saved) { closeModal(); render({ quiet: true }); }
+  }
+  if (form.id === 'indexer-form') {
+    const data = readIndexerForm();
+    const list = data.id ? indexersCache.map((i) => (i.id === data.id ? data : i)) : [...indexersCache, data];
+    await saveIndexers(list, 'Indexer saved');
+  }
   if (form.id === 'rule-form') {
     const lines = (name) => form.elements[name].value.split('\n').map((v) => v.trim()).filter(Boolean);
     const spec = {
@@ -750,6 +1115,14 @@ document.addEventListener('submit', async (event) => {
 let addTimer = null;
 document.addEventListener('input', (event) => {
   if (event.target.name === 'library.naming') updateNamingExample();
+  if (event.target.id === 'promo-filter') {
+    const q = event.target.value.trim().toLowerCase();
+    document.querySelectorAll('#add-promos .add-promo').forEach((card) => { card.hidden = q && !card.dataset.name.includes(q); });
+  }
+  if (event.target.id === 'pv-name' && !$('#pv-id').dataset.manual) {
+    $('#pv-id').value = event.target.value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 50);
+  }
+  if (event.target.id === 'pv-id') event.target.dataset.manual = '1';
   if (event.target.id === 'add-search') {
     clearTimeout(addTimer);
     addTimer = setTimeout(async () => {
@@ -783,6 +1156,27 @@ function globalSearch(value) {
 }
 document.addEventListener('focusout', (event) => {
   if (event.target.id === 'global-search') setTimeout(() => { $('#search-results').hidden = true; }, 150);
+});
+
+document.addEventListener('change', async (event) => {
+  const el = event.target;
+  if (el.id === 'pv-type') return showProviderFields();
+  if (el.id === 'logo-file' && el.files?.[0]) {
+    const file = el.files[0];
+    if (file.size > 2 * 1024 * 1024) return message('Logos must be 2 MB or smaller.', 'error');
+    const dataUrl = await new Promise((resolve) => { const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.readAsDataURL(file); });
+    const ok = await run(() => api(`/metadata/promotions/${encodeURIComponent(el.dataset.id)}/logo`, { method: 'POST', body: { dataUrl } }), 'Logo uploaded');
+    if (ok) { closeModal(); render({ quiet: true }); }
+    return;
+  }
+  const kind = el.dataset.change;
+  if (!kind) return;
+  const id = el.closest('[data-id]')?.dataset.id;
+  const body = kind === 'follow' ? { followed: el.checked } : kind === 'provider' ? { providerId: el.value || null } : { startDate: el.value || null };
+  if (kind === 'follow' && !el.checked && !confirm('Stop following this promotion? Its fetched events stay until the next refresh cleans them up; requested ones are kept.')) { el.checked = true; return; }
+  const ok = await run(() => api(`/metadata/promotions/${encodeURIComponent(id)}`, { method: 'PUT', body }),
+    kind === 'follow' ? (el.checked ? 'Following; fetching its schedule' : 'No longer following') : 'Saved; refreshing with the new setting');
+  if (ok) render({ quiet: true });
 });
 
 $('#sidebar-toggle').addEventListener('click', () => document.body.classList.toggle('sidebar-open'));

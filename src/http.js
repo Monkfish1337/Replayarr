@@ -12,8 +12,10 @@ export function joinUrl(base, path) {
 
 // fetch with a hard timeout and a bounded body, so one slow or oversized
 // response from an external service cannot stall the worker.
-export async function request(service, url, { timeoutMs = 20000, maxBytes = 8 * 1024 * 1024, ...init } = {}) {
+export async function request(service, url, { timeoutMs: requestedTimeout, maxBytes = 8 * 1024 * 1024, ...init } = {}) {
   if (!/^https?:\/\//i.test(String(url))) throw new ServiceError(service, 'URL is not configured');
+  // Settings can arrive as form text; AbortSignal.timeout only takes a number.
+  const timeoutMs = Number(requestedTimeout) > 0 ? Number(requestedTimeout) : 20000;
   let response;
   try {
     response = await fetch(url, { ...init, redirect: init.redirect || 'follow', signal: AbortSignal.timeout(timeoutMs) });

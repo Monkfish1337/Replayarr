@@ -1,0 +1,430 @@
+// Ported from SeriousSportSync (Monkfish1337/Serioussportsync @ 0706d4d), lib/sources/thesportsdb.js.
+const fetch = require('../fetch.cjs');
+const config = require('../config.cjs');
+const httpAgent = require('../http-agent.cjs');
+
+const BASE = (key) => 'https://www.thesportsdb.com/api/v1/json/' + key;
+
+// Every other adapter bounds its requests; this one did not. A rate-limited or
+// silently stalled TSDB call could hold an admin preview open indefinitely —
+// the browser sat on "Fetching and comparing events…" with nothing to render,
+// because four 429 sleeps alone can run past seven minutes and no request had
+// a timeout at all. REQUEST_TIMEOUT_MS bounds one call; retryBudgetMs bounds
+// the whole sequence.
+const REQUEST_TIMEOUT_MS = 20000;
+const DEFAULT_RETRY_BUDGET_MS = 150000;
+
+function delay(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+async function getJson(url, options) {
+  const opts = options || {};
+  const maxRetries = opts.maxRetries != null ? opts.maxRetries : 4;
+  const log = opts.log || (() => {});
+  const budgetMs = opts.retryBudgetMs != null ? opts.retryBudgetMs : DEFAULT_RETRY_BUDGET_MS;
+  const deadline = Date.now() + budgetMs;
+  // A sleep that would outlast the budget is not worth taking: fail now with a
+  // message the admin UI can show instead of holding the request open.
+  const affordable = (wait) => Date.now() + wait <= deadline;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    let res;
+    try {
+      res = await fetch(url, httpAgent.fetchOpts({
+        headers: { 'User-Agent': 'serioussportsync/0.4' },
+        timeout: REQUEST_TIMEOUT_MS,
+      }, url));
+    } catch (err) {
+      const wait = 5000 * (attempt + 1);
+      if (attempt < maxRetries && affordable(wait)) {
+        log('    network error, retry in ' + wait + 'ms: ' + err.message);
+        await delay(wait); continue;
+      }
+      throw err;
+    }
+    if (res.status === 429) {
+      const ra = parseInt(res.headers.get('retry-after'), 10);
+      const wait = ra && !Number.isNaN(ra) ? ra * 1000 : 65000 + 30000 * attempt;
+      if (attempt >= maxRetries || !affordable(wait)) {
+        throw new Error('TheSportsDB rate-limited this key (HTTP 429) and did not recover in time: ' + url);
+      }
+      log('    429 rate-limited, sleeping ' + Math.round(wait / 1000) + 's');
+      await delay(wait); continue;
+    }
+    if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + res.statusText + ' for ' + url);
+    const text = await res.text();
+    if (!text) return {};
+    try { return JSON.parse(text); }
+    catch (err) { throw new Error('Bad JSON from ' + url + ': ' + err.message); }
+  }
+}
+
+// All endpoints take an explicit leagueId so multiple promotions can share
+// this client. Falls back to config.tsdb.leagueId for backward compat.
+function lid(leagueId) { return leagueId || config.tsdb.leagueId; }
+
+async function fetchLeague(leagueId, log) {
+  const url = BASE(config.tsdb.apiKey) + '/lookupleague.php?id=' + lid(leagueId);
+  const leagues = (await getJson(url, { log })).leagues;
+  return Array.isArray(leagues) ? (leagues[0] || null) : null;
+}
+
+// Convert the calendar years used by SSS's global event window into the
+// source's season convention. Combat/motorsport leagues normally expose
+// `2026`; NBA/EPL-style leagues expose `2026-2027`.
+function resolveSeasonIds(requested, currentSeason) {
+  const input = (requested || []).map((s) => String(s || '').trim()).filter(Boolean);
+  if (!/^\d{4}-\d{4}$/.test(String(currentSeason || ''))) return input;
+  // Explicit split seasons are already authoritative.
+  if (input.some((s) => /^\d{4}-\d{4}$/.test(s))) return Array.from(new Set(input));
+  const out = new Set();
+  for (const season of input) {
+    if (!/^\d{4}$/.test(season)) { out.add(season); continue; }
+    const year = Number(season);
+    out.add(String(year - 1) + '-' + String(year));
+    out.add(String(year) + '-' + String(year + 1));
+  }
+  return Array.from(out).sort();
+}
+
+async function fetchUpcoming(leagueId, log) {
+  const url = BASE(config.tsdb.apiKey) + '/eventsnextleague.php?id=' + lid(leagueId);
+  return (await getJson(url, { log })).events || [];
+}
+async function fetchRecent(leagueId, log) {
+  const url = BASE(config.tsdb.apiKey) + '/eventspastleague.php?id=' + lid(leagueId);
+  return (await getJson(url, { log })).events || [];
+}
+async function fetchSeasonBulk(leagueId, season, log) {
+  const url = BASE(config.tsdb.apiKey) + '/eventsseason.php?id=' + lid(leagueId) + '&s=' + season;
+  return (await getJson(url, { log })).events || [];
+}
+// 0.95.0 — named-event lookup, because the list endpoints do not reach these.
+//
+// Measured against the live free-key API on 2026-09-11:
+//
+//   eventsnextleague.php?id=4563  -> 1 event  ("Collision #161", weekly TV)
+//   eventsseason.php?id=4563&s=2026 -> 15 events, the first 15 of the season,
+//                                      ending 2026-02-19
+//
+// AEW runs roughly three weekly TV tapings a week, so those 15 slots are spent
+// before February and every PPV falls outside them. The promotion then filters
+// the weekly shows out — correctly — and the Upcoming row is empty. UFC's
+// league behaves identically (eventsnextleague also returns exactly 1), so
+// this is the free key's shape rather than anything specific to AEW.
+//
+// The data is there. `searchevents.php?e=All_Out` returns idEvent 2579127,
+// "All Out", 2026-09-27, league AEW. So a promotion whose events have stable
+// recurring names can simply ask for them by name. That is a better fit than
+// paging a schedule anyway: these promotions want the named cards and discard
+// the weekly filler, and this asks for exactly the former.
+//
+// One result per name is all the free key returns, and that result is the
+// current or next instance — which is what an Upcoming row needs.
+async function fetchNamedEvent(leagueId, name, log) {
+  const query = String(name || '').trim().replace(/\s+/g, '_');
+  if (!query) return [];
+  const url = BASE(config.tsdb.apiKey) + '/searchevents.php?e=' + encodeURIComponent(query);
+  // searchevents returns `event`, singular, unlike every list endpoint here.
+  const payload = await getJson(url, { log });
+  const events = payload.event || payload.events || [];
+  return Array.isArray(events) ? events : [];
+}
+
+// Names are matched back to the league, because searchevents is global: asking
+// for "Revolution" must not file a different promotion's event under AEW.
+async function fetchNamedEvents(leagueId, names, log, opts) {
+  log = log || (() => {});
+  // Injectable so the league filter and the URL shape can be tested without a
+  // network, the same way lib/sources/bitmagnet.js takes a fetchImpl.
+  const lookup = (opts && opts.lookup) || fetchNamedEvent;
+  const wanted = Array.from(new Set((names || [])
+    .map((n) => String(n || '').trim()).filter(Boolean)));
+  if (!wanted.length) return [];
+  const collected = new Map();
+  let found = 0;
+  for (const name of wanted) {
+    let events = [];
+    try { events = await lookup(leagueId, name, log); }
+    catch (err) { log('  named lookup "' + name + '" failed: ' + err.message); }
+    for (const event of events) {
+      if (!event || !event.idEvent) continue;
+      if (String(event.idLeague || '') !== String(lid(leagueId))) continue;
+      collected.set(event.idEvent, event);
+      found += 1;
+    }
+    await delay(config.tsdb.requestDelayMs);
+  }
+  log('  named lookups: ' + found + ' event(s) from ' + wanted.length + ' name(s)');
+  return Array.from(collected.values());
+}
+
+// Which known cards still need a lookup, given what the list endpoints returned.
+//
+// Pulled out of fetchAll and exported because this one decision has been wrong
+// twice, both times because the wrong thing satisfied it, and both times it was
+// only reachable through the network. It is a pure function of (events, names,
+// today); test/tsdb-known-events.test.js exercises it directly.
+//
+//   v1: "skip if any future event came back at all" — satisfied by the next
+//       Dynamite, so the PPVs stayed missing.
+//   v2: "skip a name already present in the fetched set" — satisfied by LAST
+//       YEAR's instance of the same annual card, pulled in by the season walk
+//       over the event window (which starts 2025-01-01). Measured on AEW: the
+//       2025 walk returns All Out 2025-09-20, WrestleDream 2025-10-19,
+//       Revolution, Dynasty, Double or Nothing, Forbidden Door and All In. Ten
+//       of fourteen names were "covered" and nothing was looked up.
+//
+// The question is "is this card known AHEAD?", so only an event dated today or
+// later can cover a name.
+function namesNeedingLookup(events, knownEvents, todayIso) {
+  const today = String(todayIso || new Date().toISOString().slice(0, 10));
+  const ahead = (events || [])
+    .filter((e) => String(e && e.dateEvent || '') >= today)
+    .map((e) => String(e && e.strEvent || '').toLowerCase());
+  return (knownEvents || []).filter((name) => {
+    const needle = String(name || '').toLowerCase().trim();
+    return needle && !ahead.some((title) => title.includes(needle));
+  });
+}
+
+// TSDB sometimes publishes new weekly wrestling episodes with intRound=0.
+// Those records are invisible to both the free season response (capped at the
+// first 15 events) and the per-round walk. The one-item recent/upcoming feeds
+// still tell us the current episode number, so fill only holes in the small
+// tail leading up to that number through exact-name searches.
+function weeklyEpisodeNamesNeedingLookup(events, seriesNames, lookback) {
+  const wanted = [];
+  const count = Math.max(1, Number(lookback) || 8);
+  for (const seriesName of seriesNames || []) {
+    const escaped = String(seriesName || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (!escaped) continue;
+    const pattern = new RegExp('^(?:AEW\\s+|WWE\\s+)?' + escaped + '\\s*#(\\d+)\\b', 'i');
+    const numbers = new Set();
+    for (const event of events || []) {
+      const match = String(event && event.strEvent || '').trim().match(pattern);
+      if (match) numbers.add(Number(match[1]));
+    }
+    if (!numbers.size) continue;
+    const latest = Math.max(...numbers);
+    for (let episode = Math.max(1, latest - count + 1); episode <= latest; episode++) {
+      if (!numbers.has(episode)) wanted.push(seriesName + ' #' + episode);
+    }
+  }
+  return wanted;
+}
+
+async function fetchRound(leagueId, season, round, log) {
+  const url = BASE(config.tsdb.apiKey) + '/eventsround.php?id=' + lid(leagueId) + '&r=' + round + '&s=' + season;
+  return (await getJson(url, { log })).events || [];
+}
+
+// The per-round walk is the expensive half of a TheSportsDB refresh: one HTTP
+// request per round with config.tsdb.requestDelayMs (3000ms) between them to
+// stay inside the free key's 30/min. A league whose rounds keep returning
+// events — WWE runs Raw and SmackDown every week — walks 40+ rounds before the
+// five-consecutive-empty stop fires, which is over two minutes. That is fine
+// for a scheduled refresh and fatal for anything with a deadline, so callers
+// can pass one and get whatever was collected by the time it runs out.
+async function fetchSeasonAllRounds(leagueId, season, log, deadlineAt, options) {
+  log = log || (() => {});
+  const opts = options || {};
+  const getRound = opts.fetchRound || fetchRound;
+  const pause = opts.pause || delay;
+  const startDate = /^\d{4}-\d{2}-\d{2}$/.test(String(opts.startDate || ''))
+    ? opts.startDate : null;
+  const collected = new Map();
+  let consecutiveEmpty = 0;
+  const probed = new Map();
+  let startRound = 1;
+  // The WWE and AEW feeds put one card in each chronological round. Seek to
+  // the first round on/after the configured start date instead of requesting
+  // every earlier weekly episode (hundreds of calls on the free key).
+  if (startDate && opts.dateOrderedRounds) {
+    let lo = 1, hi = config.tsdb.maxRoundsPerSeason + 1;
+    while (lo < hi) {
+      if (deadlineAt && Date.now() + config.tsdb.requestDelayMs >= deadlineAt) break;
+      const mid = Math.floor((lo + hi) / 2);
+      let events;
+      try { events = await getRound(leagueId, season, mid, log); }
+      catch (err) { log('  round seek failed: ' + err.message); break; }
+      probed.set(mid, events);
+      if (!events.length || String(events[0].dateEvent || '') >= startDate) hi = mid;
+      else lo = mid + 1;
+      await pause(config.tsdb.requestDelayMs);
+    }
+    if (lo === hi) {
+      startRound = Math.max(1, lo - 2);
+      log('  starting season ' + season + ' near round ' + startRound + ' for ' + startDate);
+    }
+  }
+  for (let r = startRound; r <= config.tsdb.maxRoundsPerSeason; r++) {
+    if (deadlineAt && Date.now() + config.tsdb.requestDelayMs >= deadlineAt) {
+      log('  stopping season ' + season + ' at round ' + r + ': out of time budget');
+      break;
+    }
+    let events = null, errored = false;
+    try { events = probed.has(r) ? probed.get(r) : await getRound(leagueId, season, r, log); }
+    catch (err) { log('  round ' + r + ': error ' + err.message); errored = true; }
+    if (errored) { await delay(config.tsdb.requestDelayMs * 2); continue; }
+    if (events.length === 0) {
+      consecutiveEmpty++;
+      log('  round ' + r + ': empty (' + consecutiveEmpty + '/' + config.tsdb.emptyRoundStopAfter + ')');
+      if (consecutiveEmpty >= config.tsdb.emptyRoundStopAfter) {
+        log('  stopping season ' + season + ' at round ' + r); break;
+      }
+    } else {
+      consecutiveEmpty = 0;
+      for (const ev of events) {
+        if (ev.idEvent && (!startDate || String(ev.dateEvent || '') >= startDate)) {
+          collected.set(ev.idEvent, ev);
+        }
+      }
+      const e = events[0];
+      log('  round ' + r + ': ' + e.dateEvent + ' | ' + e.strEvent);
+    }
+    await pause(config.tsdb.requestDelayMs);
+  }
+  return Array.from(collected.values());
+}
+
+// New options-object signature: fetchAll({ leagueId, seasons, log })
+async function fetchAll(opts) {
+  opts = opts || {};
+  const leagueId = opts.leagueId || config.tsdb.leagueId;
+  const requestedSeasons = opts.seasons || config.tsdb.seasons || [];
+  const log = opts.log || (() => {});
+  const dedup = new Map();
+  // An absolute wall-clock stop, not a per-request timeout. The caller knows
+  // its own deadline (the source preview's is 60s); this one just declines to
+  // start work it cannot finish.
+  const deadlineAt = Number(opts.deadlineMs) > 0 ? Date.now() + Number(opts.deadlineMs) : 0;
+
+  let league = null;
+  try { league = await fetchLeague(leagueId, log); }
+  catch (err) { log('  league lookup failed; using requested seasons unchanged: ' + err.message); }
+  const seasons = resolveSeasonIds(requestedSeasons, league && league.strCurrentSeason);
+  if (seasons.join(',') !== requestedSeasons.join(',')) {
+    log('  split-season league (' + league.strCurrentSeason + '): resolved seasons to ' + seasons.join(', '));
+  }
+
+  log('-> upcoming (eventsnextleague)');
+  try { for (const e of await fetchUpcoming(leagueId, log)) if (e.idEvent) dedup.set(e.idEvent, e); }
+  catch (err) { log('  upcoming failed: ' + err.message); }
+  await delay(config.tsdb.requestDelayMs);
+
+  log('-> recent (eventspastleague)');
+  try { for (const e of await fetchRecent(leagueId, log)) if (e.idEvent) dedup.set(e.idEvent, e); }
+  catch (err) { log('  recent failed: ' + err.message); }
+  await delay(config.tsdb.requestDelayMs);
+
+  // The round walk is shared between seasons rather than raced for.
+  //
+  // Seasons are walked oldest-first, and `deadlineAt` is a single absolute
+  // stop, so the first season simply took all of it. Measured on AEW with the
+  // window's two seasons: 2025 walked to round 127 and stopped "out of time
+  // budget", and 2026 — the season anyone is actually asking about — got one
+  // round. Giving each remaining season an equal share of what is left means a
+  // truncated walk truncates every season a little instead of starving all but
+  // the first. A season that finishes early hands its unused share on.
+  for (let seasonIndex = 0; seasonIndex < seasons.length; seasonIndex++) {
+    const season = seasons[seasonIndex];
+    const seasonDeadlineAt = deadlineAt
+      ? Math.min(deadlineAt,
+        Date.now() + Math.max(0, deadlineAt - Date.now()) / (seasons.length - seasonIndex))
+      : 0;
+    log('-> season ' + season + ' bulk');
+    let bulkCount = 0;
+    try {
+      const bulk = await fetchSeasonBulk(leagueId, season, log);
+      bulkCount = bulk.length;
+      for (const e of bulk) if (e.idEvent) dedup.set(e.idEvent, e);
+      log('  season ' + season + ' bulk returned ' + bulkCount + ' event(s)');
+      if (bulkCount === 15 && String(config.tsdb.apiKey) === '123') {
+        log('  season response reached the TheSportsDB free-key limit (15); use a premium TSDB_API_KEY for complete league schedules');
+      }
+    } catch (err) { log('  bulk season ' + season + ' failed: ' + err.message); }
+    await delay(config.tsdb.requestDelayMs);
+
+    if (opts.skipRoundWalk) {
+      log('-> season ' + season + ' per-round: skipped for this preview '
+        + '(one request per round at ' + config.tsdb.requestDelayMs + 'ms apart)');
+      continue;
+    }
+    const rounds = [];
+    log('-> season ' + season + ' per-round');
+    for (const e of await fetchSeasonAllRounds(leagueId, season, log, seasonDeadlineAt, {
+      startDate: opts.startDate > String(season).slice(0, 4) + '-01-01' ? opts.startDate : null,
+      dateOrderedRounds: opts.dateOrderedRounds === true,
+    })) rounds.push(e);
+    for (const e of rounds) if (e.idEvent) dedup.set(e.idEvent, e);
+  }
+
+  if (Array.isArray(opts.weeklySeries) && opts.weeklySeries.length) {
+    const missingEpisodes = weeklyEpisodeNamesNeedingLookup(
+      Array.from(dedup.values()), opts.weeklySeries, opts.weeklyEpisodeLookback);
+    if (opts.skipNamedLookups) {
+      log('-> weekly episode gap recovery: skipped for this preview');
+    } else if (!missingEpisodes.length) {
+      log('-> weekly episode gap recovery: recent episode numbers are complete');
+    } else if (deadlineAt && Date.now() + config.tsdb.requestDelayMs >= deadlineAt) {
+      log('-> weekly episode gap recovery: skipped because the time budget is exhausted');
+    } else {
+      log('-> weekly episode gap recovery (searchevents): ' + missingEpisodes.join(', '));
+      try {
+        for (const e of await fetchNamedEvents(leagueId, missingEpisodes, log)) {
+          if (e.idEvent) dedup.set(e.idEvent, e);
+        }
+      } catch (err) { log('  weekly episode gap recovery failed: ' + err.message); }
+    }
+  }
+
+  // Named lookups are expensive and usually unnecessary.
+  //
+  // They are one request per name with config.tsdb.requestDelayMs between them
+  // to stay inside the free key's 30/min, which at the shipped 3000ms is 42
+  // seconds for AEW's fourteen names. Added unconditionally, that pushed every
+  // AEW refresh — and the 60s interactive source preview — straight past its
+  // deadline. A preview that times out is worse than the empty Upcoming row
+  // this was meant to fix.
+  //
+  // So: ask only for the cards the list endpoints did not already return.
+  //
+  // The first version of this gate was "skip if any future event came back at
+  // all", and it was wrong in the one case the feature exists for. AEW's list
+  // endpoints DO reach the future — they return the next Dynamite or Collision,
+  // because AEW runs weekly TV — while All Out, the card actually being asked
+  // about, never appears. One future taping satisfied the gate and the PPVs
+  // stayed missing, which is the empty Upcoming row the user reported.
+  //
+  // Matching on the name is what the list is keyed by anyway: TheSportsDB names
+  // these events "All Out", "Revolution", "Full Gear". The gate itself is
+  // namesNeedingLookup above, which carries the history of getting it wrong.
+  if (Array.isArray(opts.knownEvents) && opts.knownEvents.length) {
+    const todayIso = new Date().toISOString().slice(0, 10);
+    const missing = namesNeedingLookup(
+      Array.from(dedup.values()), opts.knownEvents, todayIso);
+    if (opts.skipNamedLookups) {
+      log('-> named events: skipped for this preview (' + opts.knownEvents.length + ' name(s))');
+    } else if (!missing.length) {
+      log('-> named events: not needed, the list endpoints already reach all '
+        + opts.knownEvents.length + ' known card(s) ahead of ' + todayIso);
+    } else {
+      log('-> named events (searchevents): ' + missing.length + ' of '
+        + opts.knownEvents.length + ' known card(s) have no event dated '
+        + todayIso + ' or later: ' + missing.join(', '));
+      try {
+        for (const e of await fetchNamedEvents(leagueId, missing, log)) {
+          if (e.idEvent) dedup.set(e.idEvent, e);
+        }
+      } catch (err) { log('  named events failed: ' + err.message); }
+    }
+  }
+
+  return Array.from(dedup.values());
+}
+
+module.exports = {
+  fetchLeague, fetchUpcoming, fetchRecent, fetchSeasonBulk, fetchRound,
+  fetchSeasonAllRounds, fetchNamedEvent, fetchNamedEvents, namesNeedingLookup,
+  weeklyEpisodeNamesNeedingLookup, fetchAll, resolveSeasonIds,
+  getJson, REQUEST_TIMEOUT_MS, DEFAULT_RETRY_BUDGET_MS,
+};
