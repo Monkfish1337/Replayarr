@@ -95,6 +95,7 @@ test('an import is named for Jellyfin and gets its .nfo, thumbnail and show file
   assert.deepEqual(await readFile(join(season, 'UFC - S2026E092002 - UFC 331 Van vs Pantoja 2 [1080p]-thumb.jpg')), JPG);
   assert.match(await readFile(join(library, 'UFC', 'tvshow.nfo'), 'utf8'), /<title>UFC<\/title>/);
   assert.ok(await exists(join(library, 'UFC', 'poster.png')), 'the chosen logo is the show poster');
+  assert.deepEqual(await readFile(join(season, 'poster.png')), await readFile(join(library, 'UFC', 'poster.png')), 'and the season poster');
   assert.ok(await exists(join(library, 'UFC', 'fanart.jpg')));
 
   await new Promise((r) => setTimeout(r, 20));
@@ -137,12 +138,39 @@ test('Rename Files moves events imported under an older pattern, with their side
   assert.deepEqual(results.map((r) => r.ok), [true]);
   assert.equal(store.libraryFor('ufc:331').path, newPath);
   assert.equal(store.libraryFor('ufc:331').episode, 92002);
-  const files = (await readdir(oldFolder)).sort();
+  const files = (await readdir(oldFolder)).filter((name) => !name.startsWith('poster.')).sort();
   assert.deepEqual(files, [
     'UFC - S2026E092002 - UFC 331 Van vs Pantoja 2 [1080p]-thumb.jpg',
     'UFC - S2026E092002 - UFC 331 Van vs Pantoja 2 [1080p].mkv',
     'UFC - S2026E092002 - UFC 331 Van vs Pantoja 2 [1080p].nfo',
-  ]);
+  ], 'the event files are renamed together (the season poster sits beside them)');
   assert.match(await readFile(newPath.replace(/\.mkv$/, '.nfo'), 'utf8'), /<episode>92002<\/episode>/, 'the .nfo is rewritten with the new numbers');
   assert.equal(service.renamePlan()[0].changed, false, 'nothing left to rename');
+});
+
+test('Write Metadata replaces season posters after a logo change', async (t) => {
+  const env = await setup(t, { images: { 'https://img.test/ufc-logo.png': PNG, 'https://img.test/ufc-new.jpg': JPG } });
+  const { service, library } = env;
+  service.metadata.update('ufc', { logoUrl: 'https://img.test/ufc-logo.png' });
+  const request = await finishedDownload(env, UFC_331);
+  await service.importRequest(request.id);
+  const season = join(library, 'UFC', 'Season 2026');
+  assert.deepEqual(await readFile(join(season, 'poster.png')), PNG);
+
+  service.metadata.update('ufc', { logoUrl: 'https://img.test/ufc-new.jpg' });
+  await service.writeAllMetadata();
+  assert.deepEqual(await readFile(join(season, 'poster.jpg')), JPG, 'new logo copied down');
+  assert.equal(await exists(join(season, 'poster.png')), false, 'the old season poster is replaced, not left beside it');
+});
+
+test('a season folder left with only its poster after a rename is removed', async (t) => {
+  const { library } = await setup(t);
+  const { pruneEmptyFolders } = await import('../src/mediaFiles.js');
+  const old = join(library, 'UFC', 'Season 2025');
+  await mkdir(old, { recursive: true });
+  await writeFile(join(old, 'poster.png'), PNG);
+  await writeFile(join(library, 'UFC', 'tvshow.nfo'), '<tvshow/>');
+  await pruneEmptyFolders(old, library);
+  assert.equal(await exists(old), false);
+  assert.equal(await exists(join(library, 'UFC', 'tvshow.nfo')), true, 'the show folder stays');
 });

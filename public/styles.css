@@ -276,3 +276,10 @@ h1, h2, h3 { color: var(--text-strong); font-weight: 400; margin: 0; }
   .table .hide-sm { display: none; }
   .agenda-event { grid-template-columns: 1fr; gap: 4px; }
 }
+.log-table td { padding: 5px 8px; font-size: 13px; }
+.log-table .log-details { font-family: ui-monospace, Consolas, monospace; font-size: 11px; white-space: pre-wrap; }
+.log-table tr.log-warn td:last-child { color: #ffd28a; }
+.log-table tr.log-error td:last-child { color: #ff9c9c; }
+.log-table tr.log-debug td { color: var(--muted); }
+.logo-group { margin-bottom: 18px; }
+.logo-group-title { font-size: 15px; margin: 0 0 8px; }

@@ -43,3 +43,9 @@ If qBittorrent or SABnzbd mount your data under a different path, e.g. `/downloa
 The compose file sets `pull_policy: always`. Dockge's **Update** button pulls the newest image for your tag and recreates only this stack. Settings and the database live in the `replayarr_config` volume and are kept.
 
 If `PUID` is not 1000, replace `replayarr_config:/config` with a host folder owned by that user, e.g. `/opt/stacks/replayarr/config:/config`, created before deploying.
+
+## Troubleshooting
+
+**System › Logs** shows what Replayarr is doing: every request to Prowlarr, Bitmagnet, Easynews, qBittorrent, SABnzbd and Jellyfin, each search query and match verdict, downloads and imports. Set **Settings › General › Log Level** to *Debug* while chasing a problem, then back to *Info*. **Download** saves the log as text to share. API keys, passwords and tokens are removed from every line.
+
+The same lines go to the container's output (Dozzle, `docker logs replayarr`) and to rotating files in the config volume: `/config/logs/replayarr.txt`, keeping 3 files of 5 MB.

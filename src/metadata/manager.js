@@ -6,6 +6,9 @@ import refresh from './refresh.cjs';
 import preview from './preview.cjs';
 import providers from './providers.cjs';
 import { logoCandidates } from './logos.js';
+import { logger } from '../logger.js';
+
+const log = logger('metadata');
 
 // Replayarr's own schedule metadata, replacing the SSS install it used to
 // read. Promotions are followed like Sonarr series: only followed promotions
@@ -85,7 +88,11 @@ export function createMetadata(store, { settings, logoDir, clock = () => new Dat
     const started = Date.now();
     applyKeys();
     try {
-      const events = await fetchEvents(effective(promotion, meta), { log: () => {} });
+      const view = effective(promotion, meta);
+      log.info(`Refreshing ${promotion.name}`, { source: describe(view.source), from: view.metadataStartDate });
+      // The ported SSS sources narrate each request and page; keep that at debug.
+      const events = await fetchEvents(view, { log: (line) => log.debug(`${promotion.name}: ${String(line).trim()}`) });
+      log.info(`${promotion.name}: ${events.length} event(s)`, { seconds: Math.round((Date.now() - started) / 1000) });
       for (const event of events) {
         store.upsertEvent({
           id: event.id,
@@ -106,6 +113,7 @@ export function createMetadata(store, { settings, logoDir, clock = () => new Dat
     } catch (error) {
       store.updatePromotionMeta(promotion.id, { refreshedAt: clock().toISOString(), refreshError: error.message });
       store.log('warning', `${promotion.name}: metadata refresh failed: ${error.message}`);
+      log.warn(`${promotion.name}: refresh failed: ${error.message}`, error);
       return { promotionId, ok: false, error: error.message };
     }
   }
@@ -205,7 +213,12 @@ export function createMetadata(store, { settings, logoDir, clock = () => new Dat
 
     async logoCandidates(promotionId, query) {
       const promotion = requirePromotion(promotionId);
-      return logoCandidates({ promotion, source: resolve(promotion).source, tsdbApiKey: settings().metadata.tsdbApiKey, query });
+      const keys = settings().metadata;
+      const recentEvents = store.listEvents({ promotionId: promotion.id, to: clock().toISOString().slice(0, 10), limit: 4 });
+      return logoCandidates({
+        promotion, source: resolve(promotion).source, query, recentEvents,
+        tsdbApiKey: keys.tsdbApiKey, tmdbApiKey: keys.tmdbApiKey,
+      });
     },
 
     // Queue promotions for refresh (all followed ones when none are given).

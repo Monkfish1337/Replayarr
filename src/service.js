@@ -12,6 +12,12 @@ import { destinationFor, ImportError, importDownload } from './importer.js';
 import { scoreCandidate } from './scoring.js';
 import { indexerReady, loadSettings, mapRemotePath } from './settings.js';
 import { createMetadata } from './metadata/manager.js';
+import { logger } from './logger.js';
+
+const searchLog = logger('search');
+const downloadLog = logger('download');
+const importLog = logger('import');
+const workerLog = logger('worker');
 
 export class UserError extends Error {
   constructor(message, status = 400) {
@@ -188,13 +194,16 @@ export function createService(store, overrides = {}) {
       // Each indexer gets the promotion's search titles, most precise first,
       // up to its own query budget. The first indexer to report a release
       // (by info hash or indexer guid) keeps it.
+      searchLog.info(`Searching for ${event.title} (${event.date}) on ${indexers.length} indexer(s)`, { request: request.id, event: event.id, attempt: request.searchCount });
       for (const indexer of indexers) {
         const queries = searchTitles(event, indexer.maxQueries);
         const attempt = { source: indexer.name, queries, started: Date.now(), results: 0, error: null, found: [] };
         for (const [index, query] of queries.entries()) {
           if (index && QUERY_PAUSE_MS[indexer.type]) await new Promise((r) => setTimeout(r, QUERY_PAUSE_MS[indexer.type]));
           try {
-            for (const result of await adapters[indexer.type].search(indexer, query)) {
+            const results = await adapters[indexer.type].search(indexer, query);
+            searchLog.debug(`${indexer.name}: "${query}" returned ${results.length} result(s)`);
+            for (const result of results) {
               attempt.results += 1;
               if (found.has(result.identity)) continue;
               const tagged = { ...result, source: indexer.name, sourceId: indexer.id };
@@ -203,10 +212,16 @@ export function createService(store, overrides = {}) {
             }
           } catch (error) {
             attempt.error ||= error.message;
-            // A configuration problem fails every query the same way.
-            if (/not configured|rejected|HTTP 401|HTTP 403/.test(error.message)) break;
+            searchLog.warn(`${indexer.name}: "${query}" failed: ${error.message}`);
+            // A configuration problem, or an indexer that cannot be reached at
+            // all, fails every query the same way; skip the rest.
+            if (/not configured|rejected|HTTP 401|HTTP 403|ENOTFOUND|ECONNREFUSED|EHOSTUNREACH|EAI_AGAIN/.test(error.message)) {
+              searchLog.warn(`${indexer.name}: skipping its remaining queries this search`);
+              break;
+            }
           }
         }
+        searchLog.info(`${indexer.name}: ${attempt.results} result(s), ${attempt.found.length} new, from ${queries.length} quer${queries.length === 1 ? 'y' : 'ies'}`, { ms: Date.now() - attempt.started, error: attempt.error });
         if (attempt.error) errors.push(attempt.error);
         attempts.push(attempt);
       }
@@ -222,8 +237,15 @@ export function createService(store, overrides = {}) {
         }
         return { ...result, score, quality, evidence, decision: verdict.ok ? 'matched' : 'rejected', reason: verdict.ok ? null : `${verdict.stage}: ${verdict.reason}` };
       });
+      // Every verdict, so "why wasn't X picked up?" can be answered from the log.
+      for (const candidate of scored) {
+        searchLog.debug(`${candidate.decision === 'matched' ? 'Matched' : 'Rejected'} ${candidate.title}`, {
+          source: candidate.source, indexer: candidate.indexer, reason: candidate.reason, score: candidate.decision === 'matched' ? candidate.score : undefined,
+        });
+      }
       const matched = scored.filter((c) => c.decision === 'matched');
       const rejected = scored.filter((c) => c.decision === 'rejected').slice(0, MAX_REJECTED_KEPT);
+      searchLog.info(`${event.title}: ${matched.length} matched, ${scored.length - matched.length} rejected of ${found.size} unique result(s)`);
       store.saveCandidates(request.id, [...matched, ...rejected]);
       const matchedIds = new Set(matched.map((c) => c.identity));
       for (const attempt of attempts) {
@@ -270,10 +292,13 @@ export function createService(store, overrides = {}) {
       if (request.status === 'failed') store.setStatus(request.id, 'review');
 
       const job = store.createJob({ requestId: request.id, candidateId: candidate.id, client, state: 'submitting' });
+      downloadLog.info(`Sending ${candidate.title} to ${CLIENT_NAMES[client]}`, { event: event.title, job: job.id, source: candidate.source, indexer: candidate.indexer, size: candidate.size });
       try {
         const { remoteId } = await adapters[client].add(clientConfig(settings, client, candidate.sourceId), candidate, { tag: `replayarr-${job.id}` });
         store.updateJob(job.id, { remoteId, state: 'queued' });
+        downloadLog.info(`${CLIENT_NAMES[client]} accepted job ${job.id}`, { remoteId: String(remoteId).slice(0, 80) });
       } catch (error) {
+        downloadLog.warn(`${CLIENT_NAMES[client]} refused ${candidate.title}: ${error.message}`, { job: job.id });
         store.updateJob(job.id, { state: 'failed', error: error.message });
         store.setStatus(request.id, 'review', { error: error.message });
         store.log('warning', `${event.title}: could not send to ${CLIENT_NAMES[client]}: ${error.message}`, request.id);
@@ -293,10 +318,16 @@ export function createService(store, overrides = {}) {
           if (!config) throw new Error('its Easynews indexer has been removed from Settings');
           remote = await adapters[job.client].status(config, job.remoteId);
         } catch (error) {
+          downloadLog.warn(`Could not check job ${job.id} (${event.title}) in ${CLIENT_NAMES[job.client]}: ${error.message}`);
           store.updateJob(job.id, { error: error.message });
           continue;
         }
+        if (remote) {
+          const change = remote.state !== job.state;
+          downloadLog[change ? 'info' : 'debug'](`Job ${job.id} (${event.title}): ${remote.state}${remote.state === 'downloading' ? ` ${Math.round((remote.progress || 0) * 100)}%` : ''}`, { client: CLIENT_NAMES[job.client], path: remote.path, error: remote.error });
+        }
         if (!remote) {
+          downloadLog.debug(`Job ${job.id} (${event.title}) not found in ${CLIENT_NAMES[job.client]} yet`, { remoteId: String(job.remoteId).slice(0, 80) });
           if (clock().getTime() - Date.parse(job.createdAt) < MISSING_JOB_GRACE_MS) continue;
           store.updateJob(job.id, { state: 'failed', error: `No longer in ${CLIENT_NAMES[job.client]}` });
           store.setStatus(job.requestId, 'failed', { error: `The download was removed from ${CLIENT_NAMES[job.client]}.` });
@@ -328,12 +359,14 @@ export function createService(store, overrides = {}) {
         if (!job?.remotePath) throw new ImportError('The download client did not report where the files are');
         const localPath = mapRemotePath(settings, job.remotePath);
         const { season, episode } = numberFor(event);
+        importLog.info(`Importing ${event.title}`, { reported: job.remotePath, local: localPath, season, episode, mode: settings.library.mode });
         const result = await importDownload({
           settings, localPath, event, candidate, promotionName: promotionName(event),
           verifyName: (name) => evaluate(name, event), season, episode,
         });
         store.addLibraryItem({ eventId: event.id, requestId: request.id, path: result.path, size: result.size, quality: candidate?.quality, releaseTitle: candidate?.title, season, episode });
         store.log('ready', `${event.title} imported (${result.method}) to ${result.path}`, request.id);
+        importLog.info(`Imported ${event.title}`, { method: result.method, path: result.path, bytes: result.size });
         await writeSidecars(event, store.libraryFor(event.id), settings);
         notifyMediaServer(settings);
         return store.setStatus(request.id, 'ready');
@@ -345,6 +378,7 @@ export function createService(store, overrides = {}) {
           message += `. ${CLIENT_NAMES[job.client] || 'The download client'} reported this path from its own container; add a Remote Path Mapping in Settings › Download Clients so Replayarr can find it, then Retry.`;
         }
         store.log('warning', `${event.title}: ${message}`, request.id);
+        importLog.warn(`Import failed for ${event.title}: ${message}`, error instanceof ImportError ? undefined : error);
         return store.setStatus(request.id, 'failed', { error: message });
       }
     },
@@ -524,7 +558,7 @@ export function startWorker(service, intervalMs = 30000) {
     if (running) return;
     running = true;
     try { await service.tick(); }
-    catch (error) { console.error('[worker]', error); }
+    catch (error) { workerLog.error('Worker tick failed', error); }
     finally { running = false; }
   };
   service.recover();

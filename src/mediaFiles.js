@@ -11,7 +11,7 @@ import { dirname, extname, join, relative, resolve, sep } from 'node:path';
 
 const IMAGE_TYPES = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif' };
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
-const USER_AGENT = 'Replayarr/0.2 (self-hosted sports replay manager)';
+const USER_AGENT = 'Replayarr/0.2 (https://github.com/Monkfish1337/Replayarr; self-hosted sports replay manager)';
 
 const xml = (value) => String(value ?? '')
   .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '')
@@ -147,6 +147,21 @@ export async function writeMediaFiles({ videoPath, libraryRoot, event, promotion
         problems.push(`${name}: ${error.message}`);
       }
     }
+
+    // Jellyfin does not carry the show poster down to its seasons, so each
+    // season folder gets its own copy (taken from the show's, not refetched).
+    const season = dirname(videoPath);
+    const showPoster = await findImage(join(show, 'poster'));
+    if (resolve(season) !== resolve(show) && showPoster && (overwrite || !(await findImage(join(season, 'poster'))))) {
+      try {
+        const target = join(season, `poster${extname(showPoster)}`);
+        await copyFile(showPoster, `${target}.part`);
+        await removeImages(join(season, 'poster'));
+        await rename(`${target}.part`, target);
+      } catch (error) {
+        problems.push(`season poster: ${error.code || error.message}`);
+      }
+    }
   }
   return problems;
 }
@@ -161,12 +176,17 @@ export async function moveSidecars(fromVideo, toVideo) {
 }
 
 // Remove folders left empty by a rename, up to (not including) the library root.
+// A season folder holding only its copied poster counts as empty; the show
+// folder (tvshow.nfo, fanart) never does.
 export async function pruneEmptyFolders(folder, libraryRoot) {
   const root = resolve(libraryRoot);
   let current = resolve(folder);
   while (current.startsWith(root + sep)) {
     const entries = await readdir(current).catch(() => null);
-    if (!entries || entries.length) return;
+    if (!entries) return;
+    const onlyPoster = entries.length && entries.every((name) => /^poster\.(?:jpg|png|webp|gif)$/.test(name));
+    if (entries.length && !onlyPoster) return;
+    if (onlyPoster) await removeImages(join(current, 'poster'));
     await rmdir(current).catch(() => {});
     current = dirname(current);
   }
