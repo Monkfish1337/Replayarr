@@ -79,6 +79,7 @@ Online metadata databases don't carry sports events, so Replayarr writes the met
 
 ```text
 UFC/tvshow.nfo, poster.*, fanart.*          promotion (poster = the logo you picked)
+UFC/Season 2026/poster.*                     the same poster, per season (Jellyfin does not inherit it)
 UFC/Season 2026/UFC - S2026E091901 - UFC 331 Van vs Pantoja 2 [1080p].mkv
                 .nfo                         title, air date, TheSportsDB description and venue
                 -thumb.jpg                   the event's TheSportsDB artwork (fight poster)
