@@ -31,7 +31,7 @@ export const DEFAULTS = {
   // stopAtFirstMatch: once a release matches, skip an indexer's remaining
   // queries and the lower-priority indexers. 'no' searches everything.
   // minSearchSeconds: a match only stops the search after this long.
-  preferences: { protocol: 'any', minSeeders: 1, stopAtFirstMatch: 'yes', minSearchSeconds: 30 },
+  preferences: { protocol: 'any', minSeeders: 1, stopAtFirstMatch: 'yes', minSearchSeconds: 60, searchPlan: 2 },
 };
 
 // Fields each indexer type keeps, with defaults. Every entry also has id,
@@ -82,6 +82,10 @@ export function loadSettings(store) {
   }
   out.indexers = out.indexers.map(upgradeQueryLimit).map(normaliseIndexer).filter(Boolean);
   if (out.library.naming === OLD_DEFAULT_NAMING) out.library.naming = DEFAULTS.library.naming;
+  // The minimum search time first shipped as 30 seconds; installs that saved
+  // it move to the current default once.
+  if (Number(saved.preferences?.searchPlan) !== 2 && Number(out.preferences.minSearchSeconds) === 30) out.preferences.minSearchSeconds = DEFAULTS.preferences.minSearchSeconds;
+  out.preferences.searchPlan = 2;
   return out;
 }
 

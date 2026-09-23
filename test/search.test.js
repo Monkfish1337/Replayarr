@@ -160,3 +160,12 @@ test('an event stored without its metadata asks for its promotion to be refreshe
   assert.deepEqual(refreshed, ['ucl']);
   assert.equal(prowlarr.queries.filter((q) => /MUN/.test(q)).length, 0, 'without team codes the MUN-SAB queries cannot be built');
 });
+
+test('the minimum search time defaults to a minute, and a saved 30 from the first release moves to it once', () => {
+  const store = createStore(openDatabase(':memory:'));
+  assert.equal(loadSettings(store).preferences.minSearchSeconds, 60);
+  store.setSetting('config', { preferences: { minSearchSeconds: 30 } });
+  assert.equal(loadSettings(store).preferences.minSearchSeconds, 60);
+  saveSettings(store, { preferences: { minSearchSeconds: 30 } });
+  assert.equal(loadSettings(store).preferences.minSearchSeconds, 30, 'chosen after the upgrade, 30 is kept');
+});
