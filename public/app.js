@@ -180,9 +180,32 @@ async function refreshChrome() {
 // --- shared pieces ------------------------------------------------------
 // A chosen logo wins; otherwise the promotion's shipped artwork, else its name.
 const logoOf = (promotion) => promotion.logo || promotion.defaultLogo || '';
+// Portrait artwork (a real poster) fills its tile; a logo sits inside it with
+// a margin. The shape is only known once the image loads, so it is measured
+// once per URL and remembered, and pages that re-render during a metadata
+// refresh do not flicker.
+const posterShapes = new Map();
 function posterStyle(promotion) {
   const logo = logoOf(promotion);
-  return logo ? `style="background-image:url('${esc(logo)}')"` : '';
+  if (!logo) return '';
+  const shape = posterShapes.get(logo);
+  return `style="background-image:url('${esc(logo)}')" data-logo="${esc(logo)}"${shape ? ` data-shape="${shape}"` : ''}`;
+}
+function fitPosters() {
+  for (const el of document.querySelectorAll('.poster[data-logo]:not([data-shape])')) {
+    const url = el.dataset.logo;
+    if (posterShapes.has(url)) { el.dataset.shape = posterShapes.get(url); continue; }
+    posterShapes.set(url, null);
+    const img = new Image();
+    img.onload = () => {
+      const ratio = img.naturalHeight / img.naturalWidth;
+      const shape = ratio >= 1.25 && ratio <= 1.75 ? 'poster' : 'logo';
+      posterShapes.set(url, shape);
+      for (const each of document.querySelectorAll('.poster[data-logo]')) if (each.dataset.logo === url) each.dataset.shape = shape;
+    };
+    img.onerror = () => posterShapes.set(url, 'logo');
+    img.src = url;
+  }
 }
 function posterFallback(promotion) {
   return logoOf(promotion) ? '' : `<span class="poster-fallback">${esc(promotion.name)}</span>`;
@@ -1017,6 +1040,7 @@ async function render({ quiet = false } = {}) {
 }
 
 function afterRender(route) {
+  fitPosters();
   if (route[0] === 'settings' && route[1] === 'mediamanagement') updateNamingExample();
   if (route[0] === 'add') $('#add-search')?.focus();
 }

@@ -90,8 +90,11 @@ h1, h2, h3 { color: var(--text-strong); font-weight: 400; margin: 0; }
 .poster-card:hover { transform: translateY(-2px); text-decoration: none; }
 .poster { container-type: inline-size; position: relative; aspect-ratio: 2 / 3; background: #333 center / cover no-repeat; display: grid; place-items: center; overflow: hidden; }
 .poster.landscape, .poster.square { background-size: contain; background-color: #1d1d1d; }
-/* Promotion logos sit centred on a dark tile rather than cropped like posters. */
-.poster.logo { background-size: 72% auto; background-color: #1d1d1d; }
+/* Promotion logos sit centred on a dark tile, inside an even margin whatever
+   their shape; portrait artwork (data-shape="poster", measured in app.js)
+   fills the tile like a Sonarr series poster. */
+.poster.logo { background-size: contain; background-origin: content-box; padding: 14%; background-color: #1d1d1d; }
+.poster.logo[data-shape="poster"] { background-size: cover; background-origin: padding-box; padding: 0; }
 .logo-thumb { width: 64px; height: 40px; border-radius: 3px; background: #1d1d1d center / contain no-repeat; border: 1px solid var(--border); cursor: pointer; padding: 0; }
 .logo-thumb:hover { border-color: var(--accent); }
 .logo-thumb.empty { display: grid; place-items: center; color: var(--muted); font-size: 18px; }
