@@ -6,7 +6,7 @@ Replayarr is a self-hosted manager for sports event recordings, in the style of 
 
 It is a standalone companion to [SeriousSportSync](https://github.com/Monkfish1337/Serioussportsync): SSS is a sports calendar and streaming add-on, Replayarr keeps a durable local library. Replayarr does not need SSS running; its schedule sources and release matching are ported from SSS (see [Metadata](#metadata) and [Matching](#matching)).
 
-> **Phase 1.** The manual loop works end to end: request → search → review → download → import. Automatic grabbing, quality upgrades and media-server notifications come later.
+> **Phase 1.** The manual loop works end to end: request → search → review → download → import, with Jellyfin metadata. Automatic grabbing and quality upgrades come later.
 
 ## Run it with Docker (Dockge)
 
@@ -61,7 +61,7 @@ Event ─▶ Request (wanted) ─▶ Search ─▶ Candidates ─▶ Review ─�
 - **Searching** waits until 3 hours after the event starts, then sends the promotion's search titles to every enabled indexer, most precise first, up to each indexer's *Queries Per Search*. Indexers can be any number of Prowlarr instances, Bitmagnet (GraphQL, ordered by seeders) and Easynews. A release reported by several indexers is listed once. When nothing matches it backs off: 30 minutes, 2, 6 and 12 hours, then daily.
 - **Candidates** pass SSS's release filter and the promotion's matcher. Rejected releases stay visible in Interactive Search with the reason, such as `wrong-date` or `sports-noise`, but cannot be grabbed. Matches are scored from quality, source, seeders and protocol, and each score shows how it was reached.
 - **Review** is manual in Phase 1: choose a release from Interactive Search. A torrent goes to qBittorrent and an NZB to SABnzbd. An Easynews result is a single file over HTTPS, so Replayarr's built-in downloader fetches it into that indexer's download folder (two at a time, resuming after a restart); Easynews credentials only ever go to easynews.com.
-- **Import** uses the largest non-sample video. It checks the minimum size and that the file name does not name a different date or event. It then hardlinks, copies or moves the file to `{promotion}/Season {year}/{promotion} - {date} - {title} [{quality}]`. Imports are idempotent, and a half-copied file never appears under its final name.
+- **Import** uses the largest non-sample video. It checks the minimum size and that the file name does not name a different date or event. It then hardlinks, copies or moves the file to `{promotion}/Season {season}/{promotion} - S{season}E{episode} - {title} [{quality}]` and writes its Jellyfin metadata (see [Media servers](#media-servers-jellyfin)). Imports are idempotent, and a half-copied file never appears under its final name.
 
 State lives in SQLite. Request status changes only through an explicit transition table, so no code path can mark a request ready without an import.
 
