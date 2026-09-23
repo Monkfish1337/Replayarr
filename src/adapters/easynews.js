@@ -102,12 +102,29 @@ const isEasynewsHost = (host) => /(^|\.)easynews\.com(:\d+)?$/i.test(host);
 // The download host comes from Easynews's search response (per-account
 // affinity). Only an easynews.com host is accepted, because the account's
 // credentials are sent to it.
+//
+// The download base is used as given, path included: Easynews returns e.g.
+// "https://members.easynews.com/dl" (sometimes protocol-relative), and the
+// file lives at <base>/<farm>/<port>/<hash><ext>/<title><ext>. Only its host
+// is checked; dropping the "/dl" path makes every download a 404.
+const DEFAULT_DOWNLOAD_BASE = 'https://members.easynews.com/dl';
+
+export function downloadBase(downURL) {
+  let value = String(downURL || '').trim();
+  if (!value) return DEFAULT_DOWNLOAD_BASE;
+  if (value.startsWith('//')) value = `https:${value}`;
+  else if (!/^https?:\/\//i.test(value)) value = `https://${value}`;
+  let url;
+  try { url = new URL(value); } catch { return DEFAULT_DOWNLOAD_BASE; }
+  if (!isEasynewsHost(url.host)) return DEFAULT_DOWNLOAD_BASE;
+  return `https://${url.host}${url.pathname.replace(/\/+$/, '')}`;
+}
+
 export function fileUrl(file) {
-  const path = `/${encodeURIComponent(file.f || '')}/${Number(file.p) || 0}/${encodeURIComponent(file.h)}${file.e || ''}/${encodeURIComponent(file.t || file.h)}${file.e || ''}`;
+  const path = `/${encodeURIComponent(file.f || 'auto')}/${Number(file.p) || 443}/${encodeURIComponent(file.h)}${file.e || ''}/${encodeURIComponent(file.t || file.h)}${file.e || ''}`;
   const override = process.env.REPLAYARR_EASYNEWS_BASE_URL;
   if (override) return override.replace(/\/+$/, '') + path;
-  const host = String(file.u || '').replace(/^https?:/, '').replace(/^\/+/, '').replace(/\/.*$/, '');
-  return `https://${isEasynewsHost(host) ? host : 'members.easynews.com'}${path}`;
+  return downloadBase(file.u) + path;
 }
 
 // Credentials go only to Easynews hosts, and are re-attached by hand on each
@@ -178,7 +195,9 @@ async function run(config, remoteId) {
       let offset = (await stat(target.partial).catch(() => null))?.size || 0;
       const response = await openDownload(config, fileUrl(file), offset, controller.signal);
       if (response.status === 401 || response.status === 403) throw Object.assign(new Error('Easynews rejected the username or password'), { fatal: true });
-      if (response.status === 404 || response.status === 410) throw Object.assign(new Error('Easynews no longer has this file'), { fatal: true });
+      // Name the address that failed (it carries no credentials), so a file
+      // Easynews really removed can be told apart from a wrong URL.
+      if (response.status === 404 || response.status === 410) throw Object.assign(new Error(`Easynews returned HTTP ${response.status} for ${fileUrl(file)}; the post may have been removed`), { fatal: true });
       if (response.status === 416) offset = 0;
       if (!response.ok) throw new Error(`Easynews HTTP ${response.status}`);
       // A server that ignores Range sends the whole file again.

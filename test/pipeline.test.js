@@ -359,3 +359,14 @@ test('an unmapped client path fails with a fix-it message, and Retry imports onc
   assert.equal(store.getRequest(request.id).status, 'ready', store.getRequest(request.id).error || '');
   assert.equal(fake.state.torrents.length, 1, 'retrying an import does not download again');
 });
+
+test('Easynews download URLs keep the /dl path Easynews gives, and only its hosts', async () => {
+  const easynews = await import('../src/adapters/easynews.js');
+  const file = { h: 'abc123', t: 'UFC.331.1080p', e: '.mkv', f: 'farm2', p: 443 };
+  const expected = 'https://members.easynews.com/dl/farm2/443/abc123.mkv/UFC.331.1080p.mkv';
+  assert.equal(easynews.fileUrl({ ...file, u: 'https://members.easynews.com/dl' }), expected);
+  assert.equal(easynews.fileUrl({ ...file, u: '//members.easynews.com/dl/' }), expected, 'protocol-relative, trailing slash');
+  assert.equal(easynews.fileUrl({ ...file, u: '' }), expected, 'missing base uses the standard one');
+  assert.equal(easynews.fileUrl({ ...file, u: 'https://evil.example.com/dl' }), expected, 'credentials never go to another host');
+  assert.equal(easynews.fileUrl({ ...file, u: 'https://dl3.easynews.com/news' }), 'https://dl3.easynews.com/news/farm2/443/abc123.mkv/UFC.331.1080p.mkv');
+});
