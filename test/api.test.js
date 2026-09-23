@@ -59,3 +59,20 @@ test('manual events are validated and matched to their promotion', async (t) => 
   const promotions = await (await call('/promotions')).json();
   assert.equal(promotions.find((p) => p.id === 'ufc').stats.events, 1);
 });
+
+test('indexer Test cleans form text the same way saving does', async (t) => {
+  let received;
+  const service = createService(createStore(openDatabase(':memory:')));
+  const api = createApi(service, { testers: { easynews: async (config) => { received = config; return 'ok'; } } });
+  const server = createServer((req, res) => api(req, res, new URL(req.url, 'http://x')));
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => server.close());
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/api/indexers/test`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ type: 'easynews', username: ' me ', password: 'pw', timeoutMs: '20000', maxQueries: '4', enabled: true }),
+  });
+  assert.equal(response.status, 200);
+  assert.equal(received.timeoutMs, 20000);
+  assert.equal(received.maxQueries, 4);
+  assert.equal(received.username, 'me');
+});

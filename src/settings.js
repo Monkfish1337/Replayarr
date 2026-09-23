@@ -47,7 +47,7 @@ export function loadSettings(store) {
   return out;
 }
 
-function normaliseIndexer(item) {
+export function normaliseIndexer(item) {
   const defaults = INDEXER_TYPES[item?.type];
   if (!defaults) return null;
   const entry = {

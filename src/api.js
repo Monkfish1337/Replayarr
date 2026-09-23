@@ -1,6 +1,6 @@
 import { TransitionError } from './store.js';
 import { UserError } from './service.js';
-import { indexerReady, loadSettings, MASK, publicSettings, saveSettings } from './settings.js';
+import { indexerReady, loadSettings, MASK, normaliseIndexer, publicSettings, saveSettings } from './settings.js';
 import { listPromotions, promotionAliases } from './matching/index.js';
 
 const MAX_BODY = 256 * 1024;
@@ -106,7 +106,8 @@ export function createApi(service, { testers, version = '', databasePath = '' })
       for (const key of ['apiKey', 'password']) if (indexer[key] === MASK) indexer[key] = saved[key] || '';
       const tester = testers[indexer.type];
       if (!tester) throw new UserError('Unknown indexer type.');
-      return { ok: true, message: await tester({ ...saved, ...indexer }) };
+      // Clean the form values exactly as saving would (numbers, trimming).
+      return { ok: true, message: await tester(normaliseIndexer({ ...saved, ...indexer })) };
     }],
     // SSS's alias learner: turn good/bad example release names into rules.
     ['POST', /^\/api\/promotion-rules\/suggest$/, (_m, body) => promotionAliases.suggestPromotionSetup(
