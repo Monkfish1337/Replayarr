@@ -7,7 +7,7 @@ import * as jellyfinAdapter from './adapters/jellyfin.js';
 import { mkdir, rename as renameFile, stat } from 'node:fs/promises';
 import { dirname, extname } from 'node:path';
 import { episodeNumber, moveSidecars, pruneEmptyFolders, writeMediaFiles } from './mediaFiles.js';
-import { broadQueries, configurePromotions, evaluate, promotionFor, promotions, queriesFor } from './matching/index.js';
+import { configurePromotions, evaluate, promotionFor, promotions, queriesFor } from './matching/index.js';
 import { destinationFor, ImportError, importDownload } from './importer.js';
 import { scoreCandidate } from './scoring.js';
 import { indexerReady, loadSettings, mapRemotePath } from './settings.js';
@@ -133,11 +133,12 @@ export function createService(store, overrides = {}) {
   // Send queries to one indexer, collecting new releases into `found` (keyed
   // by info hash or guid, first indexer wins). Returns false when the indexer
   // is unusable (bad key, unreachable), in which case the rest are skipped.
-  // With `stopAtMatch`, stops as soon as this indexer has returned a release
-  // that matches `event`; with `deadline`, stops when its time is up.
-  async function runQueries(indexer, queries, attempt, found, { event = null, deadline = 0, stopAtMatch = false } = {}) {
+  // With `stopAtMatch`, stops once a release matching `event` has been found
+  // (by this indexer, or one before it: `attempt.matched` starts true then)
+  // and `stopAfter` has passed; with `deadline`, stops when its time is up.
+  async function runQueries(indexer, queries, attempt, found, { event = null, deadline = 0, stopAtMatch = false, stopAfter = 0 } = {}) {
     for (const [index, query] of queries.entries()) {
-      if (index && stopAtMatch && attempt.matched) {
+      if (index && stopAtMatch && attempt.matched && Date.now() >= stopAfter) {
         searchLog.info(`${indexer.name}: found a match after ${index} of ${queries.length} queries; skipping the rest`);
         break;
       }
@@ -261,34 +262,29 @@ export function createService(store, overrides = {}) {
 
       const indexers = byPriority(settings.indexers.filter(indexerReady));
       const stopAtFirstMatch = settings.preferences.stopAtFirstMatch !== 'no';
+      // A match only ends the search once it has run this long, so a fast
+      // first answer does not stop the others offering alternatives.
+      const stopAfter = Date.now() + settings.preferences.minSearchSeconds * 1000;
       const found = new Map();
       const errors = [];
       const attempts = [];
       if (!indexers.length) errors.push('No indexer is configured; add one under Settings › Indexers');
       // Indexers are asked in priority order (fast ones first by default).
-      // Each gets the queries SSS would send it, stopping at its first match
-      // or when its time is up; once one has a match, the slower ones after
-      // it are not asked. The first indexer to report a release (by info
-      // hash or indexer guid) keeps it.
+      // Each gets the queries SSS would send it, stopping when its time is
+      // up, or once there is a match and the minimum search time has passed;
+      // then the indexers after it are not asked. The first indexer to report
+      // a release (by info hash or indexer guid) keeps it.
       searchLog.info(`Searching for ${event.title} (${event.date}) on ${indexers.length} indexer(s)`, { request: request.id, event: event.id, attempt: request.searchCount, order: indexers.map((i) => `${i.name} (${i.priority})`).join(', ') });
       for (const indexer of indexers) {
-        if (stopAtFirstMatch && attempts.some((a) => a.matched)) {
+        if (stopAtFirstMatch && attempts.some((a) => a.matched) && Date.now() >= stopAfter) {
           searchLog.info(`${indexer.name}: skipped, a higher-priority indexer already found a match`);
           continue;
         }
         const queries = queriesFor(event, indexer.type, indexer.maxQueries);
-        const attempt = { source: indexer.name, queries: [], started: Date.now(), results: 0, error: null, found: [], matched: false };
+        const attempt = { source: indexer.name, queries: [], started: Date.now(), results: 0, error: null, found: [], matched: attempts.some((a) => a.matched) };
         const deadline = attempt.started + indexer.searchMinutes * MINUTE;
-        const reachable = await runQueries(indexer, queries, attempt, found, { event, deadline, stopAtMatch: stopAtFirstMatch });
-        // Last resort when the whole list found nothing: just the two teams,
-        // and let the matcher sort out the rest.
-        if (reachable && attempt.results === 0 && !attempt.partial) {
-          const broad = broadQueries(event, attempt.queries);
-          if (broad.length) {
-            searchLog.info(`${indexer.name}: nothing for ${attempt.queries.length} queries; trying broad ones`, { queries: broad.join(' | ') });
-            await runQueries(indexer, broad, attempt, found, { event, deadline: deadline + MINUTE, stopAtMatch: stopAtFirstMatch });
-          }
-        }
+        await runQueries(indexer, queries, attempt, found, { event, deadline, stopAtMatch: stopAtFirstMatch, stopAfter });
+        attempt.matched = attempt.found.some((r) => evaluate(r.title, event).ok);
         searchLog.info(`${indexer.name}: ${attempt.results} result(s), ${attempt.found.length} new, from ${attempt.queries.length} quer${attempt.queries.length === 1 ? 'y' : 'ies'}`, { ms: Date.now() - attempt.started, error: attempt.error });
         if (attempt.error) errors.push(attempt.error);
         attempts.push(attempt);
@@ -304,6 +300,7 @@ export function createService(store, overrides = {}) {
       const matched = scored.filter((c) => c.decision === 'matched');
       const rejected = scored.filter((c) => c.decision === 'rejected').slice(0, MAX_REJECTED_KEPT);
       searchLog.info(`${event.title}: ${matched.length} matched, ${scored.length - matched.length} rejected of ${found.size} unique result(s)`);
+      store.clearRejected(request.id);
       store.saveCandidates(request.id, [...matched, ...rejected]);
       const matchedIds = new Set(matched.map((c) => c.identity));
       for (const attempt of attempts) {

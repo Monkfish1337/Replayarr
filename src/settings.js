@@ -30,7 +30,8 @@ export const DEFAULTS = {
   pathMappings: [],
   // stopAtFirstMatch: once a release matches, skip an indexer's remaining
   // queries and the lower-priority indexers. 'no' searches everything.
-  preferences: { protocol: 'any', minSeeders: 1, stopAtFirstMatch: 'yes' },
+  // minSearchSeconds: a match only stops the search after this long.
+  preferences: { protocol: 'any', minSeeders: 1, stopAtFirstMatch: 'yes', minSearchSeconds: 30 },
 };
 
 // Fields each indexer type keeps, with defaults. Every entry also has id,
@@ -64,6 +65,8 @@ const OLD_DEFAULT_NAMING = '{promotion}/Season {year}/{promotion} - {date} - {ti
 const SECRETS = [['jellyfin', 'apiKey'], ['qbittorrent', 'apiKey'], ['qbittorrent', 'password'], ['sabnzbd', 'apiKey'],
   ['metadata', 'footballDataApiKey'], ['metadata', 'apiFootballApiKey'], ['metadata', 'tmdbApiKey']];
 export const MASK = '••••••••';
+// Number settings where 0 is a real choice rather than "use the default".
+const ZERO_ALLOWED = new Set(['minSearchSeconds', 'minSeeders']);
 
 export function loadSettings(store) {
   const saved = store.getSetting('config', {});
@@ -133,7 +136,10 @@ export function saveSettings(store, incoming) {
       if (!(key in value)) continue;
       const isSecret = SECRETS.some(([s, k]) => s === section && k === key);
       if (isSecret && value[key] === MASK) continue;
-      next[section][key] = typeof defaults[key] === 'number' ? Number(value[key]) || defaults[key] : String(value[key] ?? '').trim();
+      const number = Number(value[key]);
+      next[section][key] = typeof defaults[key] !== 'number' ? String(value[key] ?? '').trim()
+        : ZERO_ALLOWED.has(key) && value[key] !== '' && Number.isFinite(number) ? number
+          : number || defaults[key];
     }
   }
   // Older clients (and the single-Prowlarr API) send a `prowlarr` section:
@@ -150,6 +156,7 @@ export function saveSettings(store, incoming) {
   if (!['debug', 'info', 'warn', 'error'].includes(next.logging.level)) next.logging.level = 'info';
   if (!['any', 'torrent', 'usenet'].includes(next.preferences.protocol)) next.preferences.protocol = 'any';
   if (!['yes', 'no'].includes(next.preferences.stopAtFirstMatch)) next.preferences.stopAtFirstMatch = 'yes';
+  next.preferences.minSearchSeconds = Math.min(600, Math.max(0, Math.round(Number(next.preferences.minSearchSeconds) || 0)));
   store.setSetting('config', next);
   return next;
 }

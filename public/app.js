@@ -483,7 +483,8 @@ const pages = {
         <fieldset class="fieldset" style="border:0;padding:0"><legend>Release Preferences</legend>
         ${field('preferences.protocol', 'Preferred Protocol', settings.preferences.protocol, { options: [['any', 'No preference'], ['usenet', 'Prefer Usenet'], ['torrent', 'Prefer Torrent']] })}
         ${field('preferences.minSeeders', 'Minimum Seeders', settings.preferences.minSeeders, { type: 'number' })}
-        ${field('preferences.stopAtFirstMatch', 'Stop at First Match', settings.preferences.stopAtFirstMatch, { options: [['yes', 'Yes: stop once a release matches'], ['no', 'No: search every indexer fully']], help: 'Yes skips an indexer’s remaining queries, and the lower-priority indexers, once a matching release is found. Faster, but a slower indexer with a better release is not asked. Interactive and manual search let you look further.' })}</fieldset>`;
+        ${field('preferences.stopAtFirstMatch', 'Stop at First Match', settings.preferences.stopAtFirstMatch, { options: [['yes', 'Yes: stop once a release matches'], ['no', 'No: search every indexer fully']], help: 'Yes skips an indexer’s remaining queries, and the lower-priority indexers, once a matching release is found and the minimum search time has passed.' })}
+        ${field('preferences.minSearchSeconds', 'Minimum Search Time (seconds)', settings.preferences.minSearchSeconds, { type: 'number', help: 'Keep searching at least this long after a first match, so slower indexers can offer alternatives. 0 stops at the first match.' })}</fieldset>`;
     } else if (tab === 'downloadclients') {
       const mappings = settings.pathMappings.length ? settings.pathMappings : [{ remote: '', local: '' }];
       body = `<fieldset class="fieldset" style="border:0;padding:0"><legend>qBittorrent</legend>
@@ -616,7 +617,7 @@ async function interactiveSearch(eventId, { searchFirst = true } = {}) {
 
 async function searchInModal(requestId) {
   const body = $('#release-body');
-  if (body) body.innerHTML = '<div class="empty-state">Searching indexers, highest priority first…</div>';
+  if (body) body.innerHTML = '<div class="empty-state">Searching indexers, highest priority first. This can take a minute…</div>';
   await run(() => api(`/requests/${requestId}/search`, { method: 'POST' }));
   await renderReleases(requestId);
 }

@@ -106,6 +106,7 @@ async function setup() {
   const service = createService(store, { now: () => now, fetchImage, logoDir: join(dir, 'logos') });
   saveSettings(store, {
     prowlarr: { url: fake.base, apiKey: 'prowlarr-key', maxQueries: 2 },
+    preferences: { minSearchSeconds: 0 },
     qbittorrent: { url: fake.base, username: 'admin', password: 'qb-pass' },
     sabnzbd: { url: fake.base, apiKey: 'sab-key' },
     library: { root: library, mode: 'copy', minSizeMb: 1 },

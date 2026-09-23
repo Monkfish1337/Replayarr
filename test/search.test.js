@@ -5,7 +5,7 @@ import { openDatabase } from '../src/db.js';
 import { createStore } from '../src/store.js';
 import { byPriority, createService } from '../src/service.js';
 import { loadSettings, saveSettings } from '../src/settings.js';
-import { broadQueries, queriesFor } from '../src/matching/index.js';
+import { queriesFor } from '../src/matching/index.js';
 
 // The fixture as UEFA's feed describes it (see metadata refresh).
 const MAN_UTD_SABAH = {
@@ -42,10 +42,10 @@ async function fakeProwlarr(t, titles = [RIGHT, LAST_SEASON]) {
   return { base: `http://127.0.0.1:${server.address().port}`, queries };
 }
 
-async function setup(t, indexers) {
+async function setup(t, indexers, preferences = { minSearchSeconds: 0 }) {
   const store = createStore(openDatabase(':memory:'));
   const service = createService(store, { now: () => new Date('2026-09-11T12:00:00Z'), fetchEvents: async () => [] });
-  saveSettings(store, { indexers, qbittorrent: { url: 'http://127.0.0.1:9' } });
+  saveSettings(store, { indexers, preferences, qbittorrent: { url: 'http://127.0.0.1:9' } });
   store.upsertEvent(MAN_UTD_SABAH);
   const request = await service.requestEvent(MAN_UTD_SABAH.id);
   return { store, service, request };
@@ -60,12 +60,6 @@ test('torrent indexers get SSS\'s whole torrent list; Easynews gets distinct spe
   const easynews = queriesFor(MAN_UTD_SABAH, 'easynews', 6);
   assert.equal(easynews.length, 6);
   assert.ok(easynews.some((q) => q.startsWith('Man. United')) && easynews.some((q) => q.startsWith('Manchester United')), easynews.join(' | '));
-});
-
-test('broad queries are just the two teams, without prefix, date or "vs"', () => {
-  assert.deepEqual(broadQueries(MAN_UTD_SABAH), ['Manchester United Sabah', 'Man Utd Sabah FC']);
-  assert.deepEqual(broadQueries(MAN_UTD_SABAH, ['manchester united sabah']), ['Man Utd Sabah FC'], 'not repeated');
-  assert.deepEqual(broadQueries({ title: 'UFC 331 Van vs Pantoja 2', payload: {} }), [], 'events without structured teams keep their own queries');
 });
 
 test('the search works down SSS\'s list, stops at the first match, and the matcher keeps the right fixture', async (t) => {
@@ -93,6 +87,27 @@ test('indexers are asked in priority order, and slower ones are skipped once the
   assert.ok(fast.queries.length > 0);
   assert.equal(slow.queries.length, 0, 'the torrent Prowlarr was not needed');
   assert.deepEqual(store.listSearches(request.id).map((s) => s.source), ['Hosted']);
+});
+
+test('a match only stops the search once the minimum search time has passed', async (t) => {
+  const fast = await fakeProwlarr(t);
+  const slow = await fakeProwlarr(t);
+  const { store, service, request } = await setup(t, [
+    { id: 'hosted', type: 'prowlarr', name: 'Hosted', url: fast.base, apiKey: 'k', priority: 5 },
+    { id: 'tor', type: 'prowlarr', name: 'Torrent Prowlarr', url: slow.base, apiKey: 'k', priority: 40 },
+  ], { minSearchSeconds: 30 });
+  await service.searchRequest(request.id);
+  assert.equal(fast.queries.length, 58, 'kept going after its match');
+  assert.equal(slow.queries.length, 58, 'the slower indexer was still asked');
+  assert.equal(store.listCandidates(request.id).filter((c) => c.decision === 'matched').length, 1, 'the same release from both is listed once');
+});
+
+test('a fresh search clears rejected releases earlier searches kept', async (t) => {
+  const prowlarr = await fakeProwlarr(t);
+  const { store, service, request } = await setup(t, [{ id: 'p', type: 'prowlarr', name: 'Prowlarr', url: prowlarr.base, apiKey: 'k' }]);
+  store.saveCandidates(request.id, [{ identity: 'junk', source: 'Bitmagnet', protocol: 'torrent', title: 'Catweazle Season 2 Dvdrip', score: 0, decision: 'rejected', reason: 'relevance' }]);
+  await service.searchRequest(request.id);
+  assert.ok(!store.listCandidates(request.id).some((c) => c.identity === 'junk'));
 });
 
 test('indexers saved with the old small query limits move to SSS\'s, and get a default priority', () => {

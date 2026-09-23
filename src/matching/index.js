@@ -112,30 +112,6 @@ export function selectProviderQueries(titles, event, limit, promotion) {
   return primary.concat(overflow).slice(0, cap);
 }
 
-// Broad queries for when the precise ones find nothing: just the two teams,
-// with no competition prefix, date or "vs" to trip an indexer that needs
-// every word to match ("Manchester United Sabah", "Man Utd Sabah FC").
-// Safe because every result still goes through the matcher, which checks the
-// date and both teams. Events without structured teams get none: their
-// search titles (e.g. "UFC 331") are already broad.
-export function broadQueries(event, alreadyAsked = []) {
-  const teams = event.payload?.teamNames;
-  const home = Array.isArray(teams?.home) ? teams.home : [];
-  const away = Array.isArray(teams?.away) ? teams.away : [];
-  if (!home.length || !away.length) return [];
-  // A readable alternative form: not a three-letter code, not the first form.
-  const alternative = (forms) => forms.slice(1).find((name) => String(name).length > 3 && !/^[A-Z.]{2,4}$/.test(name));
-  const pairs = [[home[0], away[0]], [alternative(home), alternative(away)]];
-  const asked = new Set(alreadyAsked.map((q) => q.toLowerCase()));
-  const out = [];
-  for (const [a, b] of pairs) {
-    if (!a || !b) continue;
-    const query = `${a} ${b}`.replace(/\s+/g, ' ').trim();
-    if (!asked.has(query.toLowerCase()) && !out.some((q) => q.toLowerCase() === query.toLowerCase())) out.push(query);
-  }
-  return out;
-}
-
 // Same order as SSS's candidate filter: shared noise filter first, then the
 // promotion's relevance check, then an event alias may rescue a keyword miss
 // provided the title does not name a different year.
