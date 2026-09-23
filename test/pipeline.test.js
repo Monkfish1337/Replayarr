@@ -8,11 +8,12 @@ import { openDatabase } from '../src/db.js';
 import { createStore } from '../src/store.js';
 import { createService } from '../src/service.js';
 import { saveSettings } from '../src/settings.js';
+import * as qbittorrent from '../src/adapters/qbittorrent.js';
 
 // Stand-ins for SSS, Prowlarr, qBittorrent and SABnzbd that speak just enough
 // of each real API for the pipeline to run against them over HTTP.
 async function fakeServices(downloadDir) {
-  const state = { torrents: [], sab: { queue: [], history: [] }, prowlarrQueries: [] };
+  const state = { torrents: [], sab: { queue: [], history: [] }, prowlarrQueries: [], logins: 0 };
   const hash = 'a'.repeat(40);
   const server = createServer(async (req, res) => {
     const url = new URL(req.url, 'http://x');
@@ -44,12 +45,13 @@ async function fakeServices(downloadDir) {
     }
     // qBittorrent
     if (url.pathname === '/api/v2/auth/login') {
+      state.logins += 1;
       const form = new URLSearchParams(body);
       if (form.get('password') !== 'qb-pass') return res.end('Fails.');
       return res.writeHead(200, { 'set-cookie': 'SID=abc; HttpOnly; path=/' }).end('Ok.');
     }
     if (url.pathname.startsWith('/api/v2/')) {
-      if (req.headers.cookie !== 'SID=abc') return res.writeHead(403).end('Forbidden');
+      if (req.headers.cookie !== 'SID=abc' && req.headers.authorization !== 'Bearer qbt_testkey1234567890123456789') return res.writeHead(403).end('Forbidden');
       if (url.pathname === '/api/v2/torrents/add') {
         const form = new URLSearchParams(body);
         state.torrents.push({ hash, url: form.get('urls'), tags: form.get('tags'), category: form.get('category'), state: 'downloading', progress: 0.4, content_path: '/downloads/Premier.League.Arsenal.City' });
@@ -213,4 +215,25 @@ test('status changes that skip a step are refused', () => {
   const { request } = store.createRequest('wwe:1');
   assert.throws(() => store.setStatus(request.id, 'ready'), /cannot move from wanted to ready/);
   assert.throws(() => store.setStatus(request.id, 'downloading'), /cannot move from wanted to downloading/);
+});
+
+test('a qBittorrent API key is used instead of logging in', async (t) => {
+  const env = await setup();
+  t.after(() => env.cleanup());
+  const { service, store, fake } = env;
+  saveSettings(store, { qbittorrent: { apiKey: 'qbt_testkey1234567890123456789', password: 'wrong' } });
+  await service.syncEvents();
+  const request = await service.requestEvent('epl:101');
+  await service.searchRequest(request.id);
+  const torrent = store.listCandidates(request.id).find((c) => c.protocol === 'torrent' && c.decision === 'matched');
+  await service.approve(request.id, torrent.id);
+  await service.reconcileJobs();
+  assert.equal(store.latestJob(request.id).state, 'downloading');
+  assert.equal(fake.state.logins, 0);
+
+  await assert.rejects(
+    qbittorrent.testConnection({ url: fake.base, apiKey: 'qbt_revoked' }),
+    /API key rejected/,
+  );
+  assert.equal(fake.state.logins, 0, 'a rejected key does not fall back to a password login');
 });

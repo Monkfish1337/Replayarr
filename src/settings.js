@@ -1,7 +1,7 @@
 export const DEFAULTS = {
   sss: { manifestUrl: '', lookbackDays: 30, lookaheadDays: 7 },
   prowlarr: { url: '', apiKey: '', maxQueries: 6, timeoutMs: 20000 },
-  qbittorrent: { url: '', username: '', password: '', category: 'replayarr' },
+  qbittorrent: { url: '', apiKey: '', username: '', password: '', category: 'replayarr' },
   sabnzbd: { url: '', apiKey: '', category: 'replayarr' },
   library: {
     root: '',
@@ -15,7 +15,7 @@ export const DEFAULTS = {
   preferences: { protocol: 'any', minSeeders: 1 },
 };
 
-const SECRETS = [['prowlarr', 'apiKey'], ['qbittorrent', 'password'], ['sabnzbd', 'apiKey']];
+const SECRETS = [['prowlarr', 'apiKey'], ['qbittorrent', 'apiKey'], ['qbittorrent', 'password'], ['sabnzbd', 'apiKey']];
 export const MASK = '••••••••';
 
 export function loadSettings(store) {

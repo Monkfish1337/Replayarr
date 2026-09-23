@@ -1,6 +1,7 @@
 import { joinUrl, request, ServiceError } from '../http.js';
 
-// qBittorrent WebUI API v2. Download clients share one interface:
+// qBittorrent WebUI API v2, authenticated by API key (qBittorrent 5.2+) or
+// by username and password. Download clients share one interface:
 //   add(config, candidate, { tag }) -> { remoteId }
 //   status(config, remoteId)        -> { state, progress, path, error } | null
 // where state is queued | downloading | completed | failed.
@@ -28,6 +29,21 @@ async function login(config) {
 
 async function call(config, path, init = {}, retried = false) {
   const base = String(config.url || '').replace(/\/+$/, '');
+  // qBittorrent 5.2+ API keys are stateless: no login and no session cookie.
+  if (config.apiKey) {
+    try {
+      return await request(SERVICE, joinUrl(base, path), {
+        ...init,
+        headers: { ...(init.headers || {}), Referer: base, Origin: base, Authorization: `Bearer ${config.apiKey}` },
+        timeoutMs: 15000,
+      });
+    } catch (error) {
+      if (error.status === 401 || error.status === 403) {
+        throw new ServiceError(SERVICE, 'API key rejected (API keys need qBittorrent 5.2 or newer)', error.status);
+      }
+      throw error;
+    }
+  }
   if (!sessions.has(base)) await login(config);
   try {
     return await request(SERVICE, joinUrl(base, path), {

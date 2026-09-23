@@ -30,7 +30,7 @@ On the shared network, use container names:
 | --- | --- |
 | Metadata Source › Install URL | Your SSS addon URL from the SSS account page. `http://serioussportsync:7000/u/…/manifest.json` if SSS is on the same network |
 | Indexers › Prowlarr URL | `http://gluetun:9696` if Prowlarr runs behind Gluetun, otherwise `http://prowlarr:9696` |
-| Download Clients | `http://qbittorrent:8080`, `http://sabnzbd:8080` |
+| Download Clients | `http://qbittorrent:8080`, `http://sabnzbd:8080`. For qBittorrent 5.2 or newer, use its API key (Options › WebUI › API Key) instead of a username and password |
 | Media Management › Library Folder | `/data/media/sports` (a folder under `DATA_ROOT`) |
 
 If qBittorrent or SABnzbd mount your data under a different path, e.g. `/downloads` instead of `/data/downloads`, add a **Remote Path Mapping** (`/downloads` → `/data/downloads`) under Download Clients. Keep downloads and the library under the same `DATA_ROOT` so imports can be hardlinks.

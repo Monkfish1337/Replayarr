@@ -376,7 +376,8 @@ const pages = {
       const mappings = settings.pathMappings.length ? settings.pathMappings : [{ remote: '', local: '' }];
       body = `<fieldset class="fieldset" style="border:0;padding:0"><legend>qBittorrent</legend>
         ${field('qbittorrent.url', 'URL', settings.qbittorrent.url, { placeholder: 'http://qbittorrent:8080' })}
-        ${field('qbittorrent.username', 'Username', settings.qbittorrent.username)}
+        ${field('qbittorrent.apiKey', 'API Key', settings.qbittorrent.apiKey, { type: 'password', help: 'qBittorrent 5.2 or newer: Options › WebUI › API Key. When set, the username and password are not used.' })}
+        ${field('qbittorrent.username', 'Username', settings.qbittorrent.username, { help: 'Only needed without an API key.' })}
         ${field('qbittorrent.password', 'Password', settings.qbittorrent.password, { type: 'password' })}
         ${field('qbittorrent.category', 'Category', settings.qbittorrent.category)}
         ${test('qbittorrent')}</fieldset>
