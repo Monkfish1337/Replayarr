@@ -80,7 +80,7 @@ export function createApi(service, { testers, version = '', revision = '', uiBui
     ['GET', /^\/api\/health$/, () => service.health()],
     ['GET', /^\/api\/system\/status$/, () => ({
       version, revision, uiBuild, node: process.version, platform: process.platform, database: databasePath,
-      startedAt, promotions: listPromotions().length,
+      startedAt, promotions: listPromotions().length, releaseCache: store.releaseCacheStats(),
     })],
     ['GET', /^\/api\/system\/tasks$/, () => service.tasks()],
     ['POST', /^\/api\/system\/tasks\/([a-z-]+)$/, ([, name]) => service.runTask(name)],

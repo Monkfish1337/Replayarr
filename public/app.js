@@ -535,7 +535,8 @@ const pages = {
         <fieldset class="fieldset" style="border:0;padding:0"><legend>Release Preferences</legend>
         ${field('preferences.protocol', 'Preferred Protocol', settings.preferences.protocol, { options: [['any', 'No preference'], ['usenet', 'Prefer Usenet'], ['torrent', 'Prefer Torrent']] })}
         ${field('preferences.minSeeders', 'Minimum Seeders', settings.preferences.minSeeders, { type: 'number' })}
-        ${field('preferences.searchSeconds', 'Search Time Limit (seconds)', settings.preferences.searchSeconds, { type: 'number', help: 'A search ends when every indexer has finished or this long has passed, whichever comes first. Results that arrive later are ignored. 10 to 600.' })}</fieldset>`;
+        ${field('preferences.searchSeconds', 'Search Time Limit (seconds)', settings.preferences.searchSeconds, { type: 'number', help: 'A search ends when every indexer has finished or this long has passed, whichever comes first. Results that arrive later are ignored. 10 to 600.' })}
+        ${field('preferences.rssMinutes', 'RSS Sync Interval (minutes)', settings.preferences.rssMinutes, { type: 'number', help: 'How often each Prowlarr’s newest releases are read into the release cache and matched against wanted events and upgrades. Scheduled searches look there first and only search the indexers when it has nothing. 0 turns RSS off; up to 240.' })}</fieldset>`;
     } else if (tab === 'downloadclients') {
       const mappings = settings.pathMappings.length ? settings.pathMappings : [{ remote: '', local: '' }];
       body = `<fieldset class="fieldset" style="border:0;padding:0"><legend>qBittorrent</legend>
@@ -643,6 +644,7 @@ const pages = {
       <fieldset class="fieldset" style="border:0;padding:0"><legend>About</legend><table class="table info-table"><tbody>
         <tr><td>Version</td><td>${esc(status.version)}${status.revision ? ` (build <a href="https://github.com/Monkfish1337/Replayarr/commit/${esc(status.revision)}" target="_blank" rel="noopener">${esc(status.revision)}</a>)` : ''}</td></tr><tr><td>Node.js</td><td>${esc(status.node)} (${esc(status.platform)})</td></tr>
         <tr><td>Database</td><td class="title-cell">${esc(status.database)}</td></tr><tr><td>Promotions</td><td>${status.promotions}</td></tr>
+        <tr><td>RSS Cache</td><td>${status.releaseCache.releases} release${status.releaseCache.releases === 1 ? '' : 's'}${status.releaseCache.newest ? ` <span class="muted">· newest ${relative(status.releaseCache.newest)}</span>` : ''}</td></tr>
         <tr><td>Started</td><td>${formatDateTime(status.startedAt)}</td></tr>
         <tr><td>Matching</td><td>Ported from SeriousSportSync</td></tr></tbody></table></fieldset>`;
   },
@@ -794,7 +796,11 @@ function indexerModal(indexer) {
   const fields = {
     prowlarr: input('url', 'URL', indexer.url, { placeholder: 'http://prowlarr:9696' })
       + input('apiKey', 'API Key', indexer.apiKey, { type: 'password', help: 'Prowlarr › Settings › General › API Key.' })
-      + input('timeoutMs', 'Query Timeout (ms)', indexer.timeoutMs ?? 20000, { type: 'number' }),
+      + input('timeoutMs', 'Query Timeout (ms)', indexer.timeoutMs ?? 20000, { type: 'number' })
+      + `<div class="form-group"><label class="form-label" for="ix-rss">RSS</label><div class="form-input"><select id="ix-rss" name="rss">
+          <option value="yes" ${indexer.rss === 'no' ? '' : 'selected'}>Read its newest releases into the release cache</option>
+          <option value="no" ${indexer.rss === 'no' ? 'selected' : ''}>Search only</option></select>
+          <div class="form-help">One request per RSS sync covers every indexer in this Prowlarr; wanted events are matched against it before any search.</div></div></div>`,
     bitmagnet: input('url', 'URL', indexer.url, { placeholder: 'http://gluetun:3333', help: 'The Bitmagnet web address; /graphql is added automatically.' })
       + input('limit', 'Results Per Query', indexer.limit ?? 100, { type: 'number', help: 'Ordered by seeders, so a limit keeps the best-seeded end.' })
       + input('timeoutMs', 'Query Timeout (ms)', indexer.timeoutMs ?? 15000, { type: 'number' }),
@@ -858,7 +864,7 @@ function indexerTypeModal() {
 function readIndexerForm() {
   const form = $('#indexer-form');
   const data = { id: form.dataset.id || undefined, type: form.dataset.type, enabled: form.elements.enabled.checked };
-  for (const el of form.querySelectorAll('input[name]')) if (el.type !== 'checkbox') data[el.name] = el.value;
+  for (const el of form.querySelectorAll('input[name], select[name]')) if (el.type !== 'checkbox') data[el.name] = el.value;
   return data;
 }
 

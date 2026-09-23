@@ -201,6 +201,18 @@ export function mentionsEvent(title, event) {
   return (fold(title).match(/[a-z0-9]{4,}/g) || []).some((word) => words.has(word));
 }
 
+// A looser test for the RSS cache, which judges every new release against
+// every wanted event: skip releases sharing no token of three or more
+// characters with the event ("ufc", "331", "sabah"), ignoring filler words
+// and years, before running the full matcher.
+const FILLER = new Set(['the', 'and', 'vs', 'fc', 'afc', 'cf', 'sc', 'fk', 'of', 'at', 'de', 'la', 'los', 'las', 'del', 'for', 'night', 'fight', 'main', 'card', 'live', 'full', 'show']);
+export function mayConcern(title, event) {
+  const tokens = (text) => (fold(text).match(/[a-z0-9]{3,}/g) || []).filter((t) => !FILLER.has(t) && !/^(?:19|20)\d{2}$/.test(t));
+  const teams = event.payload?.teamNames || {};
+  const words = new Set([event.payload?.mainTitle || event.title, ...(event.aliases || []), ...(teams.home || []), ...(teams.away || [])].flatMap(tokens));
+  return tokens(title).some((word) => words.has(word));
+}
+
 export function releaseDates(title) {
   return promotions.extractReleaseDates(String(title || ''));
 }

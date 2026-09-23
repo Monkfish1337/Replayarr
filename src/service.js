@@ -7,7 +7,7 @@ import * as jellyfinAdapter from './adapters/jellyfin.js';
 import { mkdir, rename as renameFile, stat } from 'node:fs/promises';
 import { dirname, extname } from 'node:path';
 import { episodeNumber, moveSidecars, pruneEmptyFolders, removeWithSidecars, writeMediaFiles } from './mediaFiles.js';
-import { configurePromotions, evaluate, mentionsEvent, promotionFor, promotions, queriesFor } from './matching/index.js';
+import { configurePromotions, evaluate, mayConcern, mentionsEvent, promotionFor, promotions, queriesFor } from './matching/index.js';
 import { destinationFor, ImportError, importDownload } from './importer.js';
 import { parseQuality, scoreCandidate } from './scoring.js';
 import { allows, isUpgrade, profileFor, wantsUpgrade } from './profiles.js';
@@ -36,6 +36,8 @@ const MAX_REJECTED_KEPT = 60;
 // Upgrade searches: every few hours, until a week after the event.
 const UPGRADE_EVERY_HOURS = 6;
 const UPGRADE_DAYS = 7;
+// How long releases stay in the RSS cache.
+const RSS_CACHE_DAYS = 14;
 
 // Easynews results are direct HTTPS files, fetched by the built-in downloader
 // in adapters/easynews.js using the credentials of the indexer that found them.
@@ -234,6 +236,35 @@ export function createService(store, overrides = {}) {
     if (!next) store.setStatus(job.requestId, 'wanted', { nextSearchAt: iso(30 * MINUTE), error: `${message}; searching again` });
   }
 
+  // --- RSS release cache (Phase 3) --------------------------------------
+  // Judge releases from the cache against one request's event. Matches are
+  // kept as its candidates (rejections are not: the cache holds everything
+  // the indexers post). A wanted event moves to review and an upgrade-watched
+  // one stays ready; either may then be grabbed by its profile.
+  async function matchCached(request, event, releases, settings) {
+    const related = releases.filter((r) => mayConcern(r.title, event));
+    if (!related.length) return 0;
+    const matched = judge(event, related, settings).filter((c) => c.decision === 'matched')
+      .map((c) => ({ ...c, evidence: [...c.evidence, 'From the RSS cache'] }));
+    if (!matched.length) return 0;
+    store.saveCandidates(request.id, matched);
+    searchLog.info(`RSS cache: ${matched.length} matching release(s) for ${event.title}`, { titles: matched.map((c) => c.title).join(' | ') });
+    store.log('match', `${event.title}: ${matched.length} matching release${matched.length === 1 ? '' : 's'} from RSS`, request.id);
+    if (request.status === 'wanted') {
+      store.setStatus(request.id, 'searching');
+      await autoGrab(store.setStatus(request.id, 'review'), event, settings);
+    } else if (request.status === 'ready') {
+      await autoGrab(request, event, settings, { current: store.libraryFor(event.id)?.quality || null });
+    }
+    return matched.length;
+  }
+
+  // Requests the cache is matched against: wanted events, and events in the
+  // library still inside their upgrade window.
+  function watchedRequests() {
+    return [...store.listRequests({ status: 'wanted' }), ...store.listRequests({ status: 'ready' }).filter((r) => r.nextSearchAt)];
+  }
+
   // Match and score releases found for an event, the same way for every kind
   // of search.
   function judge(event, releases, settings) {
@@ -387,13 +418,19 @@ export function createService(store, overrides = {}) {
     // An automatic search (worker, or the search button) grabs the best match
     // when the profile allows; an interactive one only lists what it found.
     // An event already in the library is searched for an upgrade instead.
-    async searchRequest(id, { interactive = false } = {}) {
+    // `cacheFirst` (the worker's scheduled searches): look in the RSS cache
+    // before asking the indexers, and only search them if it has no match.
+    async searchRequest(id, { interactive = false, cacheFirst = false } = {}) {
       let request = requireRequest(id);
       if (request.status === 'ready') return service.upgradeSearch(request.id, { interactive });
       if (request.status === 'review') request = store.setStatus(request.id, 'wanted');
       if (request.status !== 'wanted') throw new UserError(`A ${request.status} request cannot be searched.`, 409);
       const event = store.getEvent(request.eventId);
       const settings = loadSettings(store);
+      if (cacheFirst && settings.preferences.rssMinutes) {
+        const since = new Date(Date.parse(`${event.date}T00:00:00Z`) - 24 * 60 * MINUTE).toISOString();
+        if (await matchCached(request, event, store.cachedReleases({ since }), settings)) return store.getRequest(request.id);
+      }
       request = store.setStatus(request.id, 'searching', { searchCount: request.searchCount + 1 });
       // Events saved before Replayarr kept the provider's full record (or by
       // the old SSS sync) have no team names or codes, so the queries built
@@ -419,6 +456,45 @@ export function createService(store, overrides = {}) {
         : `No matching release yet (${found.size} checked)`;
       store.log(everyQueryFailed ? 'warning' : 'search', `${event.title}: ${message}`, request.id);
       return store.setStatus(request.id, 'wanted', { nextSearchAt: iso(delay), error: message });
+    },
+
+    // Read each Prowlarr's newest releases into the cache, then match the new
+    // ones against every wanted or upgrade-watched event. One request per
+    // indexer instead of ~60 per event; searches become the fallback.
+    async rssSync() {
+      const settings = loadSettings(store);
+      const indexers = byPriority(settings.indexers.filter((i) => i.type === 'prowlarr' && i.rss !== 'no' && indexerReady(i)));
+      const started = Date.now();
+      const fetched = [];
+      const errors = [];
+      await Promise.all(indexers.map(async (indexer) => {
+        try {
+          const releases = await adapters.prowlarr.recent(indexer);
+          fetched.push({ indexer, releases: releases.map((r) => ({ ...r, source: indexer.name, sourceId: indexer.id })) });
+          searchLog.debug(`RSS: ${indexer.name} returned ${releases.length} release(s)`);
+        } catch (error) {
+          const reason = String(error.message).replace(/^Prowlarr:\s*/, '');
+          errors.push(`${indexer.name}: ${reason}`);
+          searchLog.warn(`RSS: ${indexer.name} failed: ${reason}`);
+        }
+      }));
+      // Several indexers may post the same release; the highest priority keeps it.
+      const ordered = indexers.flatMap((indexer) => fetched.find((f) => f.indexer === indexer)?.releases || []);
+      const fresh = store.cacheReleases(ordered, iso());
+      const pruned = store.pruneReleaseCache(iso(-RSS_CACHE_DAYS * 24 * 60 * MINUTE));
+      let matched = 0;
+      if (fresh.length) {
+        for (const request of watchedRequests()) {
+          const event = store.getEvent(request.eventId);
+          if (!event) continue;
+          try { if (await matchCached(request, event, fresh, settings)) matched += 1; }
+          catch (error) { searchLog.warn(`RSS: matching ${event.title} failed: ${error.message}`); }
+        }
+      }
+      store.setSetting('tasks', { ...store.getSetting('tasks', {}), 'rss-sync': iso() });
+      const summary = { indexers: indexers.length, fetched: ordered.length, fresh: fresh.length, matched, pruned, errors };
+      searchLog.info(`RSS sync: ${ordered.length} release(s) from ${indexers.length} indexer(s), ${fresh.length} new, ${matched} event(s) matched`, { ms: Date.now() - started, pruned, errors: errors.join('; ') || undefined });
+      return summary;
     },
 
     // Events in the library below their profile's cutoff, with the profile.
@@ -747,6 +823,7 @@ export function createService(store, overrides = {}) {
         { name: 'sync-events', title: 'Refresh Metadata', interval: `${loadSettings(store).metadata.refreshHours || 'Manual'}${loadSettings(store).metadata.refreshHours ? ' hours' : ''}`, lastRun: metadata.status().finishedAt || null },
         { name: 'search-missing', title: 'Search Missing', interval: '30 seconds (due requests)', lastRun: last['search-missing'] || null },
         { name: 'check-downloads', title: 'Check For Finished Downloads', interval: '30 seconds', lastRun: last['check-downloads'] || null },
+        { name: 'rss-sync', title: 'RSS Sync', interval: loadSettings(store).preferences.rssMinutes ? `${loadSettings(store).preferences.rssMinutes} minutes` : 'Off', lastRun: last['rss-sync'] || null },
       ];
     },
 
@@ -760,6 +837,7 @@ export function createService(store, overrides = {}) {
         // Searches run on the worker, a few per tick, so the indexers are not flooded.
         return { queued: count };
       }
+      if (name === 'rss-sync') return service.rssSync();
       if (name === 'check-downloads') {
         await service.reconcileJobs();
         for (const request of store.listRequests({ status: 'importing' })) await service.importRequest(request.id);
@@ -772,8 +850,14 @@ export function createService(store, overrides = {}) {
     // --- worker ---------------------------------------------------------
     async tick() {
       metadata.maybeAutoRefresh();
+      const every = loadSettings(store).preferences.rssMinutes;
+      const lastRss = Date.parse(store.getSetting('tasks', {})['rss-sync'] || 0) || 0;
+      if (every && clock().getTime() - lastRss >= every * MINUTE) {
+        try { await service.rssSync(); }
+        catch (error) { workerLog.warn(`RSS sync failed: ${error.message}`); }
+      }
       for (const request of store.dueForSearch(iso()).slice(0, 3)) {
-        try { await service.searchRequest(request.id); }
+        try { await service.searchRequest(request.id, { cacheFirst: true }); }
         catch (error) {
           store.log('warning', `Search error: ${error.message}`, request.id);
           const current = store.getRequest(request.id);

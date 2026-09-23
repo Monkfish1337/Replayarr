@@ -33,7 +33,8 @@ export const DEFAULTS = {
   profiles: [DEFAULT_PROFILE],
   // searchSeconds: a search ends when every indexer has finished or this
   // long has passed, whichever comes first.
-  preferences: { protocol: 'any', minSeeders: 1, searchSeconds: 60 },
+  // rssMinutes: how often the release cache is filled from RSS; 0 turns it off.
+  preferences: { protocol: 'any', minSeeders: 1, searchSeconds: 60, rssMinutes: 15 },
 };
 
 // Fields each indexer type keeps, with defaults. Every entry also has id,
@@ -44,7 +45,8 @@ export const DEFAULTS = {
 // works like Sonarr's: lower first. It decides which indexer is credited
 // with a release several report, and the order in the log.
 export const INDEXER_TYPES = {
-  prowlarr: { url: '', apiKey: '', priority: 30, maxQueries: 60, timeoutMs: 20000 },
+  // rss: read Prowlarr's newest releases into the release cache (Phase 3).
+  prowlarr: { url: '', apiKey: '', priority: 30, maxQueries: 60, timeoutMs: 20000, rss: 'yes' },
   bitmagnet: { url: '', priority: 10, maxQueries: 60, limit: 100, timeoutMs: 15000 },
   easynews: { username: '', password: '', downloadFolder: '', priority: 20, maxQueries: 6, timeoutMs: 20000 },
 };
@@ -66,7 +68,7 @@ const SECRETS = [['jellyfin', 'apiKey'], ['qbittorrent', 'apiKey'], ['qbittorren
   ['metadata', 'footballDataApiKey'], ['metadata', 'apiFootballApiKey'], ['metadata', 'tmdbApiKey']];
 export const MASK = '••••••••';
 // Number settings where 0 is a real choice rather than "use the default".
-const ZERO_ALLOWED = new Set(['minSeeders']);
+const ZERO_ALLOWED = new Set(['minSeeders', 'rssMinutes']);
 
 export function loadSettings(store) {
   const saved = store.getSetting('config', {});
@@ -102,6 +104,7 @@ export function normaliseIndexer(item) {
       : String(value ?? fallback).trim();
   }
   entry.queryPlan = QUERY_PLAN;
+  if ('rss' in entry && entry.rss !== 'no') entry.rss = 'yes';
   entry.priority = Math.min(50, Math.round(entry.priority));
   entry.maxQueries = Math.min(100, Math.round(entry.maxQueries));
   return entry;
@@ -161,6 +164,7 @@ export function saveSettings(store, incoming) {
   if (!['debug', 'info', 'warn', 'error'].includes(next.logging.level)) next.logging.level = 'info';
   if (!['any', 'torrent', 'usenet'].includes(next.preferences.protocol)) next.preferences.protocol = 'any';
   next.preferences.searchSeconds = Math.min(600, Math.max(10, Math.round(Number(next.preferences.searchSeconds) || DEFAULTS.preferences.searchSeconds)));
+  next.preferences.rssMinutes = Math.min(240, Math.max(0, Math.round(Number(next.preferences.rssMinutes) || 0)));
   store.setSetting('config', next);
   return next;
 }

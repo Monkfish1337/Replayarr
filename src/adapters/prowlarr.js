@@ -47,6 +47,12 @@ export function normalise(result) {
   };
 }
 
+// Prowlarr's RSS: a search with no query returns each of its indexers' newest
+// releases (what Sonarr's RSS sync reads), one request for all of them.
+export function recent(config) {
+  return search(config, '');
+}
+
 export async function search(config, query) {
   const params = new URLSearchParams({ query, type: 'search', limit: '100' });
   const { body } = await requestJson(SERVICE, joinUrl(config.url, '/api/v1/search?' + params), {

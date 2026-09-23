@@ -108,6 +108,8 @@ async function setup() {
     prowlarr: { url: fake.base, apiKey: 'prowlarr-key', maxQueries: 2 },
     // These tests walk the manual review flow; auto-grab is tested in phase2.test.js.
     profiles: [{ id: 'default', name: 'Manual', autoGrab: 'no' }],
+    // RSS sync (Phase 3) is tested in phase3.test.js.
+    preferences: { rssMinutes: 0 },
     qbittorrent: { url: fake.base, username: 'admin', password: 'qb-pass' },
     sabnzbd: { url: fake.base, apiKey: 'sab-key' },
     library: { root: library, mode: 'copy', minSizeMb: 1 },

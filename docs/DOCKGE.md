@@ -5,7 +5,7 @@ Replayarr is published to `ghcr.io/monkfish1337/replayarr` for amd64 and arm64. 
 To check the server can reach it:
 
 ```bash
-docker exec dockge docker pull ghcr.io/monkfish1337/replayarr:phase-2
+docker exec dockge docker pull ghcr.io/monkfish1337/replayarr:phase-3
 ```
 
 ## Create the stack
@@ -16,7 +16,7 @@ docker exec dockge docker pull ghcr.io/monkfish1337/replayarr:phase-2
    - `REPLAYARR_PASSWORD`: the UI is on your LAN, so the stack will not start without one.
    - `DATA_ROOT`: the host folder that holds both downloads and your media library, mounted at `/data`.
    - `PUID` / `PGID`: the owner of that folder (`id <user>` on the host).
-   - Use `REPLAYARR_TAG=phase-2` for the current work (`phase-1` stays available), and switch to `latest` once it is merged.
+   - Use `REPLAYARR_TAG=phase-3` for the current work (`phase-1` and `phase-2` stay available), and switch to `latest` once it is merged.
 4. To reach Prowlarr, qBittorrent and SABnzbd by container name, uncomment the `networks:` block at the bottom of the compose file and set your existing network, e.g. `stremio-stack_stremio-net`.
 5. **Deploy**.
 

@@ -131,6 +131,24 @@ const MIGRATIONS = [
    ALTER TABLE library ADD COLUMN episode INTEGER;`,
   // Phase 2: the quality profile a promotion uses (null: the first profile).
   'ALTER TABLE promotion_meta ADD COLUMN profile_id TEXT;',
+  // Phase 3: releases seen in the indexers' RSS feeds, matched locally
+  // against wanted events and kept for two weeks.
+  `CREATE TABLE release_cache (
+     identity TEXT PRIMARY KEY,
+     source TEXT NOT NULL,
+     source_id TEXT,
+     indexer TEXT,
+     protocol TEXT NOT NULL,
+     title TEXT NOT NULL,
+     download_url TEXT,
+     info_hash TEXT,
+     size INTEGER,
+     seeders INTEGER,
+     published_at TEXT,
+     first_seen_at TEXT NOT NULL,
+     last_seen_at TEXT NOT NULL
+   );
+   CREATE INDEX release_cache_first_seen ON release_cache (first_seen_at);`,
 ];
 
 export function openDatabase(file) {

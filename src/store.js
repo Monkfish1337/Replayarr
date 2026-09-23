@@ -185,6 +185,39 @@ export function createStore(db) {
     getRequest(id) {
       return requestRow(q('SELECT * FROM requests WHERE id = ?').get(id));
     },
+    // --- RSS release cache ----------------------------------------------
+    // Store releases from an RSS sync; returns the ones not seen before.
+    cacheReleases(releases, at = now()) {
+      const fresh = [];
+      const find = q('SELECT identity FROM release_cache WHERE identity = ?');
+      const touch = q('UPDATE release_cache SET last_seen_at = ?, seeders = COALESCE(?, seeders) WHERE identity = ?');
+      const insert = q(`INSERT INTO release_cache (identity, source, source_id, indexer, protocol, title, download_url, info_hash,
+                          size, seeders, published_at, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      transaction(db, () => {
+        for (const r of releases) {
+          if (find.get(r.identity)) { touch.run(at, r.seeders ?? null, r.identity); continue; }
+          insert.run(r.identity, r.source, r.sourceId || null, r.indexer || null, r.protocol, r.title, r.downloadUrl || null,
+            r.infoHash || null, r.size ?? null, r.seeders ?? null, r.publishedAt || null, at, at);
+          fresh.push(r);
+        }
+      });
+      return fresh;
+    },
+    cachedReleases({ since = '' } = {}) {
+      return q('SELECT * FROM release_cache WHERE first_seen_at >= ? ORDER BY first_seen_at DESC').all(since).map((row) => ({
+        identity: row.identity, source: row.source, sourceId: row.source_id, indexer: row.indexer, protocol: row.protocol,
+        title: row.title, downloadUrl: row.download_url, infoHash: row.info_hash, size: row.size, seeders: row.seeders,
+        publishedAt: row.published_at,
+      }));
+    },
+    pruneReleaseCache(before) {
+      return q('DELETE FROM release_cache WHERE last_seen_at < ?').run(before).changes;
+    },
+    releaseCacheStats() {
+      const row = q('SELECT COUNT(*) AS n, MAX(first_seen_at) AS newest FROM release_cache').get();
+      return { releases: row.n, newest: row.newest };
+    },
+
     requestForEvent(eventId) {
       return requestRow(q('SELECT * FROM requests WHERE event_id = ?').get(eventId));
     },

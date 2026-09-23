@@ -40,6 +40,6 @@ ready ─▶ downloading ─▶ importing ─▶ ready      (an upgrade)
 
 ## Not in Phase 2
 
-- An RSS release cache (poll indexers' recent releases and match locally, as Sportarr does) instead of searching each event.
+- An RSS release cache: done in [Phase 3](phase-3.md).
 - Size limits per quality, and preferred words or release groups.
 - Configurable upgrade window and interval (fixed at 6 hours for 7 days).
