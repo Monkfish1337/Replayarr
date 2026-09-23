@@ -16,9 +16,13 @@ export const DEFAULTS = {
   library: {
     root: '',
     mode: 'hardlink',
-    naming: '{promotion}/Season {year}/{promotion} - {date} - {title} [{quality}]',
+    naming: '{promotion}/Season {season}/{promotion} - S{season}E{episode} - {title} [{quality}]',
     minSizeMb: 100,
+    // Kodi-style .nfo files and artwork next to each event, for Jellyfin.
+    writeMetadata: 'yes',
   },
+  // Told to rescan after imports and renames.
+  jellyfin: { url: '', apiKey: '' },
   // Download clients often run in their own container and report paths as
   // they see them. Each mapping rewrites a remote prefix to the local one.
   pathMappings: [],
@@ -35,7 +39,10 @@ export const INDEXER_TYPES = {
 const INDEXER_NAMES = { prowlarr: 'Prowlarr', bitmagnet: 'Bitmagnet', easynews: 'Easynews' };
 const INDEXER_SECRETS = ['apiKey', 'password'];
 
-const SECRETS = [['qbittorrent', 'apiKey'], ['qbittorrent', 'password'], ['sabnzbd', 'apiKey'],
+// The first default naming pattern; installs still on it move to the current one.
+const OLD_DEFAULT_NAMING = '{promotion}/Season {year}/{promotion} - {date} - {title} [{quality}]';
+
+const SECRETS = [['jellyfin', 'apiKey'], ['qbittorrent', 'apiKey'], ['qbittorrent', 'password'], ['sabnzbd', 'apiKey'],
   ['metadata', 'footballDataApiKey'], ['metadata', 'apiFootballApiKey'], ['metadata', 'tmdbApiKey']];
 export const MASK = '••••••••';
 
@@ -52,6 +59,7 @@ export function loadSettings(store) {
     out.indexers = [normaliseIndexer({ id: 'prowlarr', type: 'prowlarr', ...saved.prowlarr })];
   }
   out.indexers = out.indexers.map(normaliseIndexer).filter(Boolean);
+  if (out.library.naming === OLD_DEFAULT_NAMING) out.library.naming = DEFAULTS.library.naming;
   return out;
 }
 
@@ -116,6 +124,7 @@ export function saveSettings(store, incoming) {
     ]);
   }
   if (!['hardlink', 'copy', 'move'].includes(next.library.mode)) next.library.mode = DEFAULTS.library.mode;
+  if (!['yes', 'no'].includes(next.library.writeMetadata)) next.library.writeMetadata = 'yes';
   if (!['any', 'torrent', 'usenet'].includes(next.preferences.protocol)) next.preferences.protocol = 'any';
   store.setSetting('config', next);
   return next;

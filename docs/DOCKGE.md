@@ -33,6 +33,7 @@ On the shared network, use container names:
 | Indexers › Bitmagnet | `http://gluetun:3333` when Bitmagnet shares Gluetun's network, otherwise `http://bitmagnet:3333` |
 | Indexers › Easynews | Your Easynews username and password, and a download folder such as `/data/downloads/easynews` |
 | Download Clients | `http://qbittorrent:8080`, `http://sabnzbd:8080`. For qBittorrent 5.2 or newer, use its API key (Options › WebUI › API Key) instead of a username and password |
+| Settings › Connect › Jellyfin | `http://jellyfin:8096` and an API key from Jellyfin › Dashboard › API Keys |
 | Media Management › Library Folder | `/data/media/sports` (a folder under `DATA_ROOT`) |
 
 If qBittorrent or SABnzbd mount your data under a different path, e.g. `/downloads` instead of `/data/downloads`, add a **Remote Path Mapping** (`/downloads` → `/data/downloads`) under Download Clients. Keep downloads and the library under the same `DATA_ROOT` so imports can be hardlinks.

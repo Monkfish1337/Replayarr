@@ -101,7 +101,9 @@ async function setup() {
   const fake = await fakeServices(downloads);
   let now = new Date('2026-09-22T12:00:00Z');
   const store = createStore(openDatabase(':memory:'));
-  const service = createService(store, { now: () => now });
+  // Artwork downloads never leave the test.
+  const fetchImage = async () => new Response(Buffer.from('89504e47', 'hex'), { headers: { 'content-type': 'image/png' } });
+  const service = createService(store, { now: () => now, fetchImage, logoDir: join(dir, 'logos') });
   saveSettings(store, {
     prowlarr: { url: fake.base, apiKey: 'prowlarr-key', maxQueries: 2 },
     qbittorrent: { url: fake.base, username: 'admin', password: 'qb-pass' },
@@ -171,7 +173,7 @@ test('a requested event goes from search to review to download to library', asyn
   const done = store.getRequest(request.id);
   assert.equal(done.status, 'ready', done.error || '');
   const item = store.libraryFor('epl:101');
-  assert.equal(item.path, join(env.library, 'Premier League', 'Season 2026', 'Premier League - 2026-09-21 - Arsenal vs Manchester City [1080p].mkv'));
+  assert.equal(item.path, join(env.library, 'Premier League', 'Season 2026', 'Premier League - S2026E092101 - Arsenal vs Manchester City [1080p].mkv'));
   assert.equal((await stat(item.path)).size, 2 * 1024 * 1024, 'the main file is imported, not the larger sample');
   assert.deepEqual(await readFile(item.path), Buffer.alloc(2 * 1024 * 1024, 1));
   await assert.rejects(service.requestEvent('epl:101'), /already in your library/);
@@ -299,7 +301,7 @@ test('every configured indexer is searched, and Easynews results download throug
   const done = store.getRequest(request.id);
   assert.equal(done.status, 'ready', done.error || '');
   const item = store.libraryFor('epl:101');
-  assert.match(item.path, /Premier League - 2026-09-21 - Arsenal vs Manchester City \[720p\]\.mkv$/);
+  assert.match(item.path, /Premier League - S2026E092101 - Arsenal vs Manchester City \[720p\]\.mkv$/);
   assert.deepEqual(await readFile(item.path), Buffer.alloc(2 * 1024 * 1024, 7));
 });
 

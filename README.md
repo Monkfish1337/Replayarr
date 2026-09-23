@@ -73,6 +73,19 @@ Under **Metadata › Matching Rules** you can add learned aliases to a built-in 
 
 When SSS's matching improves, port the change into `src/matching/` and its tests. Don't make Replayarr depend on SSS's code at runtime.
 
+## Media servers (Jellyfin)
+
+Online metadata databases don't carry sports events, so Replayarr writes the metadata itself, next to each file:
+
+```text
+UFC/tvshow.nfo, poster.*, fanart.*          promotion (poster = the logo you picked)
+UFC/Season 2026/UFC - S2026E091901 - UFC 331 Van vs Pantoja 2 [1080p].mkv
+                .nfo                         title, air date, TheSportsDB description and venue
+                -thumb.jpg                   the event's TheSportsDB artwork (fight poster)
+```
+
+Each promotion is a show and each year a season. The episode number is the date (MMDD) plus the order that day, so it sorts by date and never changes. In Jellyfin, add a **Shows** library, untick all metadata downloaders and image fetchers, and keep the **Nfo** reader. **Settings › Connect** tells Jellyfin to rescan after imports. **Library › Rename Files** moves events imported under an older pattern, and **Write Metadata** rewrites every .nfo and image (e.g. after picking a new logo).
+
 ## Metadata
 
 Replayarr fetches schedules itself, like Sonarr fetches series. **Follow** a promotion (Promotions › Add New, or Metadata › Promotions) and its events are fetched in the background and refreshed every *Refresh Every* hours. Only followed promotions are fetched.

@@ -12,6 +12,7 @@ import * as bitmagnet from './src/adapters/bitmagnet.js';
 import * as easynews from './src/adapters/easynews.js';
 import * as qbittorrent from './src/adapters/qbittorrent.js';
 import * as sabnzbd from './src/adapters/sabnzbd.js';
+import * as jellyfin from './src/adapters/jellyfin.js';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const publicDir = resolve(root, 'public');
@@ -50,6 +51,7 @@ const api = createApi(service, {
     easynews: easynews.testConnection,
     qbittorrent: qbittorrent.testConnection,
     sabnzbd: sabnzbd.testConnection,
+    jellyfin: jellyfin.testConnection,
   },
 });
 

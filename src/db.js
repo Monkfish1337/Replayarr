@@ -125,6 +125,10 @@ const MIGRATIONS = [
    INSERT INTO promotion_meta (promotion_id, followed)
      SELECT DISTINCT events.promotion_id, 1 FROM events JOIN requests ON requests.event_id = events.id
      WHERE events.promotion_id IS NOT NULL;`,
+  // Season/episode numbers given to an imported event, kept so renames and
+  // media-server metadata stay stable.
+  `ALTER TABLE library ADD COLUMN season INTEGER;
+   ALTER TABLE library ADD COLUMN episode INTEGER;`,
 ];
 
 export function openDatabase(file) {

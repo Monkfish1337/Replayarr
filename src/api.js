@@ -103,10 +103,13 @@ export function createApi(service, { testers, version = '', revision = '', uiBui
     ['POST', /^\/api\/requests\/(\d+)\/approve$/, async ([, id], body) => requestView(store, await service.approve(id, body.candidateId))],
     ['POST', /^\/api\/requests\/(\d+)\/retry$/, ([, id]) => requestView(store, service.retry(id))],
     ['GET', /^\/api\/activity$/, () => store.listActivity(200)],
+    ['GET', /^\/api\/library\/rename$/, () => service.renamePlan()],
+    ['POST', /^\/api\/library\/rename$/, () => service.renameFiles()],
+    ['POST', /^\/api\/library\/metadata$/, () => service.writeAllMetadata()],
     ['GET', /^\/api\/library$/, () => store.listLibrary().map((item) => ({ ...item, event: store.getEvent(item.eventId) }))],
     ['GET', /^\/api\/settings$/, () => ({ settings: publicSettings(loadSettings(store)), rules: store.listPromotionRules() })],
     ['PUT', /^\/api\/settings$/, (_m, body) => publicSettings(saveSettings(store, body))],
-    ['POST', /^\/api\/settings\/test\/(qbittorrent|sabnzbd)$/, async ([, name]) => {
+    ['POST', /^\/api\/settings\/test\/(qbittorrent|sabnzbd|jellyfin)$/, async ([, name]) => {
       const settings = loadSettings(store);
       return { ok: true, message: await testers[name](settings[name]) };
     }],

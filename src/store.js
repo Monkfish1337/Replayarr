@@ -69,6 +69,7 @@ function libraryRow(row) {
   return {
     id: row.id, eventId: row.event_id, requestId: row.request_id, path: row.path, size: row.size,
     quality: row.quality, releaseTitle: row.release_title, importedAt: row.imported_at,
+    season: row.season, episode: row.episode,
   };
 }
 
@@ -281,13 +282,21 @@ export function createStore(db) {
 
     // --- library --------------------------------------------------------
     addLibraryItem(item) {
-      q(`INSERT INTO library (event_id, request_id, path, size, quality, release_title, imported_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+      q(`INSERT INTO library (event_id, request_id, path, size, quality, release_title, imported_at, season, episode)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (event_id) DO UPDATE SET request_id = excluded.request_id, path = excluded.path,
            size = excluded.size, quality = excluded.quality, release_title = excluded.release_title,
-           imported_at = excluded.imported_at`)
-        .run(item.eventId, item.requestId, item.path, item.size, item.quality || null, item.releaseTitle || null, now());
+           imported_at = excluded.imported_at, season = excluded.season, episode = excluded.episode`)
+        .run(item.eventId, item.requestId, item.path, item.size, item.quality || null, item.releaseTitle || null, now(),
+          item.season ?? null, item.episode ?? null);
       return libraryRow(q('SELECT * FROM library WHERE event_id = ?').get(item.eventId));
+    },
+    updateLibraryItem(eventId, { path, season, episode }) {
+      q('UPDATE library SET path = ?, season = ?, episode = ? WHERE event_id = ?').run(path, season ?? null, episode ?? null, eventId);
+      return store.libraryFor(eventId);
+    },
+    eventsOnDate(promotionId, date) {
+      return q('SELECT * FROM events WHERE promotion_id = ? AND date = ?').all(promotionId, date).map(eventRow);
     },
     listLibrary() {
       return q('SELECT * FROM library ORDER BY imported_at DESC').all().map(libraryRow);

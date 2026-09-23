@@ -3,8 +3,12 @@ import * as qbittorrentAdapter from './adapters/qbittorrent.js';
 import * as sabnzbdAdapter from './adapters/sabnzbd.js';
 import * as bitmagnetAdapter from './adapters/bitmagnet.js';
 import * as easynewsAdapter from './adapters/easynews.js';
+import * as jellyfinAdapter from './adapters/jellyfin.js';
+import { mkdir, rename as renameFile, stat } from 'node:fs/promises';
+import { dirname, extname } from 'node:path';
+import { episodeNumber, moveSidecars, pruneEmptyFolders, writeMediaFiles } from './mediaFiles.js';
 import { configurePromotions, evaluate, promotionFor, promotions, searchTitles } from './matching/index.js';
-import { ImportError, importDownload } from './importer.js';
+import { destinationFor, ImportError, importDownload } from './importer.js';
 import { scoreCandidate } from './scoring.js';
 import { indexerReady, loadSettings, mapRemotePath } from './settings.js';
 import { createMetadata } from './metadata/manager.js';
@@ -33,7 +37,7 @@ const QUERY_PAUSE_MS = { easynews: 800 };
 export function createService(store, overrides = {}) {
   const adapters = {
     prowlarr: prowlarrAdapter, bitmagnet: bitmagnetAdapter, easynews: easynewsAdapter,
-    qbittorrent: qbittorrentAdapter, sabnzbd: sabnzbdAdapter,
+    qbittorrent: qbittorrentAdapter, sabnzbd: sabnzbdAdapter, jellyfin: jellyfinAdapter,
     ...overrides.adapters,
   };
   const clock = overrides.now || (() => new Date());
@@ -53,6 +57,50 @@ export function createService(store, overrides = {}) {
 
   function promotionName(event) {
     return promotionFor(event)?.name || 'Sports';
+  }
+
+  // --- media-server files -------------------------------------------------
+  const logoDir = overrides.logoDir || 'data/logos';
+
+  function numberFor(event) {
+    const sameDay = event.promotionId ? store.eventsOnDate(event.promotionId, event.date) : [];
+    return episodeNumber(event, sameDay.length ? sameDay : [event]);
+  }
+
+  // The promotion as the media-server files need it: name and chosen logo.
+  function promotionInfo(event) {
+    const promotion = promotionFor(event);
+    const listed = promotion && metadata.list().find((p) => p.id === promotion.id);
+    return { id: promotion?.id || 'sports', name: promotion?.name || 'Sports', logo: listed?.logo || '', defaultLogo: listed?.defaultLogo || '' };
+  }
+
+  // .nfo and artwork for Jellyfin. Best effort: problems are logged, the
+  // import itself has already succeeded.
+  async function writeSidecars(event, item, settings, { overwrite = false } = {}) {
+    if (settings.library.writeMetadata === 'no' || !item) return;
+    try {
+      const problems = await writeMediaFiles({
+        videoPath: item.path, libraryRoot: settings.library.root, event, promotion: promotionInfo(event),
+        season: item.season, episode: item.episode, quality: item.quality, logoDir, overwrite,
+        fetchImpl: overrides.fetchImage,
+      });
+      if (problems.length) store.log('warning', `${event.title}: some artwork was not saved (${problems.join('; ')})`);
+    } catch (error) {
+      store.log('warning', `${event.title}: could not write media-server files: ${error.code || error.message}`);
+    }
+  }
+
+  // Ask Jellyfin to rescan, at most once per burst of imports or renames.
+  let refreshTimer = null;
+  function notifyMediaServer(settings) {
+    if (!settings.jellyfin.url || !settings.jellyfin.apiKey) return;
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(() => {
+      adapters.jellyfin.refreshLibrary(loadSettings(store).jellyfin)
+        .then(() => store.log('metadata', 'Asked Jellyfin to rescan its libraries'))
+        .catch((error) => store.log('warning', `Jellyfin rescan failed: ${error.message}`));
+    }, overrides.mediaServerDelayMs ?? 10000);
+    refreshTimer.unref?.();
   }
 
   function clientConfigured(settings, client, sourceId) {
@@ -279,12 +327,15 @@ export function createService(store, overrides = {}) {
       try {
         if (!job?.remotePath) throw new ImportError('The download client did not report where the files are');
         const localPath = mapRemotePath(settings, job.remotePath);
+        const { season, episode } = numberFor(event);
         const result = await importDownload({
           settings, localPath, event, candidate, promotionName: promotionName(event),
-          verifyName: (name) => evaluate(name, event),
+          verifyName: (name) => evaluate(name, event), season, episode,
         });
-        store.addLibraryItem({ eventId: event.id, requestId: request.id, path: result.path, size: result.size, quality: candidate?.quality, releaseTitle: candidate?.title });
+        store.addLibraryItem({ eventId: event.id, requestId: request.id, path: result.path, size: result.size, quality: candidate?.quality, releaseTitle: candidate?.title, season, episode });
         store.log('ready', `${event.title} imported (${result.method}) to ${result.path}`, request.id);
+        await writeSidecars(event, store.libraryFor(event.id), settings);
+        notifyMediaServer(settings);
         return store.setStatus(request.id, 'ready');
       } catch (error) {
         let message = error instanceof ImportError ? error.message : `Import failed: ${error.code || error.message}`;
@@ -296,6 +347,70 @@ export function createService(store, overrides = {}) {
         store.log('warning', `${event.title}: ${message}`, request.id);
         return store.setStatus(request.id, 'failed', { error: message });
       }
+    },
+
+    // --- library: rename files and media-server metadata -----------------
+    // Where each imported event would go under the current naming pattern.
+    // Events imported before numbering existed get their numbers now.
+    renamePlan() {
+      const settings = loadSettings(store);
+      const plan = [];
+      for (const item of store.listLibrary()) {
+        const event = store.getEvent(item.eventId);
+        if (!event) continue;
+        const numbers = item.season && item.episode ? { season: item.season, episode: item.episode } : numberFor(event);
+        const to = destinationFor(settings, {
+          promotion: promotionName(event), title: event.title, date: event.date, year: String(event.date).slice(0, 4),
+          quality: item.quality || '', release: item.releaseTitle || '', season: numbers.season,
+          episode: String(numbers.episode).padStart(6, '0'),
+        }, extname(item.path));
+        plan.push({ eventId: event.id, title: event.title, from: item.path, to, ...numbers, changed: to !== item.path });
+      }
+      return plan;
+    },
+
+    async renameFiles() {
+      const settings = loadSettings(store);
+      const results = [];
+      for (const entry of service.renamePlan()) {
+        const event = store.getEvent(entry.eventId);
+        try {
+          if (entry.changed) {
+            if (await stat(entry.to).catch(() => null)) throw new Error(`${entry.to} already exists`);
+            await mkdir(dirname(entry.to), { recursive: true });
+            await renameFile(entry.from, entry.to);
+            await moveSidecars(entry.from, entry.to);
+            await pruneEmptyFolders(dirname(entry.from), settings.library.root);
+            store.log('ready', `Renamed ${entry.from} to ${entry.to}`);
+          }
+          const item = store.updateLibraryItem(entry.eventId, { path: entry.to, season: entry.season, episode: entry.episode });
+          if (entry.changed) await writeSidecars(event, item, settings);
+          results.push({ eventId: entry.eventId, ok: true, renamed: entry.changed });
+        } catch (error) {
+          store.log('warning', `${entry.title}: rename failed: ${error.code || error.message}`);
+          results.push({ eventId: entry.eventId, ok: false, error: error.code || error.message });
+        }
+      }
+      if (results.some((r) => r.renamed)) notifyMediaServer(settings);
+      return results;
+    },
+
+    // Rewrite every imported event's .nfo and artwork, and each promotion's
+    // show files (e.g. after choosing a new logo).
+    async writeAllMetadata() {
+      const settings = { ...loadSettings(store) };
+      settings.library = { ...settings.library, writeMetadata: 'yes' };
+      let count = 0;
+      for (const item of store.listLibrary()) {
+        const event = store.getEvent(item.eventId);
+        if (!event || !(await stat(item.path).catch(() => null))) continue;
+        const numbered = item.season && item.episode ? item : store.updateLibraryItem(item.eventId, { path: item.path, ...numberFor(event) });
+        await writeSidecars(event, numbered, settings, { overwrite: true });
+        count += 1;
+      }
+      store.log('metadata', `Wrote media-server metadata for ${count} event${count === 1 ? '' : 's'}`);
+      notifyMediaServer(settings);
+      return { count };
     },
 
     retry(id) {

@@ -31,6 +31,7 @@ const segment = (value) => String(value ?? '')
   .replace(/^[\s.]+|[\s.]+$/g, '')
   .slice(0, 150);
 
+// Tokens: {promotion} {title} {date} {year} {quality} {release} {season} {episode}
 export function destinationFor(settings, tokens, extension) {
   const root = resolve(settings.library.root || '');
   if (!settings.library.root) throw new ImportError('Set a library folder in Settings before importing');
@@ -67,7 +68,7 @@ async function place(source, target, mode) {
 
 // Import one completed download. Idempotent: re-running after a crash finds
 // the file already in place and reports it rather than failing.
-export async function importDownload({ settings, localPath, event, promotionName, candidate, verifyName }) {
+export async function importDownload({ settings, localPath, event, promotionName, candidate, verifyName, season, episode }) {
   const video = await pickVideo(localPath);
   const minBytes = (Number(settings.library.minSizeMb) || 0) * 1024 * 1024;
   if (video.size < minBytes) {
@@ -86,6 +87,8 @@ export async function importDownload({ settings, localPath, event, promotionName
     year: String(event.date).slice(0, 4),
     quality: candidate.quality || '',
     release: candidate.title,
+    season: season ?? String(event.date).slice(0, 4),
+    episode: episode === undefined ? '' : String(episode).padStart(6, '0'),
   };
   const target = destinationFor(settings, tokens, extname(video.path));
   const existing = await stat(target).catch(() => null);

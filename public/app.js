@@ -140,7 +140,7 @@ const NAV = [
     ['Promotions', '#/metadata/promotions'], ['Providers', '#/metadata/providers'], ['Matching Rules', '#/metadata/rules'], ['Settings', '#/metadata/settings']] },
   { key: 'settings', label: 'Settings', icon: 'settings', href: '#/settings/mediamanagement', children: [
     ['Media Management', '#/settings/mediamanagement'], ['Indexers', '#/settings/indexers'], ['Download Clients', '#/settings/downloadclients'],
-    ['General', '#/settings/general']] },
+    ['Connect', '#/settings/connect'], ['General', '#/settings/general']] },
   { key: 'system', label: 'System', icon: 'system', href: '#/system/status', children: [['Status', '#/system/status'], ['Tasks', '#/system/tasks'], ['Events', '#/system/events']] },
 ];
 const sectionOf = { promotions: 'promotions', promotion: 'promotions', add: 'promotions', library: 'promotions', calendar: 'calendar', activity: 'activity', wanted: 'wanted', metadata: 'metadata', settings: 'settings', system: 'system' };
@@ -351,7 +351,7 @@ const pages = {
   },
 
   async library() {
-    setToolbar();
+    setToolbar(toolbarButton('rename-preview', 'list', 'Rename Files') + toolbarButton('write-metadata', 'save', 'Write Metadata'));
     promotionsCache = await api('/promotions');
     const items = await api('/library');
     if (!items.length) return `<h1 class="page-title">Library</h1><div class="empty-state">Nothing has been imported yet.</div>`;
@@ -463,7 +463,8 @@ const pages = {
         ${field('library.mode', 'Import Mode', settings.library.mode, { options: [['hardlink', 'Hardlink (fall back to copy)'], ['copy', 'Copy'], ['move', 'Move']], help: 'Hardlinks keep torrents seeding without using extra space. Move stops a torrent from seeding.' })}
         ${field('library.minSizeMb', 'Minimum File Size (MB)', settings.library.minSizeMb, { type: 'number', help: 'Files smaller than this are rejected as samples or clips.' })}</fieldset>
         <fieldset class="fieldset" style="border:0;padding:0"><legend>Event Naming</legend>
-        ${field('library.naming', 'Event Format', settings.library.naming, { help: 'Tokens: {promotion} {title} {date} {year} {quality} {release}. Use / for folders.' })}
+        ${field('library.naming', 'Event Format', settings.library.naming, { help: 'Tokens: {promotion} {title} {date} {year} {season} {episode} {quality} {release}. Use / for folders. Keep S{season}E{episode} in the name so Jellyfin can number events; {episode} is the date (MMDD) plus the order that day. After changing it, use Library › Rename Files.' })}
+        ${field('library.writeMetadata', 'Media Server Metadata', settings.library.writeMetadata, { options: [['yes', 'Write .nfo files and artwork (Jellyfin, Kodi)'], ['no', 'Do not write']], help: 'Saves each event’s details and TheSportsDB artwork next to the file, plus the promotion’s poster (your chosen logo). Set the Jellyfin library to use NFO and turn off its online metadata downloaders.' })}
         <div class="form-group"><span class="form-label">Example</span><div class="form-input"><code id="naming-example"></code></div></div></fieldset>`;
     } else if (tab === 'indexers') {
       indexersCache = settings.indexers;
@@ -523,6 +524,19 @@ const pages = {
             <td class="actions"><button class="icon-button" data-action="promotion-rule" data-id="${esc(p.id)}" title="Edit rules" aria-label="Edit rules">${icon('settings')}</button>
             ${rule ? `<button class="icon-button danger" data-action="delete-rule" data-id="${esc(p.id)}" title="Remove rules" aria-label="Remove rules">${icon('trash')}</button>` : ''}</td></tr>`;
         }).join('')}</tbody></table></div>`;
+    } else if (tab === 'connect') {
+      body = `<fieldset class="fieldset" style="border:0;padding:0"><legend>Jellyfin</legend>
+        <p class="form-help" style="max-width:none">Replayarr asks Jellyfin to rescan its libraries after importing or renaming, so events appear straight away.</p>
+        ${field('jellyfin.url', 'URL', settings.jellyfin.url, { placeholder: 'http://jellyfin:8096' })}
+        ${field('jellyfin.apiKey', 'API Key', settings.jellyfin.apiKey, { type: 'password', help: 'Jellyfin › Dashboard › API Keys › +.' })}
+        ${test('jellyfin')}</fieldset>
+        <fieldset class="fieldset" style="border:0;padding:0"><legend>Jellyfin library setup</legend>
+        <ol class="form-help" style="max-width:none;line-height:1.7">
+          <li>Add a library of type <strong>Shows</strong> pointing at your Replayarr library folder as Jellyfin sees it (for example <code>/data/media/sports</code>).</li>
+          <li>Under <strong>Metadata downloaders</strong> and <strong>Image fetchers</strong>, untick everything (TheMovieDb, TheTVDB, OMDb…). Online databases do not carry sports events and will mis-match them.</li>
+          <li>Leave <strong>Nfo</strong> ticked under <strong>Metadata readers</strong>. Jellyfin then uses the .nfo files and artwork Replayarr writes.</li>
+          <li>For events imported before this was set up, run <strong>Library › Rename Files</strong>, then <strong>Write Metadata</strong>.</li>
+        </ol></fieldset>`;
     } else if (tab === 'general') {
       setToolbar();
       const status = await api('/system/status');
@@ -835,7 +849,7 @@ function updateNamingExample() {
   const input = $('[name="library.naming"]');
   const out = $('#naming-example');
   if (!input || !out) return;
-  const tokens = { promotion: 'Premier League', title: 'Arsenal vs Manchester City', date: '2026-09-21', year: '2026', quality: '1080p', release: 'EPL.2026.09.21.Arsenal.vs.Man.City.1080p.WEB' };
+  const tokens = { promotion: 'Premier League', title: 'Arsenal vs Manchester City', date: '2026-09-21', year: '2026', season: '2026', episode: '092101', quality: '1080p', release: 'EPL.2026.09.21.Arsenal.vs.Man.City.1080p.WEB' };
   out.textContent = input.value.replace(/\{(\w+)\}/g, (_, key) => tokens[key] ?? '') + '.mkv';
 }
 
@@ -905,6 +919,34 @@ const actions = {
   'search-missing': async () => {
     await run(() => api('/system/tasks/search-missing', { method: 'POST' }), (r) => `Search queued for ${r.queued} missing event${r.queued === 1 ? '' : 's'}`);
     render();
+  },
+  // Sonarr-style: show every old -> new name first, rename on confirm.
+  'rename-preview': async () => {
+    const plan = await run(() => api('/library/rename'));
+    if (!plan) return;
+    const changes = plan.filter((p) => p.changed);
+    const name = (path) => esc(path.split(/[\\/]/).slice(-3).join(' / '));
+    openModal(`<div class="modal-header"><span>Rename Files</span><button class="icon-button" data-action="close-modal" aria-label="Close">${icon('x')}</button></div>
+      <div class="modal-body">${changes.length
+        ? `<p class="muted">${changes.length} file${changes.length === 1 ? '' : 's'} will be renamed to match the current naming pattern. Their .nfo and artwork move with them.</p>
+          <table class="table"><thead><tr><th>Event</th><th>Existing</th><th>New</th></tr></thead><tbody>
+          ${changes.map((p) => `<tr><td>${esc(p.title)}</td><td class="title-cell evidence">${name(p.from)}</td><td class="title-cell evidence">${name(p.to)}</td></tr>`).join('')}</tbody></table>`
+        : '<div class="empty-state">Every file already matches the naming pattern.</div>'}</div>
+      <div class="modal-footer"><button class="button" data-action="close-modal">Close</button>${changes.length ? '<button class="button button-primary" data-action="rename-apply">Rename</button>' : ''}</div>`);
+  },
+  'rename-apply': async (el) => {
+    el.disabled = true;
+    const results = await run(() => api('/library/rename', { method: 'POST' }));
+    if (!results) { el.disabled = false; return; }
+    const failed = results.filter((r) => !r.ok);
+    message(failed.length ? `${failed.length} rename${failed.length === 1 ? '' : 's'} failed: ${failed.map((r) => r.error).join('; ')}` : `Renamed ${results.filter((r) => r.renamed).length} file(s)`, failed.length ? 'error' : 'success');
+    closeModal();
+    render({ quiet: true });
+  },
+  'write-metadata': async (el) => {
+    el.classList.add('spinning');
+    await run(() => api('/library/metadata', { method: 'POST' }), (r) => `Wrote .nfo files and artwork for ${r.count} event${r.count === 1 ? '' : 's'}`);
+    el.classList.remove('spinning');
   },
   'check-downloads': async () => { await run(() => api('/system/tasks/check-downloads', { method: 'POST' })); render(); },
   'search-promotion': async () => {
